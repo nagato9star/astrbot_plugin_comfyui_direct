@@ -19,7 +19,7 @@ AstrBot 插件：局域网直连 ComfyUI API，提供图片生成、模型查询
 
 1. 将本目录放入 AstrBot 的 `data/plugins/` 下
 2. 在 AstrBot WebUI 重启插件或重载插件列表
-3. 在插件配置中确认 ComfyUI 地址（默认 `192.168.31.41:8188`，33 号 PC）
+3. 在插件配置中确认 ComfyUI 地址（默认 `127.0.0.1:8188`，本机）
 
 依赖：`httpx`（见 `requirements.txt`，AstrBot 自带）。
 
@@ -27,7 +27,7 @@ AstrBot 插件：局域网直连 ComfyUI API，提供图片生成、模型查询
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `comfyui_host` | `192.168.31.41` | ComfyUI 主机 IP（自填） |
+| `comfyui_host` | `127.0.0.1` | ComfyUI 主机 IP（自填） |
 | `comfyui_port` | `8188` | ComfyUI 端口 |
 | `comfyui_timeout` | `300` | 生成等待超时（秒） |
 | `model_cache_ttl` | `600` | 模型清单缓存刷新间隔（秒），0 表示每次强制同步 |
@@ -61,7 +61,7 @@ AstrBot 插件：局域网直连 ComfyUI API，提供图片生成、模型查询
 
 ## 工作流模板
 
-- 模板源：插件数据目录 `data/plugin_data/astrbot_plugin_comfyui_direct/workflows/`（首次部署需从原环境拷贝，插件包不含模板文件，避免秘制蓝图随仓库分发）。anima-v3 使用 rgthree（Power Lora Loader、Image Comparer）、Comfyroll（CR Prompt Text、JoinStringMulti）与 DanbooruText 自定义节点，33 号 PC 已装。
+- 模板源：插件数据目录 `data/plugin_data/astrbot_plugin_comfyui_direct/workflows/`（首次部署需从原环境拷贝，插件包不含模板文件，避免秘制蓝图随仓库分发）。anima-v3 使用 rgthree（Power Lora Loader、Image Comparer）、Comfyroll（CR Prompt Text、JoinStringMulti）与 DanbooruText 自定义节点，需自行安装。
 - 兼容旧模板：`nagato-anima`、`anima-v2`，从 AstrBot `data/skills/anima-comfyui/references/` 目录加载（不存在时报错提示）。
 - 模板即事实来源：模型 / 步数 / cfg / 采样器默认值都在模板里，代码不写死。
 
@@ -102,4 +102,4 @@ AstrBot Dashboard → 插件页 → **Workflow Studio**（`pages/workflow-editor
 ## 注意事项
 
 - 图片由插件通过 `event.send` 直接发送，不要重复调用 `send_message_to_user`。
-- ComfyUI 不可达时生成失败，请确认 33 号 PC 开机且 ComfyUI 已启动。
+- ComfyUI 不可达时生成失败，请确认 ComfyUI 已启动且网络可达。

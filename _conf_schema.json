@@ -1,8 +1,8 @@
 {
   "comfyui_host": {
     "type": "string",
-    "default": "192.168.31.41",
-    "hint": "ComfyUI 主机 IP（默认 33 号 PC）",
+    "default": "127.0.0.1",
+    "hint": "ComfyUI 主机 IP（默认本机）",
     "description": "ComfyUI 服务地址 IP，可按实际环境自填"
   },
   "comfyui_port": {

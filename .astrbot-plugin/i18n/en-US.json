@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "display_name": "ComfyUI Direct"
+  },
+  "pages": {
+    "workflow-editor": {
+      "title": "Workflow Studio",
+      "desc": "Visual editor for ComfyUI workflow templates"
+    }
+  }
+}

@@ -1,0 +1,217 @@
+{
+  "comfyui_host": {
+    "type": "string",
+    "default": "192.168.31.41",
+    "hint": "ComfyUI 主机 IP（默认 33 号 PC）",
+    "description": "ComfyUI 服务地址 IP，可按实际环境自填"
+  },
+  "comfyui_port": {
+    "type": "int",
+    "default": 8188,
+    "hint": "ComfyUI 端口"
+  },
+  "comfyui_timeout": {
+    "type": "int",
+    "default": 300,
+    "hint": "生成等待超时（秒）"
+  },
+  "model_cache_ttl": {
+    "type": "int",
+    "default": 600,
+    "hint": "模型清单缓存刷新间隔（秒），0 表示每次查询都强制同步"
+  },
+  "default_workflow": {
+    "type": "string",
+    "default": "anima-v3",
+    "hint": "默认工作流模板名（anima-v3 / nagato-anima / anima-v2，或 JSON 文件路径）"
+  },
+  "danbooru_base_url": {
+    "type": "string",
+    "default": "https://danbooru.donmai.us",
+    "obvious_hint": true,
+    "description": "danbooru API 文档：https://danbooru.donmai.us/wiki_pages/help:api",
+    "hint": "danbooru 接口地址，国内可换可用镜像；官方 API 文档 https://danbooru.donmai.us/wiki_pages/help:api（可点击链接见 Workflow Studio 侧栏「相关链接」）"
+  },
+  "gelbooru_base_url": {
+    "type": "string",
+    "default": "https://gelbooru.com",
+    "obvious_hint": true,
+    "description": "gelbooru DAPI 文档：https://gelbooru.com/index.php?page=help&topic=dapi",
+    "hint": "gelbooru 接口地址（镜像可换）；DAPI 文档 https://gelbooru.com/index.php?page=help&topic=dapi（可点击链接见 Workflow Studio 侧栏）"
+  },
+  "civitai_api_key": {
+    "type": "string",
+    "default": "",
+    "obvious_hint": true,
+    "description": "API Key 获取：https://civitai.com/user/account（镜像站路径相同）",
+    "hint": "civitai API Key（可选，以你的身份调用）：获取 https://civitai.com/user/account，镜像站路径相同；API 参考 https://github.com/civitai/civitai/wiki/REST-API-Reference（可点击链接见 Workflow Studio 侧栏）"
+  },
+  "default_artist": {
+    "type": "string",
+    "default": "",
+    "hint": "默认画师串（如 (@名字:1.2)），留空用模板原值；生成时若 LLM 未传 artist 则用此项"
+  },
+  "default_quality": {
+    "type": "string",
+    "default": "",
+    "hint": "默认质量词（如 masterpiece, best quality, score_9），留空用模板原值"
+  },
+  "default_trigger_words": {
+    "type": "string",
+    "default": "",
+    "hint": "默认 lora 触发词（如 @f1f,@deadpuritystyle），留空用模板原值"
+  },
+  "default_negative_prompt": {
+    "type": "string",
+    "default": "",
+    "hint": "默认负向提示词，留空用模板原值"
+  },
+  "default_model": {
+    "type": "string",
+    "default": "",
+    "hint": "默认底模文件名（可用 comfyui_list_models 查看，如 miaomiaoRealskin_anima11.safetensors），留空用模板原值",
+    "options": [
+      "",
+      "anima29B_v10.safetensors",
+      "anima_baseV10.safetensors",
+      "fnMixAnimaTurbo_baseNoTurbo.safetensors",
+      "miaomiao3DHarem_animaLH3D10.safetensors",
+      "miaomiaoHarem_anima14.safetensors",
+      "miaomiaoHarem_anima16.safetensors",
+      "miaomiaoRealskin_anima11.safetensors",
+      "novaAnimeAM_v30A.safetensors",
+      "oneObsessionAnima_v30.safetensors",
+      "pornmasterAnima_baseV1.safetensors",
+      "rinFlanimeAnima_v14.safetensors"
+    ]
+  },
+  "default_lora": {
+    "type": "template_list",
+    "description": "默认 LoRA 列表：可添加多条，按顺序映射 Power Lora Loader 插槽 lora_1..lora_N；每条含文件名与权重",
+    "templates": {
+      "lora": {
+        "name": "LoRA",
+        "items": {
+          "name": {
+            "type": "string",
+            "default": "",
+            "hint": "LoRA 文件名（下拉选择；插件启动时自动同步清单，重载插件后更新）",
+            "options": [
+              "",
+              "96yottea_anima_v2.safetensors",
+              "@deadpuritystyle.safetensors",
+              "@mxsxkx-v1-animabase1-ty_lee.safetensors",
+              "@syurikenmaru,chibi_anima_ver20.safetensors",
+              "@tldhfdy_style.safetensors",
+              "AI styles dump.safetensors",
+              "Anima\\style\\kanzarin_v1_step1500.safetensors",
+              "Anima_in_real_update_v2_epoch_20.safetensors",
+              "Anime_artistic_2.safetensors",
+              "Betabeet-000060.safetensors",
+              "E5A684E683B3E5A4A9E4BD.7FzT.safetensors",
+              "FComic1to1000_Anima_V1.safetensors",
+              "Futurabbit_sketch_Anima_v1.safetensors",
+              "Klein_动漫高清放大.safetensors",
+              "Krea2-25D动漫Semi_Real_Anime_V2_NSW.safetensors",
+              "Turbo-ANIMA-v2.9.safetensors",
+              "ZodaPlus.safetensors",
+              "anima-base-1-masterpiece-v51.safetensors",
+              "anima-base-1-photo-background-v4.safetensors",
+              "anima-turbo-lora-v0.2.safetensors",
+              "anima_context_detailer_base10.safetensors",
+              "anima_footRepair_v2.safetensors",
+              "ba_nai_style_v1.safetensors",
+              "bakav3-000012.safetensors",
+              "baka皮肤-000008.safetensors",
+              "cunnyfunky.safetensors",
+              "deepseek_whale_girl_maid_anima_lora_clean.safetensors",
+              "gpt-image-2_anima-base1_v1.safetensors",
+              "john_v2_epoch26.safetensors",
+              "lighting_base10-000100.safetensors",
+              "nekoya_v1_epoch21.safetensors",
+              "nffastyle_animaV1.4.safetensors",
+              "sby1_epoch14.safetensors",
+              "snofs_krea_v1_3D.safetensors",
+              "zoda_v3_anima.safetensors"
+            ]
+          },
+          "strength": {
+            "type": "float",
+            "default": 0.8,
+            "hint": "权重（0~1.5，常用 0.5~1.0）"
+          }
+        }
+      }
+    },
+    "default": []
+  },
+  "default_steps": {
+    "type": "int",
+    "default": 0,
+    "hint": "默认采样步数，0=用模板原值"
+  },
+  "default_cfg": {
+    "type": "float",
+    "default": 0,
+    "hint": "默认 CFG，0=用模板原值"
+  },
+  "default_sampler_name": {
+    "type": "string",
+    "default": "",
+    "options": [
+      "",
+      "er_sde",
+      "euler",
+      "euler_ancestral",
+      "dpmpp_2m",
+      "dpmpp_2m_sde",
+      "dpmpp_3m_sde",
+      "dpmpp_sde",
+      "ddim",
+      "uni_pc",
+      "lcm"
+    ],
+    "hint": "默认采样器，留空=用模板原值"
+  },
+  "default_scheduler": {
+    "type": "string",
+    "default": "",
+    "options": [
+      "",
+      "normal",
+      "karras",
+      "exponential",
+      "sgm_uniform",
+      "simple",
+      "beta"
+    ],
+    "hint": "默认调度器，留空=用模板原值"
+  },
+  "default_denoise": {
+    "type": "float",
+    "default": 0,
+    "hint": "默认降噪强度 0~1，0=用模板原值"
+  },
+  "default_width": {
+    "type": "int",
+    "default": 0,
+    "hint": "默认图片宽度，0=用模板原值"
+  },
+  "default_height": {
+    "type": "int",
+    "default": 0,
+    "hint": "默认图片高度，0=用模板原值"
+  },
+  "animadex_mcp_url": {
+    "description": "AnimaDex MCP 服务地址",
+    "type": "string",
+    "default": "http://127.0.0.1:11451/mcp",
+    "hint": "本地角色库 MCP 服务端点，默认 127.0.0.1:11451/mcp"
+  },
+  "animadex_timeout": {
+    "description": "AnimaDex 查询超时（秒）",
+    "type": "float",
+    "default": 8.0,
+    "hint": "示例：8.0"
+  }
+}

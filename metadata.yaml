@@ -1,0 +1,8 @@
+name: astrbot_plugin_comfyui_direct
+display_name: ComfyUI Direct
+desc: 局域网直连 ComfyUI API（Anima 工作流），提供图片生成与模型查询
+short_desc: 局域网直连 ComfyUI 生图
+version: v2.1.0
+author: 长门九曜
+repo: https://github.com/nagato9star/astrbot_plugin_comfyui_direct
+astrbot_version: ">=4.16,<5"

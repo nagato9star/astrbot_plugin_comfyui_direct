@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "display_name": "ComfyUI Direct"
+  },
+  "pages": {
+    "workflow-editor": {
+      "title": "Workflow Studio",
+      "desc": "可视化编辑与管理 ComfyUI 工作流模板"
+    }
+  }
+}

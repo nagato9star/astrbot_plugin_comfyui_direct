@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ComfyUI Direct · Workflow Studio</title>
+<link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div id="topbar">
+    <div class="brand">ComfyUI Direct<span class="sub">Workflow Studio</span></div>
+    <select id="wf-select" title="选择工作流模板"></select>
+    <span id="wf-source" class="badge"></span>
+    <span class="sep"></span>
+    <button id="btn-new" title="新建空白工作流">新建</button>
+    <button id="btn-save" title="保存（自定义副本优先于内置）">保存</button>
+    <button id="btn-saveas" title="另存为新模板">另存为</button>
+    <button id="btn-delete" title="删除自定义模板（内置/技能模板不可删）">删除</button>
+    <button id="btn-json" title="查看/编辑原始 JSON">JSON</button>
+    <span class="sep"></span>
+    <span id="conn-dot" class="dot off" title="ComfyUI 连接状态"></span>
+    <span id="conn-text">检测中…</span>
+    <button id="btn-models" title="查看模型/LoRA/CLIP/VAE 清单">模型清单</button>
+    <div class="spacer"></div>
+    <button id="btn-run" class="primary" title="把当前画布提交给 ComfyUI 试跑">▶ 试跑</button>
+  </div>
+
+  <div id="main-row">
+    <div id="sidebar">
+      <div class="side-title">节点库</div>
+      <div id="palette"></div>
+      <div class="side-title">资源</div>
+      <div id="res-box"><div class="res-empty">未连接或未同步</div></div>
+      <div class="side-title">相关链接</div>
+      <div id="links-box">
+        <a href="https://danbooru.donmai.us/wiki_pages/help:api" target="_blank" rel="noopener">danbooru API 文档（镜像选择）</a>
+        <a href="https://gelbooru.com/index.php?page=help&topic=dapi" target="_blank" rel="noopener">gelbooru DAPI 文档</a>
+        <a href="https://civitai.red" target="_blank" rel="noopener">civitai.red 站点</a>
+        <a href="https://civitai.com/user/account" target="_blank" rel="noopener">civitai API Key 获取</a>
+        <a href="https://github.com/civitai/civitai/wiki/REST-API-Reference" target="_blank" rel="noopener">civitai API 参考</a>
+      </div>
+    </div>
+
+    <div id="canvas-wrap">
+      <div id="canvas">
+        <div id="world">
+          <svg id="wires" xmlns="http://www.w3.org/2000/svg"></svg>
+        </div>
+      </div>
+      <div id="hint">滚轮缩放 · 空白拖拽平移 · 拖拽端口连线 · 点击连线删除 · 双击标题改名 · 右键节点菜单</div>
+    </div>
+  </div>
+
+  <div id="result-panel" class="hidden">
+    <div class="panel-head"><span>试跑结果</span><button id="btn-close-result">×</button></div>
+    <div id="result-body"></div>
+  </div>
+
+  <div id="modal" class="hidden">
+    <div class="modal-box">
+      <textarea id="modal-json" spellcheck="false"></textarea>
+      <div class="modal-actions">
+        <span id="modal-error" class="modal-error"></span>
+        <button id="modal-cancel">取消</button>
+        <button id="modal-apply" class="primary">应用</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="ctx-menu" class="hidden"></div>
+  <div id="toast"></div>
+
+  <div id="init-overlay" class="hidden">
+    <div id="init-box">
+      <div id="init-spinner" class="spinner-big"></div>
+      <div id="init-text">正在连接 AstrBot…</div>
+      <button id="init-retry" class="primary hidden">重试</button>
+    </div>
+  </div>
+
+  <!-- 必须用 type="module"：AstrBot 把 bridge-sdk 注入在 </body> 前，
+       普通脚本会在 bridge 注入前先执行导致 AstrBotPluginPage 未定义；
+       module 脚本延迟到文档解析完成后执行 -->
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

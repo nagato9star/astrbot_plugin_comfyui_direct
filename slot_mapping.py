@@ -1,0 +1,854 @@
+"""工作流槽位：节点列表、自动检测、按映射写入。
+
+运行时不再猜节点。人在配置/WebUI 下拉框里选定
+「哪个节点是提示词 / KSampler / 底模 / LoRA / 尺寸」，
+检测结果只作为下拉的初始建议。
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import re
+from typing import Any
+
+from astrbot.api import logger
+
+ARTIST_PATTERN = re.compile(r"\(\s*@[^)]*?:\s*[\d.]+\s*\)")
+QUALITY_KEYWORDS = ("masterpiece", "best quality", "score_")
+NEGATIVE_MARKERS = ("lowres", "worst quality")
+
+# 配置/WebUI 下拉框的槽位角色。值写入配方 defaults，节点 id 写入配方 slots。
+SLOT_ROLES: tuple[tuple[str, str], ...] = (
+    ("prompt", "用户要画的内容"),
+    ("model", "底模"),
+    ("loras", "LoRA"),
+    ("size", "画面大小"),
+    ("sampler", "出图采样"),
+    ("negative", "不要出现的东西"),
+    ("artist", "画师风格"),
+    ("quality", "画质词"),
+    ("trigger_words", "LoRA 触发词"),
+)
+SLOT_BASIC = ("prompt", "model", "loras", "size", "sampler")
+SLOT_HELP: dict[str, str] = {
+    "prompt": "机器人会把用户的描述写到这里。必选。",
+    "model": "这套默认用哪颗底模。用户说换模型时也写到这里。",
+    "loras": "这套默认挂哪些 LoRA。用户点名 LoRA 时覆盖这里。",
+    "size": "宽和高写到这里。竖图/横图也靠它。",
+    "sampler": "步数、精细程度写到这里。必选。",
+    "negative": "不想看到的东西。没有可留空。",
+    "artist": "用户点名画师时写到这里。没有可留空。",
+    "quality": "画质词。一般不用动。",
+    "trigger_words": "某些 LoRA 必须带的触发词。没有可留空。",
+}
+
+SLOT_CLASS_HINTS: dict[str, tuple[str, ...]] = {
+    "prompt": (
+        "CR Prompt Text",
+        "CLIPTextEncode",
+        "DanbooruText",
+        "String Literal",
+        "PrimitiveStringMultiline",
+        "CLIPTextEncodeSDXL",
+    ),
+    "negative": ("CLIPTextEncode", "CR Prompt Text", "CLIPTextEncodeSDXL"),
+    "artist": ("CR Prompt Text", "DanbooruText", "CLIPTextEncode"),
+    "quality": ("CR Prompt Text", "CLIPTextEncode"),
+    "trigger_words": ("CR Prompt Text", "CLIPTextEncode"),
+    "model": (
+        "UNETLoader",
+        "CheckpointLoaderSimple",
+        "UNETLoaderGGUF",
+        "CheckpointLoader",
+        "UnetLoaderGGUF",
+    ),
+    "loras": (
+        "Power Lora Loader (rgthree)",
+        "LoraLoaderModelOnly",
+        "LoraLoader",
+        "LoraLoaderModelOnly (rgthree)",
+    ),
+    "size": (
+        "EmptyLatentImage",
+        "EmptySD3LatentImage",
+        "EmptyHunyuanLatentImage",
+        "EmptyFluxLatentImage",
+    ),
+    "sampler": (
+        "KSampler",
+        "KSamplerAdvanced",
+        "XB_ROCmKSamplerAdvanced",
+        "KSamplerSelect",
+        "SamplerCustom",
+        "SamplerCustomAdvanced",
+    ),
+}
+
+SAMPLER_CLASSES = set(SLOT_CLASS_HINTS["sampler"])
+POWER_LORA_CLASS = "Power Lora Loader (rgthree)"
+ANIMA_DROP_NODES = ("445", "446", "447")
+
+_WIDGET_SKIP = {"fixed", "randomize", "increment", "decrement", "increment-1", "decrement-1"}
+
+
+def parse_node_option(raw: Any) -> str:
+    """配置下拉保存的是 '353 — CR Prompt Text — 主提示词'，取出节点 id。"""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    for sep in (" — ", " - ", " | ", "|"):
+        if sep in text:
+            text = text.split(sep, 1)[0].strip()
+            break
+    return text
+
+
+def format_node_option(nid: str, node: dict) -> str:
+    cls = str(node.get("class_type") or "?")
+    title = str((node.get("_meta") or {}).get("title") or "").strip()
+    if title and title != cls:
+        return f"{nid} — {cls} — {title}"
+    return f"{nid} — {cls}"
+
+
+def is_api_workflow(data: Any) -> bool:
+    if not isinstance(data, dict) or not data:
+        return False
+    if isinstance(data.get("nodes"), list):
+        return False
+    vals = [v for v in data.values() if isinstance(v, dict)]
+    if not vals:
+        return False
+    return sum(1 for v in vals if "class_type" in v) >= max(1, len(vals) // 2)
+
+
+def is_ui_workflow(data: Any) -> bool:
+    return isinstance(data, dict) and isinstance(data.get("nodes"), list)
+
+
+def normalize_workflow(data: dict, object_info: dict | None = None) -> dict:
+    """把导入的 JSON 收成 API 格式。UI 格式需要 object_info 才能可靠转换。"""
+    if is_api_workflow(data):
+        return {str(k): v for k, v in data.items() if isinstance(v, dict) and "class_type" in v}
+    if is_ui_workflow(data):
+        return ui_to_api(data, object_info)
+    raise ValueError("无法识别工作流格式。请在 ComfyUI 使用 Save (API Format) 再导入。")
+
+
+def ui_to_api(ui: dict, object_info: dict | None = None) -> dict:
+    """ComfyUI 前端 {nodes, links} → API {nid: {class_type, inputs}}。"""
+    nodes = ui.get("nodes") or []
+    raw_links = ui.get("links") or []
+    links_by_id: dict[int, list] = {}
+    for link in raw_links:
+        if isinstance(link, list) and len(link) >= 5:
+            links_by_id[int(link[0])] = link
+
+    out: dict[str, dict] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        nid = str(node.get("id"))
+        cls = str(node.get("type") or node.get("class_type") or "")
+        if not nid or not cls:
+            continue
+        inputs: dict[str, Any] = {}
+        for inp in node.get("inputs") or []:
+            if not isinstance(inp, dict):
+                continue
+            name = inp.get("name")
+            link_id = inp.get("link")
+            if name is None or link_id is None:
+                continue
+            link = links_by_id.get(int(link_id))
+            if not link:
+                continue
+            inputs[str(name)] = [str(link[1]), int(link[2])]
+
+        widgets = list(node.get("widgets_values") or [])
+        widgets = [v for v in widgets if not (isinstance(v, str) and v.lower() in _WIDGET_SKIP)]
+        widget_names = _widget_input_names(cls, object_info)
+        used = set(inputs)
+        wi = 0
+        for name in widget_names:
+            if name in used:
+                continue
+            if wi >= len(widgets):
+                break
+            inputs[name] = widgets[wi]
+            wi += 1
+        # 没有 object_info 时：把剩余 widgets 按常见字段名尽量填
+        if object_info is None and wi < len(widgets):
+            for guess, val in zip(
+                ("seed", "steps", "cfg", "sampler_name", "scheduler", "denoise", "text", "prompt"),
+                widgets[wi:],
+            ):
+                if guess not in inputs:
+                    inputs[guess] = val
+
+        meta = {}
+        title = node.get("title")
+        if title:
+            meta["title"] = title
+        pos = node.get("pos")
+        if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+            meta["pos"] = {"x": pos[0], "y": pos[1]}
+        elif isinstance(pos, dict):
+            meta["pos"] = pos
+        entry: dict[str, Any] = {"class_type": cls, "inputs": inputs}
+        if meta:
+            entry["_meta"] = meta
+        out[nid] = entry
+
+    if not out:
+        raise ValueError("UI 工作流里没有可转换的节点。请改用 Save (API Format)。")
+    if object_info is None:
+        logger.warning("[ComfyUIDirect] UI 格式在无 object_info 时按启发式转换，字段可能错位")
+    return out
+
+
+def _widget_input_names(cls: str, object_info: dict | None) -> list[str]:
+    if not object_info:
+        return []
+    info = object_info.get(cls) or {}
+    spec = info.get("input") or {}
+    names: list[str] = []
+    for bucket in ("required", "optional"):
+        block = spec.get(bucket) or {}
+        if not isinstance(block, dict):
+            continue
+        for name, typ in block.items():
+            if _is_widget_spec(typ):
+                names.append(name)
+    return names
+
+
+def _is_widget_spec(typ: Any) -> bool:
+    if not isinstance(typ, list) or not typ:
+        return False
+    head = typ[0]
+    if isinstance(head, list):
+        return True
+    return head in ("INT", "FLOAT", "STRING", "BOOLEAN", "COMBO")
+
+
+def list_nodes(wf: dict) -> list[dict]:
+    """给下拉框用的节点摘要。"""
+    rows = []
+    for nid, node in wf.items():
+        if not isinstance(node, dict) or "class_type" not in node:
+            continue
+        cls = str(node.get("class_type") or "")
+        title = str((node.get("_meta") or {}).get("title") or "")
+        rows.append(
+            {
+                "id": str(nid),
+                "class_type": cls,
+                "title": title,
+                "label": format_node_option(str(nid), node),
+            }
+        )
+    rows.sort(key=lambda r: (r["class_type"], int(r["id"]) if str(r["id"]).isdigit() else 0))
+    return rows
+
+
+def node_options_for_slot(wf: dict, slot: str, selected: str = "") -> list[str]:
+    """某个槽位的下拉选项：候选类优先，当前选中值始终保留。"""
+    hints = set(SLOT_CLASS_HINTS.get(slot) or ())
+    selected_id = parse_node_option(selected)
+    options = [""]
+    rest = []
+    for row in list_nodes(wf):
+        label = row["label"]
+        if hints and row["class_type"] not in hints and row["id"] != selected_id:
+            rest.append(label)
+            continue
+        options.append(label)
+    options.extend(rest)
+    if selected and selected not in options and selected_id:
+        for row in list_nodes(wf):
+            if row["id"] == selected_id:
+                options.insert(1, row["label"])
+                break
+        else:
+            options.insert(1, selected)
+    return options
+
+
+def detect_slots(wf: dict) -> dict[str, dict]:
+    """自动建议槽位。结果必须给人确认后写入配方，运行时不再调用。"""
+    slots: dict[str, dict] = {}
+    roles = _find_prompt_roles(wf)
+    if roles.get("main"):
+        slots["prompt"] = _slot(roles["main"], wf, "prompt")
+    elif roles.get("main_alt"):
+        slots["prompt"] = _slot(roles["main_alt"], wf, "prompt")
+    if roles.get("artist"):
+        slots["artist"] = _slot(roles["artist"], wf, "artist")
+    if roles.get("quality"):
+        slots["quality"] = _slot(roles["quality"], wf, "quality", mode="append")
+    if roles.get("triggers"):
+        slots["trigger_words"] = _slot(roles["triggers"], wf, "trigger_words")
+
+    neg = _find_negative_node(wf)
+    if neg:
+        slots["negative"] = _slot(neg, wf, "negative", mode="append")
+
+    model_id = _first_class(wf, SLOT_CLASS_HINTS["model"])
+    if model_id:
+        slots["model"] = _slot(model_id, wf, "model")
+
+    lora_id = _first_class(wf, (POWER_LORA_CLASS,)) or _first_class(
+        wf, SLOT_CLASS_HINTS["loras"]
+    )
+    if lora_id:
+        slots["loras"] = _slot(lora_id, wf, "loras")
+
+    size_id = _first_class(wf, SLOT_CLASS_HINTS["size"])
+    if size_id:
+        slots["size"] = _slot(size_id, wf, "size")
+
+    sampler_id = _first_class(wf, SLOT_CLASS_HINTS["sampler"])
+    if sampler_id:
+        slots["sampler"] = _slot(sampler_id, wf, "sampler")
+
+    return slots
+
+
+def looks_like_anima(wf: dict) -> bool:
+    has_join = any(n.get("class_type") == "JoinStringMulti" for n in wf.values() if isinstance(n, dict))
+    has_cr = any(n.get("class_type") == "CR Prompt Text" for n in wf.values() if isinstance(n, dict))
+    return has_join and has_cr
+
+
+def _slot(nid: str, wf: dict, role: str, mode: str = "replace") -> dict:
+    node = wf.get(nid) or {}
+    field = infer_field(node, role)
+    out: dict[str, Any] = {"node": str(nid), "mode": mode}
+    if field:
+        out["field"] = field
+    return out
+
+
+def infer_field(node: dict, role: str) -> str:
+    ins = node.get("inputs") or {}
+    cls = str(node.get("class_type") or "")
+    if role in ("prompt", "artist", "quality", "trigger_words"):
+        if "prompt" in ins:
+            return "prompt"
+        if "text" in ins:
+            return "text"
+        return "prompt" if cls == "CR Prompt Text" else "text"
+    if role == "negative":
+        return "text" if "text" in ins else "prompt"
+    if role == "model":
+        for key in ("unet_name", "ckpt_name"):
+            if key in ins:
+                return key
+        if "Checkpoint" in cls:
+            return "ckpt_name"
+        return "unet_name"
+    if role == "size":
+        return "width"
+    if role == "sampler":
+        if "noise_seed" in ins and "seed" not in ins:
+            return "noise_seed"
+        return "seed"
+    if role == "loras":
+        return "lora" if cls == POWER_LORA_CLASS else "lora_name"
+    return ""
+
+
+def _first_class(wf: dict, classes: tuple[str, ...]) -> str | None:
+    wanted = set(classes)
+    for nid, node in wf.items():
+        if isinstance(node, dict) and node.get("class_type") in wanted:
+            return str(nid)
+    return None
+
+
+def _classify_prompt_role(text: str) -> str:
+    t = text.strip()
+    if not t:
+        return "main"
+    if ARTIST_PATTERN.search(t):
+        return "artist"
+    if t.startswith("@"):
+        return "triggers"
+    if any(k in t for k in QUALITY_KEYWORDS):
+        return "quality"
+    return "main"
+
+
+def _find_prompt_roles(wf: dict) -> dict[str, str | None]:
+    roles: dict[str, str | None] = {
+        "artist": None,
+        "quality": None,
+        "main": None,
+        "triggers": None,
+        "main_alt": None,
+    }
+    joins = [nid for nid, n in wf.items() if isinstance(n, dict) and n.get("class_type") == "JoinStringMulti"]
+    if joins:
+        for jid in joins:
+            node = wf[jid]
+            entries: list[tuple[int, Any]] = []
+            for key, val in (node.get("inputs") or {}).items():
+                if not key.startswith("string_"):
+                    continue
+                try:
+                    idx = int(key.split("_")[1])
+                except ValueError:
+                    continue
+                entries.append((idx, val))
+            pending: list[str] = []
+            seen_at = False
+            for _, link in sorted(entries):
+                if not isinstance(link, list) or not link:
+                    continue
+                tid, tn = _follow_prompt_node(wf, str(link[0]))
+                if tn.get("class_type") != "CR Prompt Text":
+                    continue
+                text = str((tn.get("inputs") or {}).get("prompt", ""))
+                if not text.strip():
+                    pending.append(tid)
+                    continue
+                role = _classify_prompt_role(text)
+                if role == "triggers" and not seen_at and roles["artist"] is None:
+                    role = "artist"
+                if role == "artist":
+                    seen_at = True
+                if roles.get(role) is None:
+                    roles[role] = tid
+            multi = roles["quality"] is not None or roles["triggers"] is not None
+            for tid in pending:
+                if multi and roles["artist"] is None:
+                    roles["artist"] = tid
+                elif roles["main"] is None:
+                    roles["main"] = tid
+                elif multi and roles["triggers"] is None:
+                    roles["triggers"] = tid
+        return roles
+
+    candidates = [
+        (nid, str((n.get("inputs") or {}).get("prompt", "")))
+        for nid, n in wf.items()
+        if isinstance(n, dict) and n.get("class_type") == "CR Prompt Text"
+    ]
+    seen_at = False
+    for nid, text in candidates:
+        role = _classify_prompt_role(text)
+        if role == "triggers" and not seen_at and roles["artist"] is None:
+            role = "artist"
+        if role == "artist":
+            roles["artist"] = nid
+            seen_at = True
+            break
+    others = [(nid, t) for nid, t in candidates if nid != roles["artist"]]
+    if others:
+        roles["main"] = max(others, key=lambda x: len(x[1]))[0]
+    else:
+        best = None
+        for nid, node in wf.items():
+            if not isinstance(node, dict) or node.get("class_type") != "CLIPTextEncode":
+                continue
+            text = str((node.get("inputs") or {}).get("text", ""))
+            if any(m in text for m in NEGATIVE_MARKERS):
+                continue
+            if best is None or len(text) > best[1]:
+                best = (nid, len(text))
+        if best:
+            roles["main_alt"] = best[0]
+    return roles
+
+
+def _follow_prompt_node(wf: dict, tid: str) -> tuple[str, dict]:
+    tn = wf.get(tid) or {}
+    for _ in range(5):
+        if tn.get("class_type") == "CR Prompt Text":
+            return tid, tn
+        sub = tn.get("inputs") or {}
+        ref = sub.get("string") or sub.get("text")
+        if isinstance(ref, list) and ref:
+            tid = str(ref[0])
+            tn = wf.get(tid) or {}
+            continue
+        break
+    return tid, tn
+
+
+def _find_negative_node(wf: dict) -> str | None:
+    for nid, node in wf.items():
+        if not isinstance(node, dict) or node.get("class_type") != "CLIPTextEncode":
+            continue
+        title = str((node.get("_meta") or {}).get("title") or "").lower()
+        text = str((node.get("inputs") or {}).get("text", ""))
+        if "negative" in title or any(m in text for m in NEGATIVE_MARKERS):
+            return str(nid)
+    return None
+
+
+def slots_from_config(raw: Any) -> dict[str, dict]:
+    """把配置对象 node_slots 收成配方 slots。"""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for role, _label in SLOT_ROLES:
+        nid = parse_node_option(raw.get(role))
+        if nid:
+            out[role] = {"node": nid, "mode": "append" if role in ("negative", "quality") else "replace"}
+    return out
+
+
+def merge_slots(detected: dict[str, dict], configured: dict[str, dict]) -> dict[str, dict]:
+    merged = dict(detected)
+    merged.update(configured)
+    return merged
+
+
+def read_current_values(wf: dict, slots: dict[str, dict]) -> dict[str, Any]:
+    """从映射节点读出配方要保存的值：底模、LoRA、尺寸、KSampler。"""
+    values: dict[str, Any] = {}
+    model_slot = slots.get("model")
+    if model_slot:
+        node = wf.get(str(model_slot["node"])) or {}
+        field = model_slot.get("field") or infer_field(node, "model")
+        val = (node.get("inputs") or {}).get(field)
+        if isinstance(val, str) and val:
+            values["model"] = val
+
+    lora_slot = slots.get("loras")
+    if lora_slot:
+        values["loras"] = _read_loras(wf.get(str(lora_slot["node"])) or {})
+
+    size_slot = slots.get("size")
+    if size_slot:
+        ins = (wf.get(str(size_slot["node"])) or {}).get("inputs") or {}
+        if isinstance(ins.get("width"), (int, float)):
+            values["width"] = int(ins["width"])
+        if isinstance(ins.get("height"), (int, float)):
+            values["height"] = int(ins["height"])
+
+    sampler_slot = slots.get("sampler")
+    if sampler_slot:
+        ins = (wf.get(str(sampler_slot["node"])) or {}).get("inputs") or {}
+        for key in ("steps", "cfg", "sampler_name", "scheduler", "denoise", "seed"):
+            val = ins.get(key)
+            if key == "seed":
+                val = ins.get("seed", ins.get("noise_seed"))
+            if val is None or isinstance(val, list):
+                continue
+            values[key] = val
+    return values
+
+
+def _read_loras(node: dict) -> list[dict]:
+    ins = node.get("inputs") or {}
+    cls = node.get("class_type")
+    if cls == POWER_LORA_CLASS:
+        out = []
+        slots = sorted(
+            (k for k, v in ins.items() if k.startswith("lora_") and isinstance(v, dict)),
+            key=lambda k: int(k.split("_")[1]) if k.split("_")[1].isdigit() else 0,
+        )
+        for key in slots:
+            spec = ins[key]
+            if not spec.get("on"):
+                continue
+            name = str(spec.get("lora") or "").strip()
+            if not name:
+                continue
+            try:
+                strength = float(spec.get("strength", 0.8))
+            except (TypeError, ValueError):
+                strength = 0.8
+            out.append({"name": name, "strength": strength})
+        return out
+    name = str(ins.get("lora_name") or "").strip()
+    if not name:
+        return []
+    try:
+        strength = float(ins.get("strength_model", ins.get("strength", 0.8)))
+    except (TypeError, ValueError):
+        strength = 0.8
+    return [{"name": name, "strength": strength}]
+
+
+def parse_lora(lora: Any) -> list[dict]:
+    if lora is None:
+        return []
+    if isinstance(lora, list):
+        parsed = lora
+    elif isinstance(lora, dict):
+        parsed = [lora]
+    else:
+        txt = str(lora).strip()
+        if not txt or txt.lower() in ("none", "null"):
+            return []
+        try:
+            parsed = json.loads(txt)
+        except ValueError:
+            try:
+                parsed = ast.literal_eval(txt)
+            except (ValueError, SyntaxError) as e:
+                raise ValueError(f"lora 参数格式错误: {lora}") from e
+    out: list[dict] = []
+    for item in parsed:
+        if isinstance(item, dict):
+            out.append(item)
+        elif isinstance(item, str) and item.strip():
+            out.append({"name": item})
+        else:
+            raise ValueError(f"lora 参数格式错误: {lora}")
+    return out
+
+
+def resolve_size(width: int | None, height: int | None, size: str | None) -> tuple[int | None, int | None]:
+    w, h = width or 0, height or 0
+    token = str(size or "same").strip().lower()
+    if not w or not h:
+        if token == "portrait":
+            return 832, 1216
+        if token == "landscape":
+            return 1216, 832
+        if token == "square":
+            return 1024, 1024
+        return (w or None), (h or None)
+    if token in ("", "same"):
+        return w, h
+    if token == "portrait":
+        return min(w, h), max(w, h)
+    if token == "landscape":
+        return max(w, h), min(w, h)
+    if token == "square":
+        side = int(round((w + h) / 2 / 64) * 64) or 1024
+        return side, side
+    return w, h
+
+
+def apply_slots(
+    wf: dict,
+    slots: dict[str, dict],
+    values: dict[str, Any],
+    *,
+    prefix: str | None = None,
+    drop_nodes: list[str] | None = None,
+) -> dict:
+    """按已确认的槽位写节点。None 值跳过。"""
+    if drop_nodes:
+        for nid in drop_nodes:
+            wf.pop(str(nid), None)
+
+    prompt = values.get("prompt")
+    if prompt is not None and slots.get("prompt"):
+        _write_text(wf, slots["prompt"], str(prompt), role="prompt")
+
+    for role in ("artist", "trigger_words"):
+        val = values.get(role)
+        if val is not None and slots.get(role):
+            _write_text(wf, slots[role], str(val), role=role)
+            if role == "artist":
+                _sync_danbooru_text(wf, str(val))
+
+    for role in ("negative", "quality"):
+        val = values.get(role)
+        if val is not None and slots.get(role):
+            _write_text(wf, slots[role], str(val), role=role)
+
+    model = values.get("model")
+    if model is not None and slots.get("model"):
+        spec = slots["model"]
+        node = wf.get(str(spec["node"]))
+        if node is not None:
+            field = spec.get("field") or infer_field(node, "model")
+            node.setdefault("inputs", {})[field] = str(model)
+
+    if values.get("loras") is not None and slots.get("loras"):
+        _apply_loras(wf, str(slots["loras"]["node"]), parse_lora(values.get("loras")))
+    elif values.get("lora") is not None and slots.get("loras"):
+        _apply_loras(wf, str(slots["loras"]["node"]), parse_lora(values.get("lora")))
+
+    width, height = values.get("width"), values.get("height")
+    size_token = values.get("size")
+    if isinstance(size_token, str) and size_token and size_token not in ("same",):
+        rw = width if isinstance(width, int) else None
+        rh = height if isinstance(height, int) else None
+        if slots.get("size") and (rw is None or rh is None):
+            ins = (wf.get(str(slots["size"]["node"])) or {}).get("inputs") or {}
+            rw = rw or (int(ins["width"]) if isinstance(ins.get("width"), (int, float)) else None)
+            rh = rh or (int(ins["height"]) if isinstance(ins.get("height"), (int, float)) else None)
+        width, height = resolve_size(rw, rh, size_token)
+
+    if (width is not None or height is not None) and slots.get("size"):
+        node = wf.get(str(slots["size"]["node"]))
+        if node is not None:
+            ins = node.setdefault("inputs", {})
+            if width is not None:
+                ins["width"] = int(width)
+            if height is not None:
+                ins["height"] = int(height)
+
+    sampler_spec = slots.get("sampler")
+    sampler_keys = ("steps", "cfg", "sampler_name", "scheduler", "denoise", "seed")
+    if sampler_spec and any(values.get(k) is not None for k in sampler_keys):
+        _apply_sampler(wf, str(sampler_spec["node"]), values)
+
+    if prefix is not None:
+        for node in wf.values():
+            if isinstance(node, dict) and node.get("class_type") == "SaveImage":
+                node.setdefault("inputs", {})["filename_prefix"] = prefix
+                break
+    return wf
+
+
+def _write_text(wf: dict, spec: dict, text: str, *, role: str) -> None:
+    node = wf.get(str(spec["node"]))
+    if node is None:
+        return
+    field = spec.get("field") or infer_field(node, role)
+    ins = node.setdefault("inputs", {})
+    mode = spec.get("mode") or ("append" if role in ("negative", "quality") else "replace")
+    if mode == "append":
+        existing = str(ins.get(field) or "").strip()
+        if existing and text and text not in existing:
+            sep = ", " if not existing.rstrip().endswith(",") else " "
+            ins[field] = f"{existing}{sep}{text}".strip()
+            return
+        if existing and not text:
+            return
+    ins[field] = text
+
+
+def _sync_danbooru_text(wf: dict, artist_text: str) -> None:
+    for node in wf.values():
+        if not isinstance(node, dict) or node.get("class_type") != "DanbooruText":
+            continue
+        t = str((node.get("inputs") or {}).get("text", ""))
+        if "@" in t:
+            node.setdefault("inputs", {})["text"] = artist_text
+            return
+
+
+def _apply_sampler(wf: dict, nid: str, values: dict[str, Any]) -> None:
+    node = wf.get(nid)
+    if node is None:
+        return
+    ins = node.setdefault("inputs", {})
+    is_adv = node.get("class_type") in ("KSamplerAdvanced", "XB_ROCmKSamplerAdvanced")
+    seed = values.get("seed")
+    if seed is not None:
+        if "seed" in ins:
+            ins["seed"] = int(seed)
+        if is_adv and "noise_seed" in ins:
+            ins["noise_seed"] = int(seed)
+        # 双段采样链：种子同步到其它采样器，步数等只写选中的那一个
+        for other in wf.values():
+            if other is node or not isinstance(other, dict):
+                continue
+            if other.get("class_type") not in SAMPLER_CLASSES:
+                continue
+            oins = other.setdefault("inputs", {})
+            if "seed" in oins and not isinstance(oins.get("seed"), list):
+                oins["seed"] = int(seed)
+            if other.get("class_type") in ("KSamplerAdvanced", "XB_ROCmKSamplerAdvanced") and "noise_seed" in oins:
+                oins["noise_seed"] = int(seed)
+    if values.get("steps") is not None and not isinstance(ins.get("steps"), list):
+        ins["steps"] = int(values["steps"])
+    if values.get("cfg") is not None:
+        ins["cfg"] = float(values["cfg"])
+    if values.get("sampler_name"):
+        ins["sampler_name"] = str(values["sampler_name"])
+    if values.get("scheduler"):
+        ins["scheduler"] = str(values["scheduler"])
+    if values.get("denoise") is not None:
+        ins["denoise"] = float(values["denoise"])
+
+
+def _apply_loras(wf: dict, nid: str, parsed: list[dict]) -> None:
+    node = wf.get(nid)
+    if node is None:
+        return
+    if node.get("class_type") == POWER_LORA_CLASS:
+        if not parsed:
+            for other in wf.values():
+                if isinstance(other, dict) and other.get("class_type") == "LoraLoaderModelOnly":
+                    other.setdefault("inputs", {})["strength_model"] = 0.0
+        ins = node.setdefault("inputs", {})
+        slots = sorted(
+            (k for k, v in ins.items() if k.startswith("lora_") and isinstance(v, dict)),
+            key=lambda k: int(k.split("_")[1]) if k.split("_")[1].isdigit() else 0,
+        )
+        for i, slot in enumerate(slots):
+            if i < len(parsed):
+                spec = parsed[i]
+                ins[slot] = {
+                    "on": True,
+                    "lora": str(spec.get("name") or "").strip(),
+                    "strength": float(spec.get("strength", 0.8)),
+                }
+            else:
+                ins[slot]["on"] = False
+        if len(parsed) > len(slots):
+            logger.warning(
+                f"[ComfyUIDirect] 传入 {len(parsed)} 个 LoRA，超过 Power Lora Loader "
+                f"的 {len(slots)} 个插槽，多余的已忽略"
+            )
+        return
+
+    # 单节点 LoraLoader / 从该节点起的 LoraLoaderModelOnly 链
+    chain = _collect_lora_chain(wf, start=nid)
+    if not chain and node.get("class_type") in ("LoraLoader", "LoraLoaderModelOnly"):
+        chain = [nid]
+    for i, cid in enumerate(chain):
+        target = wf.get(cid)
+        if target is None:
+            continue
+        tins = target.setdefault("inputs", {})
+        if i < len(parsed):
+            spec = parsed[i]
+            if spec.get("name"):
+                tins["lora_name"] = str(spec["name"])
+            if "strength" in spec:
+                tins["strength_model"] = float(spec["strength"])
+                if "strength_clip" in tins and not isinstance(tins.get("strength_clip"), list):
+                    tins["strength_clip"] = float(spec["strength"])
+        else:
+            tins["strength_model"] = 0.0
+
+
+def _collect_lora_chain(wf: dict, start: str | None = None) -> list[str]:
+    if start and (wf.get(start) or {}).get("class_type") in (
+        "LoraLoaderModelOnly",
+        "LoraLoader",
+    ):
+        cur = start
+    else:
+        cur = None
+        for nid, node in wf.items():
+            if isinstance(node, dict) and node.get("class_type") == "UNETLoader":
+                cur = nid
+                break
+        if cur is None:
+            return []
+    chain: list[str] = []
+    seen = {cur}
+    for _ in range(50):
+        nxt = None
+        for nid, node in wf.items():
+            if nid in seen or not isinstance(node, dict):
+                continue
+            ins = node.get("inputs") or {}
+            if (
+                node.get("class_type") == "LoraLoaderModelOnly"
+                and isinstance(ins.get("model"), list)
+                and str(ins["model"][0]) == str(cur)
+            ):
+                chain.append(nid)
+                nxt = nid
+                seen.add(nid)
+                break
+        if nxt is None:
+            break
+        cur = nxt
+    return chain

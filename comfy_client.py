@@ -231,6 +231,37 @@ class ComfyUIClient:
             return history[prompt_id]
         return None
 
+    async def list_history(self, max_items: int = 12) -> list[dict]:
+        """最近执行记录，用于 WebUI 从 ComfyUI 导入工作流。"""
+        history = await self._get("/history")
+        if not isinstance(history, dict):
+            return []
+        rows: list[dict] = []
+        for pid, entry in history.items():
+            if not isinstance(entry, dict):
+                continue
+            prompt = entry.get("prompt")
+            number = 0
+            wf = None
+            if isinstance(prompt, list) and len(prompt) >= 3:
+                try:
+                    number = int(prompt[0])
+                except (TypeError, ValueError):
+                    number = 0
+                if isinstance(prompt[2], dict):
+                    wf = prompt[2]
+            rows.append(
+                {
+                    "prompt_id": pid,
+                    "number": number,
+                    "status": (entry.get("status") or {}).get("status_str") or "",
+                    "workflow": wf,
+                    "has_workflow": isinstance(wf, dict) and bool(wf),
+                }
+            )
+        rows.sort(key=lambda r: r.get("number") or 0, reverse=True)
+        return rows[:max_items]
+
     async def get_queue(self) -> dict | None:
         """GET /queue → {"queue_running": [...], "queue_pending": [...]}。"""
         return await self._get("/queue")

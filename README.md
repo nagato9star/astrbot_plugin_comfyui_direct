@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**局域网直连 ComfyUI API 的 AstrBot 插件，生图、查模型、管工作流，一套搞定。**
+**局域网直连 ComfyUI。人配一套默认画法，对机器人说话就能画；点名换模、换 LoRA、换画幅也可以。**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
@@ -16,7 +16,11 @@
 
 ## 📢 简介
 
-ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的生图插件，通过局域网直连 ComfyUI API，让 Bot 可以直接生成图片、查询模型清单、管理工作流模板。内置 Anima 工作流（anima-v3），提示词自动按 画师串 / 质量词 / 主提示词 / LoRA 触发词 四段组装，配合 Danbooru tag 校正，出图又快又准。
+ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的生图插件。
+
+你先在配方工作台里导入 ComfyUI 的图，确认「用户要画的内容」和「出图采样」写到哪，再保存一套默认的底模 / LoRA / 画幅。之后对机器人说「画一个站在街上的女孩」就能出图。
+
+用户点名换配方、换底模、换 LoRA、竖图横图、画师、画质、步数时，机器人会改对应的项；**没点名的一律不动**。它不会去猜节点，也不会把整份模型清单塞进上下文。
 
 本插件完全开源免费，欢迎 Issue 和 PR。
 
@@ -24,15 +28,10 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 
 | 功能 | 说明 |
 |:---|:---|
-| **图片生成** | `comfyui_generate` 直连 ComfyUI，图片直接发送到当前会话 |
-| **模型查询** | UNET / LoRA / CLIP / VAE / Embedding 清单自动同步并本地缓存，离线回退缓存 |
-| **队列与 GPU** | 查询运行中/待执行任务数、ComfyUI 版本、内存与显存占用 |
-| **中断生成** | 中断正在执行的任务，可同时从待执行队列移除 |
-| **booru 查证** | danbooru / gelbooru 查画师、角色触发词、别名与常用 tag，告别凭记忆编 tag |
-| **模型元数据** | 读本地 safetensors 头部元数据，或按名称搜 civitai 官方 trainedWords |
-| **civitai 配方** | 搜参考图直接返回完整生成配方（模型/prompt/sampler/steps/cfg/seed） |
-| **提示词优化** | 自然语言需求自动扩展成 Danbooru tags，支持联网搜索与深度思考 |
-| **Workflow Studio** | WebUI 节点画布编辑器，可视化编辑工作流模板并一键试跑 |
+| **对机器人说话就画** | 默认只填要画的内容，底模和 LoRA 用你保存的配方 |
+| **点名再改** | 换配方 / 底模 / LoRA / 画幅 / 画师 / 画质 / 步数，用户没说就不改 |
+| **配方工作台** | 导入图、确认格子、保存一套默认画法，还能试一张 |
+| **查一下再画** | 角色、画师、底模、LoRA 不确定时先查短列表 |
 
 ## 🚀 快速开始
 
@@ -46,9 +45,26 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 
 在插件配置中确认 `comfyui_host`（默认 `127.0.0.1:8188`，本机）。
 
-### 3. 开始使用
+### 3. 映射节点并保存配方
 
-直接让 LLM 调用工具即可，只需填 `prompt`，其余参数用配置默认值。
+打开插件页面「配方工作台」：
+
+1. 在 ComfyUI 里 **Save (API Format)**，把 JSON 导进来（或点「刚画过的」）。
+2. 确认两个必选格子：**用户要画的内容**、**出图采样**。底模 / LoRA / 画幅有就选。
+3. 填这套默认用的底模、LoRA、竖图还是横图，起个好叫的名字，保存。
+
+然后就可以对机器人说：
+
+| 你说 | 机器人做什么 |
+|:---|:---|
+| 画一个站在街上的女孩 | 只用这句话，其他全用默认配方 |
+| 用立绘那套，全身竖图 | 换配方 + 竖图 |
+| 换成喵喵底模，加上 zoda | 按关键词匹配已安装的底模/LoRA，只改这一次 |
+| 画师用 xxx | 只改画师 |
+| 精细一点 | 才动步数 |
+| 把这套记住，叫日常 | 把当前底模/LoRA/画幅存成新配方 |
+
+配置项 `llm_tool_mode=full` 才会把旧的调试工具暴露给模型。
 
 ## ⚙️ 配置（`_conf_schema.json`）
 
@@ -59,6 +75,9 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 | `comfyui_timeout` | `300` | 生成等待超时（秒） |
 | `model_cache_ttl` | `600` | 模型清单缓存刷新间隔（秒），0 表示每次强制同步 |
 | `default_workflow` | `anima-v3` | 默认工作流模板名 |
+| `default_recipe` | `默认` | LLM 不指定 recipe 时使用的配方 |
+| `llm_tool_mode` | `basic` | `basic` 只暴露 draw/lookup；`full` 打开全部调试工具 |
+| `node_slots` | 空 | 下拉框：哪个节点是提示词 / KSampler / 底模 / LoRA / 尺寸。导入工作流后自动刷新，重载插件生效 |
 | `danbooru_base_url` | `https://danbooru.donmai.us` | danbooru 接口地址（国内可换镜像） |
 | `gelbooru_base_url` | `https://gelbooru.com` | gelbooru DAPI 地址（镜像可换） |
 | `civitai_api_key` | 空 | civitai API Key（可选，以你的身份调用） |

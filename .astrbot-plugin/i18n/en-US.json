@@ -4,8 +4,8 @@
   },
   "pages": {
     "workflow-editor": {
-      "title": "Workflow Studio",
-      "desc": "Visual editor for ComfyUI workflow templates"
+      "title": "Recipe Studio",
+      "desc": "Import a workflow, map prompt/KSampler nodes with dropdowns, save model and sampler recipes"
     }
   }
 }

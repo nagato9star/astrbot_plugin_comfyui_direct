@@ -1,1003 +1,542 @@
-/* ComfyUI Direct · Workflow Studio —— 节点画布编辑器（零依赖 vanilla JS） */
-"use strict";
+const SLOT_FALLBACK = [
+  { id: "prompt", label: "用户要画的内容", help: "必选", basic: true },
+  { id: "model", label: "底模", help: "", basic: true },
+  { id: "loras", label: "LoRA", help: "", basic: true },
+  { id: "size", label: "画面大小", help: "", basic: true },
+  { id: "sampler", label: "出图采样", help: "必选", basic: true },
+  { id: "negative", label: "不要出现的东西", help: "", basic: false },
+  { id: "artist", label: "画师风格", help: "", basic: false },
+  { id: "quality", label: "画质词", help: "", basic: false },
+  { id: "trigger_words", label: "LoRA 触发词", help: "", basic: false },
+];
 
-const NODE_W = 240;
-const HEADER_H = 34;
-const ROW_H = 28;
-
-/* ---------------- 节点类型定义 ---------------- */
-const TYPE_OF = (cls) => {
-  if (["UNETLoader", "CLIPLoader", "VAELoader", "LoraLoaderModelOnly", "Power Lora Loader (rgthree)"].includes(cls)) return "loader";
-  if (["CR Prompt Text", "CLIPTextEncode", "JoinStringMulti", "DanbooruText"].includes(cls)) return "conditioning";
-  if (["KSampler", "ModelSamplingAuraFlow"].includes(cls)) return "sampler";
-  if (["EmptyLatentImage"].includes(cls)) return "latent";
-  if (["VAEDecode", "SaveImage"].includes(cls)) return "image";
-  return "other";
-};
-
-/* 新建节点时的默认结构（节点库 + 新建用） */
-const NODE_DEFAULTS = {
-  "CR Prompt Text": { title: "文本提示词", inputs: { prompt: "" } },
-  "DanbooruText": { title: "Danbooru 文本", inputs: { text: "" } },
-  "JoinStringMulti": {
-    title: "合并字符串",
-    inputs: {
-      inputcount: 4, delimiter: " ", return_list: false, "Update inputs": null,
-      string_1: [], string_2: [], string_3: [], string_4: [],
-    },
-  },
-  "CLIPTextEncode": { title: "CLIP 文本编码", inputs: { text: "", clip: [] } },
-  "UNETLoader": { title: "UNet 加载器", inputs: { unet_name: "", weight_dtype: "default" } },
-  "CLIPLoader": { title: "CLIP 加载器", inputs: { clip_name: "", type: "stable_diffusion", device: "default" } },
-  "VAELoader": { title: "VAE 加载器", inputs: { vae_name: "" } },
-  "LoraLoaderModelOnly": { title: "LoRA 加载器", inputs: { model: [], lora_name: "", strength_model: 0.8 } },
-  "Power Lora Loader (rgthree)": {
-    title: "Power LoRA (rgthree)",
-    inputs: { model: [], clip: [], lora_1: { on: true, lora: "", strength: 0.8 }, lora_2: { on: false, lora: "", strength: 0.8 } },
-  },
-  "EmptyLatentImage": { title: "空潜变量", inputs: { width: 1024, height: 1536, batch_size: 1 } },
-  "KSampler": {
-    title: "K 采样器",
-    inputs: { seed: 0, steps: 20, cfg: 1, sampler_name: "er_sde", scheduler: "normal", denoise: 1, model: [], positive: [], negative: [], latent_image: [] },
-  },
-  "ModelSamplingAuraFlow": { title: "采样算法 (AuraFlow)", inputs: { shift: 2, model: [] } },
-  "VAEDecode": { title: "VAE 解码", inputs: { samples: [], vae: [] } },
-  "SaveImage": { title: "保存图像", inputs: { filename_prefix: "ComfyUI", images: [] } },
-};
-
-/* 删除连线时的兜底值 */
-const LINK_DEFAULTS = {
-  prompt: "", text: "", model: "", clip: "", positive: "", negative: "",
-  samples: "", vae: "", latent_image: "", unet: "", images: "",
-  seed: 0, steps: 20, cfg: 1, denoise: 1, shift: 2, strength_model: 0.8,
-  sampler_name: "euler", scheduler: "normal", delimiter: " ", inputcount: 4,
-  return_list: false, batch_size: 1,
-  lora_name: "None", unet_name: "None", clip_name: "None", vae_name: "None",
-};
-const FILE_LISTS = { unet_name: "unet_name", lora_name: "lora_name", clip_name: "clip_name", vae_name: "vae_name", lora: "lora_name" };
-
-const SAMPLER_FALLBACK = ["er_sde", "euler", "euler_ancestral", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_3m_sde", "dpmpp_sde", "ddim", "uni_pc", "lcm"];
-const SCHEDULER_FALLBACK = ["normal", "karras", "exponential", "sgm_uniform", "simple", "beta"];
-
-/* ---------------- 全局状态 ---------------- */
 const state = {
-  wf: {},           // node_id -> {inputs, class_type, _meta}
-  current: "",      // 当前模板名
-  source: "",       // custom | builtin | skill
-  templates: [],
-  models: { unet_name: [], lora_name: [], clip_name: [], vae_name: [] },
-  systemStats: null,
-  samplers: SAMPLER_FALLBACK,
-  schedulers: SCHEDULER_FALLBACK,
   connected: false,
-  dirty: false,
-  running: false,
-  pan: { x: 80, y: 60 },
-  zoom: 1,
-  drag: null,       // 节点拖动 / 画布平移 / 端口连线
+  templates: [],
+  recipes: [],
+  slotRoles: SLOT_FALLBACK,
+  slotOptions: {},
+  resources: { unet_name: [], lora_name: [] },
+  samplers: ["er_sde", "euler", "dpmpp_2m"],
+  schedulers: ["normal", "karras", "simple"],
+  recipe: emptyRecipe(),
+  history: [],
+  runningPid: "",
 };
 
-/* ---------------- 基础工具 ---------------- */
+function emptyRecipe() {
+  return {
+    id: "",
+    name: "",
+    description: "",
+    workflow: "",
+    slots: {},
+    defaults: { loras: [] },
+    drop_nodes: [],
+  };
+}
+
 const $ = (sel) => document.querySelector(sel);
-const $$ = (sel) => Array.from(document.querySelectorAll(sel));
-const world = () => $("#world");
-const canvasEl = () => $("#canvas");
 
 function toast(msg, isErr = false) {
   const t = $("#toast");
   t.textContent = msg;
   t.className = isErr ? "show err" : "show";
   clearTimeout(t._tm);
-  t._tm = setTimeout(() => (t.className = ""), 2600);
-}
-
-/* ---------------- Bridge 诊断与恢复 ---------------- */
-let bridgeLoadErrors = [];
-window.addEventListener("error", (e) => {
-  const src = e.target && e.target.tagName === "SCRIPT" ? e.target.src : "";
-  if (src) bridgeLoadErrors.push(`脚本加载失败: ${src}`);
-});
-
-function diagnoseBridge() {
-  const lines = [];
-  const tags = document.querySelectorAll('script[src*="bridge-sdk"]');
-  lines.push(`bridge 脚本标签数: ${tags.length}`);
-  if (tags.length) {
-    lines.push(`src: ${tags[0].getAttribute("src")}`);
-    lines.push(`script 是否已执行: ${window.AstrBotPluginPage ? "是" : "否"}`);
-  } else {
-    lines.push("未注入 bridge 脚本（AstrBot 版本可能不支持页面 bridge，或页面未走 Dashboard 加载）");
-  }
-  if (bridgeLoadErrors.length) {
-    lines.push("加载错误: " + bridgeLoadErrors.join(" | "));
-  }
-  lines.push(`iframe 中: ${window.parent !== window ? "是" : "否"}`);
-  return lines.join("\n");
-}
-
-function setInitState(text, showRetry = false) {
-  const overlay = $("#init-overlay");
-  if (!overlay) return;
-  $("#init-spinner").classList.toggle("hidden", showRetry);
-  $("#init-text").textContent = text;
-  $("#init-retry").classList.toggle("hidden", !showRetry);
-  overlay.classList.remove("hidden");
-}
-function hideInitState() {
-  $("#init-overlay").classList.add("hidden");
-}
-function showInitError(text) {
-  const detail = diagnoseBridge();
-  const pre = document.createElement("pre");
-  pre.className = "init-detail";
-  pre.textContent = detail;
-  const box = $("#init-box");
-  box.querySelectorAll(".init-detail").forEach((n) => n.remove());
-  box.appendChild(pre);
-  setInitState(text || "Bridge 初始化失败——请通过 AstrBot Dashboard 打开本页面。", true);
+  t._tm = setTimeout(() => (t.className = ""), 2400);
 }
 
 async function waitForBridge(timeoutMs = 20000) {
   const start = Date.now();
   while (!window.AstrBotPluginPage) {
     if (Date.now() - start > timeoutMs) return null;
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 80));
   }
   return window.AstrBotPluginPage;
 }
 
-/* Bridge 不可用时等待重连（如主题切换导致 iframe 重载），期间全屏提示 */
-async function ensureBridge(timeoutMs = 15000) {
-  if (window.AstrBotPluginPage) return true;
-  setInitState("连接已断开，正在重连…");
-  const bridge = await waitForBridge(timeoutMs);
-  if (bridge) {
-    hideInitState();
+async function apiGet(endpoint, params) {
+  const bridge = window.AstrBotPluginPage;
+  if (!bridge) throw new Error("bridge 未就绪");
+  return bridge.apiGet(endpoint, params || {});
+}
+async function apiPost(endpoint, body) {
+  const bridge = window.AstrBotPluginPage;
+  if (!bridge) throw new Error("bridge 未就绪");
+  return bridge.apiPost(endpoint, body || {});
+}
+
+function fillSelect(sel, values, current, extra = [""]) {
+  const seen = new Set();
+  const opts = [...extra, ...(values || [])].filter((v) => {
+    if (seen.has(v)) return false;
+    seen.add(v);
     return true;
-  }
-  showInitError("Bridge 连接超时——请点击重试，或通过 AstrBot Dashboard 重新打开本页面。");
-  return false;
+  });
+  if (current && !seen.has(current)) opts.splice(1, 0, current);
+  sel.innerHTML = opts
+    .map((v) => `<option value="${escapeAttr(v)}"${v === current ? " selected" : ""}>${escapeHtml(prettyNode(v))}</option>`)
+    .join("");
 }
 
-function apiGet(endpoint, params) {
-  return ensureBridge().then(() => window.AstrBotPluginPage.apiGet(endpoint, params || {}));
-}
-function apiPost(endpoint, body) {
-  return ensureBridge().then(() => window.AstrBotPluginPage.apiPost(endpoint, body || {}));
-}
-
-/* ---------------- 坐标换算 ---------------- */
-function toWorld(clientX, clientY) {
-  const r = canvasEl().getBoundingClientRect();
-  return {
-    x: (clientX - r.left - state.pan.x) / state.zoom,
-    y: (clientY - r.top - state.pan.y) / state.zoom,
-  };
-}
-function portPos(el) {
-  const r = el.getBoundingClientRect();
-  const cr = canvasEl().getBoundingClientRect();
-  return {
-    x: (r.left + r.width / 2 - cr.left - state.pan.x) / state.zoom,
-    y: (r.top + r.height / 2 - cr.top - state.pan.y) / state.zoom,
-  };
-}
-
-/* ---------------- 画布变换 ---------------- */
-function applyTransform() {
-  world().style.transform = `translate(${state.pan.x}px, ${state.pan.y}px) scale(${state.zoom})`;
-}
-
-/* ---------------- 渲染：节点 ---------------- */
-function makeWidget(id, key, val) {
-  const row = document.createElement("div");
-  row.className = "row";
-  if (Array.isArray(val)) {
-    row.className += " link-row";
-    const label = document.createElement("span");
-    label.className = "label";
-    label.textContent = key;
-    const port = document.createElement("span");
-    port.className = "port-in";
-    port.dataset.in = `${id}:${key}`;
-    port.title = "点击删除连线，拖到此处可重新连线";
-    row.append(label, port);
-    return row;
-  }
-  const label = document.createElement("span");
-  label.className = "label";
-  label.textContent = key;
-  row.appendChild(label);
-
-  const setDirty = () => (state.dirty = true);
-  if (typeof val === "boolean") {
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.className = "chk";
-    cb.checked = val;
-    cb.addEventListener("change", () => {
-      state.wf[id].inputs[key] = cb.checked;
-      setDirty();
-    });
-    row.appendChild(cb);
-  } else if (typeof val === "number") {
-    const inp = document.createElement("input");
-    inp.type = "number";
-    inp.step = "any";
-    inp.value = String(val);
-    inp.addEventListener("change", () => {
-      const n = Number(inp.value);
-      if (!Number.isNaN(n)) {
-        state.wf[id].inputs[key] = n;
-        setDirty();
-      }
-    });
-    row.appendChild(inp);
-  } else if (typeof val === "string") {
-    if (key === "prompt" || key === "text") {
-      const ta = document.createElement("textarea");
-      ta.value = val;
-      ta.addEventListener("change", () => {
-        state.wf[id].inputs[key] = ta.value;
-        setDirty();
-      });
-      row.appendChild(ta);
-    } else if (FILE_LISTS[key] || key.toLowerCase().includes("lora")) {
-      const listKey = FILE_LISTS[key] || "lora_name";
-      const sel = document.createElement("select");
-      const opts = state.models[listKey] || [];
-      if (!opts.includes(val)) opts.unshift(val);
-      sel.innerHTML = opts
-        .map((o) => `<option value="${escapeHtml(o)}"${o === val ? " selected" : ""}>${escapeHtml(o)}</option>`)
-        .join("");
-      sel.addEventListener("change", () => {
-        state.wf[id].inputs[key] = sel.value;
-        setDirty();
-      });
-      row.appendChild(sel);
-    } else if (key === "sampler_name" || key === "scheduler") {
-      const list = key === "sampler_name" ? state.samplers : state.schedulers;
-      const sel = document.createElement("select");
-      if (!list.includes(val)) list.unshift(val);
-      sel.innerHTML = list
-        .map((o) => `<option value="${escapeHtml(o)}"${o === val ? " selected" : ""}>${escapeHtml(o)}</option>`)
-        .join("");
-      sel.addEventListener("change", () => {
-        state.wf[id].inputs[key] = sel.value;
-        setDirty();
-      });
-      row.appendChild(sel);
-    } else {
-      const inp = document.createElement("input");
-      inp.type = "text";
-      inp.value = val;
-      inp.addEventListener("change", () => {
-        state.wf[id].inputs[key] = inp.value;
-        setDirty();
-      });
-      row.appendChild(inp);
-    }
-  } else if (val && typeof val === "object") {
-    const g = document.createElement("div");
-    g.className = "slot-group";
-    for (const [sk, sv] of Object.entries(val)) {
-      if (sk === "Update inputs") continue;
-      if (typeof sv === "boolean") {
-        const cb = document.createElement("input");
-        cb.type = "checkbox";
-        cb.className = "chk";
-        cb.checked = sv;
-        cb.title = sk;
-        cb.addEventListener("change", () => {
-          state.wf[id].inputs[key][sk] = cb.checked;
-          setDirty();
-        });
-        g.appendChild(cb);
-      } else if (typeof sv === "number") {
-        const inp = document.createElement("input");
-        inp.type = "number";
-        inp.step = "any";
-        inp.value = String(sv);
-        inp.title = sk;
-        inp.addEventListener("change", () => {
-          const n = Number(inp.value);
-          if (!Number.isNaN(n)) {
-            state.wf[id].inputs[key][sk] = n;
-            setDirty();
-          }
-        });
-        g.appendChild(inp);
-      } else if (typeof sv === "string") {
-        const sel = document.createElement("select");
-        const opts = (state.models.lora_name || []).slice();
-        if (!opts.includes(sv)) opts.unshift(sv);
-        sel.innerHTML = opts
-          .map((o) => `<option value="${escapeHtml(o)}"${o === sv ? " selected" : ""}>${escapeHtml(o)}</option>`)
-          .join("");
-        sel.title = sk;
-        sel.addEventListener("change", () => {
-          state.wf[id].inputs[key][sk] = sel.value;
-          setDirty();
-        });
-        g.appendChild(sel);
-      }
-    }
-    row.appendChild(g);
-  } else {
-    return null; // null 值（如 rgthree 的 "Update inputs"）不渲染
-  }
-  return row;
+function prettyNode(v) {
+  if (!v) return "先不指定";
+  const parts = String(v).split(" — ");
+  if (parts.length >= 3) return `${parts[2]}（${parts[1]}）`;
+  if (parts.length === 2) return parts[1];
+  return v;
 }
 
 function escapeHtml(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function escapeAttr(s) {
+  return escapeHtml(s).replace(/"/g, "&quot;");
 }
 
-function estimateNodeHeight(node) {
-  let rows = 0;
-  for (const v of Object.values(node.inputs || {})) {
-    if (v === null || v === undefined) continue;
-    rows += 1;
-  }
-  return HEADER_H + rows * ROW_H + 14;
+function slotNode(role) {
+  const spec = state.recipe.slots?.[role];
+  if (!spec) return "";
+  if (typeof spec === "string") return spec;
+  return spec.node || "";
 }
 
-/* 自动布局：按依赖关系分层（源节点在左，消费者往右） */
-function computeLayout(wf) {
-  const children = {};
-  for (const [id, node] of Object.entries(wf)) {
-    for (const v of Object.values(node.inputs || {})) {
-      if (Array.isArray(v) && v.length) {
-        const src = String(v[0]);
-        (children[src] = children[src] || []).push(id);
-      }
+function renderSlotSelect(role, parent) {
+  const label = document.createElement("label");
+  label.className = "field";
+  const span = document.createElement("span");
+  span.textContent = role.label;
+  if (role.help) {
+    const help = document.createElement("small");
+    help.textContent = role.help;
+    span.appendChild(help);
+  }
+  const sel = document.createElement("select");
+  sel.dataset.slot = role.id;
+  const current = slotNode(role.id);
+  const options = state.slotOptions[role.id] || [""];
+  fillSelect(sel, options, current, [""]);
+  if (current && ![...sel.options].some((o) => o.value === current || o.value.startsWith(`${current} `) || o.value.startsWith(`${current} —`))) {
+    const opt = document.createElement("option");
+    opt.value = current;
+    opt.textContent = prettyNode(current);
+    opt.selected = true;
+    sel.insertBefore(opt, sel.firstChild);
+  }
+  for (const o of sel.options) {
+    if (o.value === current || o.value.startsWith(`${current} —`) || o.value.startsWith(`${current} `)) {
+      o.selected = true;
+      break;
     }
   }
-  const levels = {};
-  const queue = [];
-  for (const id of Object.keys(wf)) {
-    if (!children[id]) {
-      levels[id] = 0;
-      queue.push(id);
-    }
-  }
-  while (queue.length) {
-    const id = queue.shift();
-    for (const c of children[id] || []) {
-      const nl = levels[id] + 1;
-      if (levels[c] === undefined || nl > levels[c]) {
-        levels[c] = nl;
-        queue.push(c);
-      }
-    }
-  }
-  for (const id of Object.keys(wf)) {
-    if (levels[id] === undefined) levels[id] = 0;
-  }
-  const byLevel = {};
-  for (const [id, lv] of Object.entries(levels)) (byLevel[lv] = byLevel[lv] || []).push(id);
-  const pos = {};
-  let maxH = 0;
-  for (const [lv, ids] of Object.entries(byLevel)) {
-    let y = 40;
-    maxH = 0;
-    for (const id of ids) {
-      pos[id] = { x: 40 + Number(lv) * 280, y };
-      const h = estimateNodeHeight(wf[id]);
-      maxH = Math.max(maxH, h);
-      y += h + 40;
-    }
-  }
-  return pos;
+  sel.addEventListener("change", () => {
+    state.recipe.slots = state.recipe.slots || {};
+    const v = sel.value;
+    if (!v) delete state.recipe.slots[role.id];
+    else state.recipe.slots[role.id] = { node: v };
+  });
+  label.append(span, sel);
+  parent.appendChild(label);
 }
 
-function render() {
-  $("#world").querySelectorAll(".node").forEach((n) => n.remove());
-  const wf = state.wf;
-  const layoutPos = computeLayout(wf);
-  const frag = document.createDocumentFragment();
-
-  for (const [id, node] of Object.entries(wf)) {
-    const meta = node._meta || {};
-    const pos = meta.pos && typeof meta.pos.x === "number" ? meta.pos : layoutPos[id];
-    const cls = node.class_type || "unknown";
-    const div = document.createElement("div");
-    div.className = `node type-${TYPE_OF(cls)}`;
-    div.dataset.id = id;
-    div.style.left = `${pos.x}px`;
-    div.style.top = `${pos.y}px`;
-
-    const header = document.createElement("div");
-    header.className = "node-header";
-    const title = document.createElement("span");
-    title.className = "n-title";
-    title.textContent = meta.title || cls;
-    const outPort = document.createElement("span");
-    outPort.className = "port-out";
-    outPort.dataset.out = id;
-    outPort.title = "拖拽到目标输入端口连线";
-    header.append(title, outPort);
-    div.appendChild(header);
-
-    const body = document.createElement("div");
-    body.className = "node-body";
-    for (const [key, val] of Object.entries(node.inputs || {})) {
-      const row = makeWidget(id, key, val);
-      if (row) body.appendChild(row);
-    }
-    div.appendChild(body);
-    frag.appendChild(div);
+function renderSlots() {
+  const basic = $("#slot-grid");
+  const extra = $("#slot-grid-extra");
+  basic.innerHTML = "";
+  if (extra) extra.innerHTML = "";
+  for (const role of state.slotRoles) {
+    renderSlotSelect(role, role.basic === false ? extra || basic : basic);
   }
-  world().appendChild(frag);
-  drawWires();
+  const guide = $("#empty-guide");
+  if (guide) guide.classList.toggle("hidden", !!(state.recipe.workflow || state.templates.length));
 }
 
-/* ---------------- 渲染：连线 ---------------- */
-function drawWires() {
-  const svg = $("#wires");
-  svg.innerHTML = "";
-  const wires = [];
-  for (const [id, node] of Object.entries(state.wf)) {
-    for (const [key, val] of Object.entries(node.inputs || {})) {
-      if (Array.isArray(val) && val.length) {
-        wires.push({ from: String(val[0]), to: id, key });
-      }
-    }
-  }
-  for (const w of wires) {
-    const outEl = $(`[data-out="${w.from}"]`);
-    const inEl = $(`[data-in="${w.to}:${w.key}"]`);
-    if (!outEl || !inEl) continue;
-    const p1 = portPos(outEl);
-    const p2 = portPos(inEl);
-    const dx = Math.max(40, Math.abs(p2.x - p1.x) / 2);
-    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    path.setAttribute("d", `M ${p1.x} ${p1.y} C ${p1.x + dx} ${p1.y}, ${p2.x - dx} ${p2.y}, ${p2.x} ${p2.y}`);
-    path.style.pointerEvents = "stroke";
-    path.style.cursor = "pointer";
-    path.title = `${w.from} → ${w.to}.${w.key}（点击删除连线）`;
-    path.addEventListener("click", () => {
-      state.wf[w.to].inputs[w.key] = LINK_DEFAULTS[w.key] !== undefined ? LINK_DEFAULTS[w.key] : "";
-      state.dirty = true;
-      drawWires();
-      render();
+function renderLoras() {
+  const box = $("#lora-list");
+  const loras = state.recipe.defaults.loras || [];
+  box.innerHTML = "";
+  loras.forEach((item, idx) => {
+    const row = document.createElement("div");
+    row.className = "lora-row";
+    const sel = document.createElement("select");
+    fillSelect(sel, state.resources.lora_name || [], item.name || "", [""]);
+    sel.addEventListener("change", () => {
+      state.recipe.defaults.loras[idx].name = sel.value;
     });
-    path.addEventListener("mouseenter", () => path.classList.add("wire-hover"));
-    path.addEventListener("mouseleave", () => path.classList.remove("wire-hover"));
-    svg.appendChild(path);
-  }
-}
-
-/* ---------------- 交互：平移 / 缩放 ---------------- */
-function initCanvasEvents() {
-  canvasEl().addEventListener("wheel", (e) => {
-    e.preventDefault();
-    const before = toWorld(e.clientX, e.clientY);
-    state.zoom *= Math.exp(-e.deltaY * 0.0012);
-    state.zoom = Math.min(1.6, Math.max(0.3, state.zoom));
-    const after = toWorld(e.clientX, e.clientY);
-    state.pan.x += (after.x - before.x) * state.zoom;
-    state.pan.y += (after.y - before.y) * state.zoom;
-    applyTransform();
-  });
-
-  canvasEl().addEventListener("mousedown", (e) => {
-    if (e.button !== 0) return;
-    const node = e.target.closest(".node");
-    if (node) {
-      if (e.target.closest(".node-header") && !e.target.closest("input") && !e.target.classList.contains("port-out")) {
-        startDragNode(e, node);
-      }
-      return;
-    }
-    if (e.target.closest(".port-out")) return;
-    state.drag = { type: "pan", sx: e.clientX, sy: e.clientY, ox: state.pan.x, oy: state.pan.y };
-  });
-
-  canvasEl().addEventListener("mousemove", (e) => {
-    if (state.drag && state.drag.type === "pan") {
-      state.pan.x = state.drag.ox + (e.clientX - state.drag.sx);
-      state.pan.y = state.drag.oy + (e.clientY - state.drag.sy);
-      applyTransform();
-    } else if (state.drag && state.drag.type === "node") {
-      const w = toWorld(e.clientX, e.clientY);
-      state.drag.node.style.left = `${w.x - state.drag.offX}px`;
-      state.drag.node.style.top = `${w.y - state.drag.offY}px`;
-      drawWires();
-    } else if (state.drag && state.drag.type === "link") {
-      const w = toWorld(e.clientX, e.clientY);
-      state.drag.temp.setAttribute("d", tempPath(state.drag.fromPos, w));
-    }
-  });
-
-  window.addEventListener("mouseup", (e) => {
-    if (state.drag && state.drag.type === "link") {
-      state.drag.temp.remove();
-      const target = document.elementFromPoint(e.clientX, e.clientY);
-      const port = target && target.closest ? target.closest(".port-in[data-in]") : null;
-      if (port) {
-        const [toId, key] = port.dataset.in.split(":");
-        if (toId !== state.drag.fromId) {
-          state.wf[toId].inputs[key] = [state.drag.fromId, 0];
-          state.dirty = true;
-        }
-      }
-      drawWires();
-      render();
-    } else if (state.drag && state.drag.type === "node") {
-      state.dirty = true;
-    }
-    state.drag = null;
-  });
-}
-
-function startDragNode(e, node) {
-  const w = toWorld(e.clientX, e.clientY);
-  const left = parseFloat(node.style.left) || 0;
-  const top = parseFloat(node.style.top) || 0;
-  state.drag = { type: "node", node, offX: w.x - left, offY: w.y - top };
-}
-
-function tempPath(p1, p2) {
-  const dx = Math.max(40, Math.abs(p2.x - p1.x) / 2);
-  return `M ${p1.x} ${p1.y} C ${p1.x + dx} ${p1.y}, ${p2.x - dx} ${p2.y}, ${p2.x} ${p2.y}`;
-}
-
-function initPortEvents() {
-  document.addEventListener("mousedown", (e) => {
-    const out = e.target.closest(".port-out");
-    if (!out) return;
-    e.preventDefault();
-    const fromPos = portPos(out);
-    const temp = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    temp.setAttribute("d", tempPath(fromPos, fromPos));
-    temp.classList.add("wire-drag");
-    temp.style.pointerEvents = "none";
-    $("#wires").appendChild(temp);
-    state.drag = { type: "link", fromId: out.dataset.out, fromPos, temp };
-  });
-
-  document.addEventListener("click", (e) => {
-    const port = e.target.closest(".port-in");
-    if (!port) return;
-    const [id, key] = port.dataset.in.split(":");
-    if (state.wf[id] && state.wf[id].inputs[key] !== undefined) {
-      state.wf[id].inputs[key] = LINK_DEFAULTS[key] !== undefined ? LINK_DEFAULTS[key] : "";
-      state.dirty = true;
-      drawWires();
-      render();
-    }
-  });
-
-  document.addEventListener("dblclick", (e) => {
-    const title = e.target.closest(".n-title");
-    if (!title) return;
-    const nodeEl = title.closest(".node");
-    const id = nodeEl.dataset.id;
-    const meta = (state.wf[id]._meta = state.wf[id]._meta || {});
-    const inp = document.createElement("input");
-    inp.value = title.textContent;
-    title.replaceWith(inp);
-    inp.focus();
-    inp.select();
-    const commit = () => {
-      const v = inp.value.trim();
-      if (v) meta.title = v;
-      render();
-      state.dirty = true;
-    };
-    inp.addEventListener("blur", commit);
-    inp.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter") { commit(); }
-      if (ev.key === "Escape") { render(); }
+    const strength = document.createElement("input");
+    strength.type = "number";
+    strength.step = "0.05";
+    strength.value = item.strength ?? 0.8;
+    strength.addEventListener("change", () => {
+      state.recipe.defaults.loras[idx].strength = Number(strength.value);
     });
+    const del = document.createElement("button");
+    del.type = "button";
+    del.textContent = "×";
+    del.addEventListener("click", () => {
+      state.recipe.defaults.loras.splice(idx, 1);
+      renderLoras();
+    });
+    row.append(sel, strength, del);
+    box.appendChild(row);
   });
 }
 
-/* ---------------- 右键菜单 ---------------- */
-function initContextMenu() {
-  const menu = $("#ctx-menu");
-  document.addEventListener("contextmenu", (e) => {
-    const nodeEl = e.target.closest(".node");
-    if (!nodeEl) return;
-    e.preventDefault();
-    const id = nodeEl.dataset.id;
-    menu.innerHTML = "";
-    const items = [
-      { label: "复制节点", fn: () => cloneNode(id) },
-      { label: "删除节点", fn: () => removeNode(id), danger: true },
-    ];
-    for (const it of items) {
-      const b = document.createElement("button");
-      b.textContent = it.label;
-      if (it.danger) b.className = "danger";
-      b.addEventListener("click", () => {
-        menu.classList.add("hidden");
-        it.fn();
-      });
-      menu.appendChild(b);
-    }
-    menu.style.left = `${e.clientX}px`;
-    menu.style.top = `${e.clientY}px`;
-    menu.classList.remove("hidden");
-  });
-  document.addEventListener("click", () => menu.classList.add("hidden"));
-}
-
-function nextNodeId() {
-  let max = 0;
-  for (const id of Object.keys(state.wf)) {
-    if (/^\d+$/.test(id)) max = Math.max(max, Number(id));
-  }
-  return String(max + 1);
-}
-
-function cloneNode(id) {
-  const src = state.wf[id];
-  const nid = nextNodeId();
-  const copy = JSON.parse(JSON.stringify(src));
-  copy._meta = Object.assign({}, src._meta || {});
-  if (copy._meta.pos) copy._meta.pos = { x: copy._meta.pos.x + 30, y: copy._meta.pos.y + 30 };
-  state.wf[nid] = copy;
-  state.dirty = true;
-  render();
-}
-
-function removeNode(id) {
-  delete state.wf[id];
-  for (const node of Object.values(state.wf)) {
-    for (const [key, val] of Object.entries(node.inputs || {})) {
-      if (Array.isArray(val) && val.length && String(val[0]) === id) {
-        node.inputs[key] = LINK_DEFAULTS[key] !== undefined ? LINK_DEFAULTS[key] : "";
-      }
-    }
-  }
-  state.dirty = true;
-  render();
-}
-
-function addNode(cls) {
-  const def = NODE_DEFAULTS[cls];
-  if (!def) return;
-  const center = toWorld(window.innerWidth / 2, window.innerHeight / 2);
-  const id = nextNodeId();
-  state.wf[id] = {
-    inputs: JSON.parse(JSON.stringify(def.inputs)),
-    class_type: cls,
-    _meta: { title: def.title, pos: { x: Math.round(center.x - NODE_W / 2), y: Math.round(center.y - 80) } },
-  };
-  state.dirty = true;
-  render();
-}
-
-/* ---------------- 工具栏 ---------------- */
-async function loadTemplates(keepCurrent) {
-  const res = await apiGet("workflows");
-  if (!res || !res.ok) {
-    toast(res?.error || "获取模板列表失败", true);
-    return;
-  }
-  state.templates = res.templates || [];
-  const sel = $("#wf-select");
-  sel.innerHTML = "";
+function renderLists() {
+  const wfBox = $("#wf-list");
+  wfBox.innerHTML = "";
   for (const t of state.templates) {
-    const o = document.createElement("option");
-    o.value = t.name;
-    o.textContent = t.title ? `${t.name}（${t.title}）` : t.name;
-    sel.appendChild(o);
+    const li = document.createElement("li");
+    li.className = t.name === state.recipe.workflow ? "active" : "";
+    const src = t.source === "custom" ? "已导入" : (t.source || "");
+    li.innerHTML = `<strong>${escapeHtml(t.name)}</strong><span class="meta">${escapeHtml(src)} · ${t.node_count || "?"} 个格子</span>`;
+    li.addEventListener("click", () => bindWorkflow(t.name));
+    wfBox.appendChild(li);
   }
-  if (keepCurrent && state.templates.some((t) => t.name === state.current)) {
-    sel.value = state.current;
-  } else if (state.templates.length) {
-    state.current = sel.value;
+  const rBox = $("#recipe-list");
+  rBox.innerHTML = "";
+  for (const r of state.recipes) {
+    const li = document.createElement("li");
+    li.className = r.name === state.recipe.name ? "active" : "";
+    const size = r.width && r.height ? `${r.width}×${r.height}` : "";
+    li.innerHTML = `<strong>${escapeHtml(r.name)}</strong><span class="meta">${escapeHtml(r.workflow || "")} ${size}</span>`;
+    li.addEventListener("click", () => loadRecipe(r.name));
+    rBox.appendChild(li);
   }
-  updateSourceBadge();
+  const wfSel = $("#recipe-workflow");
+  fillSelect(wfSel, state.templates.map((t) => t.name), state.recipe.workflow, [""]);
 }
 
-async function loadWorkflow(name) {
-  const res = await apiGet("workflow", { name });
-  if (!res || !res.ok) {
-    toast(res?.error || `加载 ${name} 失败`, true);
-    return;
-  }
-  state.wf = res.workflow;
-  state.current = res.name;
-  state.source = res.source || "builtin";
-  state.dirty = false;
-  $("#wf-select").value = name;
-  updateSourceBadge();
-  render();
+function renderDefaults() {
+  const d = state.recipe.defaults || {};
+  fillSelect($("#def-model"), state.resources.unet_name || [], d.model || "", [""]);
+  $("#def-width").value = d.width || "";
+  $("#def-height").value = d.height || "";
+  $("#def-steps").value = d.steps || "";
+  $("#def-cfg").value = d.cfg || "";
+  fillSelect($("#def-sampler"), state.samplers, d.sampler_name || "", [""]);
+  fillSelect($("#def-scheduler"), state.schedulers, d.scheduler || "", [""]);
+  $("#def-denoise").value = d.denoise ?? "";
+  renderLoras();
 }
 
-function wfWithPositions() {
-  const copy = JSON.parse(JSON.stringify(state.wf));
-  for (const el of $$("#world .node")) {
-    const id = el.dataset.id;
-    if (copy[id]) {
-      copy[id]._meta = copy[id]._meta || {};
-      copy[id]._meta.pos = { x: Math.round(parseFloat(el.style.left)), y: Math.round(parseFloat(el.style.top)) };
-    }
+function renderHistory() {
+  const box = $("#history-list");
+  box.innerHTML = "";
+  for (const item of state.history) {
+    const li = document.createElement("li");
+    const vals = item.values || {};
+    li.innerHTML = `<div>${escapeHtml(item.recipe || "未命名")} · ${vals.width || "?"}×${vals.height || "?"}</div>
+      <div class="meta">${escapeHtml((item.prompt || "").slice(0, 80))}</div>`;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = "记住这套";
+    btn.addEventListener("click", () => saveHistoryAsRecipe(item));
+    li.appendChild(btn);
+    box.appendChild(li);
   }
-  return copy;
 }
 
-async function saveWorkflow(name) {
-  const res = await apiPost("workflow/save", { name, workflow: wfWithPositions() });
-  if (!res || !res.ok) {
-    toast(res?.error || "保存失败", true);
-    return false;
-  }
-  state.current = name;
-  state.dirty = false;
-  toast(`已保存 ${name}`);
-  await loadTemplates(true);
-  updateSourceBadge();
-  return true;
+function readFormIntoRecipe() {
+  const d = state.recipe.defaults || {};
+  d.model = $("#def-model").value;
+  d.width = numOrEmpty($("#def-width").value);
+  d.height = numOrEmpty($("#def-height").value);
+  d.steps = numOrEmpty($("#def-steps").value);
+  d.cfg = numOrEmpty($("#def-cfg").value);
+  d.sampler_name = $("#def-sampler").value;
+  d.scheduler = $("#def-scheduler").value;
+  d.denoise = numOrEmpty($("#def-denoise").value);
+  state.recipe.defaults = d;
+  state.recipe.name = $("#recipe-name").value.trim();
+  state.recipe.description = $("#recipe-desc").value.trim();
+  state.recipe.workflow = $("#recipe-workflow").value;
 }
 
-function updateSourceBadge() {
-  const el = $("#wf-source");
-  const map = { custom: "自定义", builtin: "内置", skill: "技能" };
-  el.textContent = state.current ? `${map[state.source] || state.source} · ${state.current}` : "未命名";
-  el.className = "badge" + (state.source === "custom" ? " custom" : "");
+function numOrEmpty(v) {
+  if (v === "" || v == null) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function applyRecipeToForm(recipe) {
+  state.recipe = {
+    ...emptyRecipe(),
+    ...recipe,
+    slots: recipe.slots || {},
+    defaults: { loras: [], ...(recipe.defaults || {}) },
+  };
+  $("#recipe-name").value = state.recipe.name || "";
+  $("#recipe-desc").value = state.recipe.description || "";
+  renderLists();
+  renderSlots();
+  renderDefaults();
 }
 
 async function refreshStatus() {
-  const dot = $("#conn-dot");
-  const txt = $("#conn-text");
-  dot.className = "dot wait";
-  txt.textContent = "检测中…";
-  let res = null;
-  try {
-    res = await apiGet("status", { refresh: 1 }); // 强制同步模型清单
-  } catch (e) { /* bridge 报错 */ }
+  const res = await apiGet("status", { refresh: 1 });
   if (!res || !res.ok) {
-    dot.className = "dot off";
-    txt.textContent = "接口异常";
+    $("#conn-dot").className = "dot off";
+    $("#conn-text").textContent = "接口异常";
     return;
   }
   state.connected = !!res.connected;
-  state.models = res.resources || state.models;
-  state.systemStats = res.system_stats || null;
+  state.resources = res.resources || state.resources;
   if (res.sampler_names) state.samplers = res.sampler_names;
   if (res.schedulers) state.schedulers = res.schedulers;
-  dot.className = "dot " + (state.connected ? "on" : "off");
-  txt.textContent = `${state.connected ? "已连接" : "未连接"} · ${res.base_url}`;
-  renderResBox();
+  if (res.slot_roles) state.slotRoles = res.slot_roles;
+  $("#conn-dot").className = "dot " + (state.connected ? "on" : "off");
+  $("#conn-text").textContent = `${state.connected ? "已连接" : "未连接"} · ${res.base_url}`;
+  const dev = (res.system_stats || {}).devices || [];
+  if (dev[0] && dev[0].vram_total) {
+    const free = (dev[0].vram_free / 1073741824).toFixed(1);
+    const total = (dev[0].vram_total / 1073741824).toFixed(1);
+    $("#gpu-text").textContent = `显存 ${free}/${total}G`;
+  }
+  renderDefaults();
 }
 
-function renderResBox() {
-  const box = $("#res-box");
-  const names = { unet_name: "UNET 底模", lora_name: "LoRA", clip_name: "CLIP", vae_name: "VAE", embeddings: "Embedding" };
-  box.innerHTML = "";
-  for (const [key, title] of Object.entries(names)) {
-    const arr = state.models[key] || [];
-    const line = document.createElement("div");
-    line.className = "res-line";
-    line.innerHTML = `<span>${title}</span><span>${arr.length}</span>`;
-    box.appendChild(line);
-  }
-  if (state.systemStats) {
-    const s = state.systemStats;
-    box.appendChild(Object.assign(document.createElement("hr"), { style: "border-color:#3a3a3a;margin:8px 0" }));
-    const ver = s.system && s.system.comfyui_version;
-    if (ver) {
-      const l1 = document.createElement("div");
-      l1.className = "res-line";
-      l1.innerHTML = `<span>ComfyUI</span><span>v${escapeHtml(ver)}</span>`;
-      box.appendChild(l1);
-    }
-    for (const d of (s.devices || []).slice(0, 2)) {
-      const l2 = document.createElement("div");
-      l2.className = "res-line";
-      const total = d.vram_total ? (d.vram_total / 1073741824).toFixed(1) + "G" : "?";
-      const free = d.vram_free ? (d.vram_free / 1073741824).toFixed(1) + "G" : "?";
-      l2.innerHTML = `<span title="${escapeHtml(d.name || "")}">GPU ${d.index ?? 0}</span><span>${free} / ${total}</span>`;
-      box.appendChild(l2);
-    }
-  }
+async function loadLists() {
+  const [wfs, recs, hist] = await Promise.all([
+    apiGet("workflows"),
+    apiGet("recipes"),
+    apiGet("history"),
+  ]);
+  state.templates = (wfs && wfs.templates) || [];
+  state.recipes = (recs && recs.recipes) || [];
+  state.history = (hist && hist.items) || [];
+  renderLists();
+  renderHistory();
 }
 
-/* ---------------- 试跑 ---------------- */
-async function runGenerate() {
-  if (state.running) return;
-  if (!Object.keys(state.wf).length) {
-    toast("画布为空，无法试跑", true);
+async function bindWorkflow(name) {
+  const res = await apiGet("workflow", { name });
+  if (!res || !res.ok) {
+    toast(res?.error || "加载工作流失败", true);
     return;
   }
-  if (!state.connected) {
-    toast("ComfyUI 未连接", true);
+  state.slotOptions = res.slot_options || {};
+  state.recipe.workflow = name;
+  if (res.detected_slots) {
+    state.recipe.slots = { ...res.detected_slots, ...state.recipe.slots };
   }
-  const btn = $("#btn-run");
-  const panel = $("#result-panel");
-  const body = $("#result-body");
-  panel.classList.remove("hidden");
-  body.innerHTML = `<div><span class="spinner"></span>正在提交…</div>`;
-  state.running = true;
-  btn.disabled = true;
+  if (res.detected_slots) {
+    const detect = await apiPost("workflow/detect", { name });
+    if (detect && detect.ok && detect.values) {
+      state.recipe.defaults = { loras: [], ...detect.values, ...state.recipe.defaults };
+    }
+  }
+  $("#recipe-workflow").value = name;
+  renderLists();
+  renderSlots();
+  renderDefaults();
+}
+
+async function loadRecipe(name) {
+  const res = await apiGet("recipe", { name });
+  if (!res || !res.ok) {
+    toast(res?.error || "读取配方失败", true);
+    return;
+  }
+  state.slotOptions = res.slot_options || {};
+  applyRecipeToForm(res.recipe);
+}
+
+async function saveRecipe() {
+  readFormIntoRecipe();
+  if (!state.recipe.name) {
+    toast("先给这套起个名字，比如「立绘」", true);
+    return;
+  }
+  if (!state.recipe.workflow) {
+    toast("先在左边导入或点选一张工作流图", true);
+    return;
+  }
+  if (!slotNode("prompt") || !slotNode("sampler")) {
+    toast("请确认「用户要画的内容」和「出图采样」两个格子", true);
+    return;
+  }
+  const res = await apiPost("recipe/save", state.recipe);
+  if (!res || !res.ok) {
+    toast(res?.error || "保存失败", true);
+    return;
+  }
+  toast("这套已经记住了");
+  await loadLists();
+  applyRecipeToForm(res.recipe);
+}
+
+async function importFile(file) {
+  const text = await file.text();
+  let data;
   try {
-    const res = await apiPost("generate", { workflow: JSON.parse(JSON.stringify(state.wf)) });
-    if (!res || !res.ok) {
-      body.innerHTML = `<div class="r-err">提交失败：${escapeHtml(res?.error || "未知错误")}</div>`;
-      return;
-    }
-    const pid = res.prompt_id;
-    let stopped = false;
-    body.innerHTML = `<div><span class="spinner"></span>已提交（${escapeHtml(pid)}），正在生成… <button id="btn-stop" title="中断该任务">中断</button></div>`;
-    $("#btn-stop").addEventListener("click", async () => {
-      stopped = true;
-      try {
-        await apiPost("generate/interrupt", { prompt_id: pid });
-        body.innerHTML = `<div>已请求中断，等待确认…</div>`;
-      } catch (e) {
-        body.innerHTML = `<div class="r-err">中断请求失败：${escapeHtml(String(e))}</div>`;
-      }
-    });
-    const deadline = Date.now() + 300000;
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 2000));
-      let poll;
-      try {
-        poll = await apiGet("generate", { pid });
-      } catch (e) {
-        body.innerHTML = `<div class="r-err">轮询接口异常：${escapeHtml(String(e))}</div>`;
-        return;
-      }
-      if (!poll || !poll.ok) {
-        body.innerHTML = `<div class="r-err">${escapeHtml(poll?.error || "查询失败")}</div>`;
-        return;
-      }
-      if (poll.done) {
-        if (poll.data_url) {
-          body.innerHTML = `
-            <img src="${poll.data_url}" alt="生成结果" />
-            <div class="r-line ${stopped ? "r-err" : "r-ok"}">${stopped ? "已中断（此前完成的图片）" : "✓ 生成完成"}</div>
-            <div class="r-line">文件名：${escapeHtml(poll.filename || "")}</div>`;
-        } else {
-          body.innerHTML = `<div class="r-err">${stopped ? "任务已中断。" : escapeHtml(poll.error || "执行完成但无图片")}</div>`;
-        }
-        return;
-      }
-    }
-    body.innerHTML = `<div class="r-err">生成超时（300s），请在 ComfyUI 端查看。</div>`;
+    data = JSON.parse(text);
   } catch (e) {
-    body.innerHTML = `<div class="r-err">请求异常：${escapeHtml(String(e))}</div>`;
-  } finally {
-    state.running = false;
-    btn.disabled = false;
+    toast("不是有效 JSON", true);
+    return;
   }
-}
-
-/* ---------------- JSON 弹窗 ---------------- */
-function openJsonModal() {
-  $("#modal-json").value = JSON.stringify(wfWithPositions(), null, 2);
-  $("#modal-error").textContent = "";
-  $("#modal").classList.remove("hidden");
-  $("#modal-json").focus();
-}
-function closeJsonModal() {
-  $("#modal").classList.add("hidden");
-}
-
-/* ---------------- 初始化 ---------------- */
-function buildPalette() {
-  const box = $("#palette");
-  box.innerHTML = "";
-  for (const [cls, def] of Object.entries(NODE_DEFAULTS)) {
-    const b = document.createElement("button");
-    const color = {
-      loader: "#d65745", conditioning: "#3d7ee0", sampler: "#8e5ae0",
-      latent: "#3fa0a0", image: "#4e9d5a", other: "#6b6f76",
-    }[TYPE_OF(cls)];
-    b.innerHTML = `<span class="p-color" style="background:${color}"></span>${escapeHtml(def.title)}`;
-    b.title = cls;
-    b.addEventListener("click", () => addNode(cls));
-    box.appendChild(b);
+  const name = file.name.replace(/\.json$/i, "").replace(/[^A-Za-z0-9_\u4e00-\u9fff-]/g, "_") || "imported";
+  const res = await apiPost("workflow/import", { name, workflow: data });
+  if (!res || !res.ok) {
+    toast(res?.error || "导入失败", true);
+    return;
   }
+  toast(`已导入 ${name}`);
+  state.slotOptions = res.slot_options || {};
+  state.recipe.workflow = name;
+  state.recipe.slots = res.detected_slots || {};
+  await loadLists();
+  const detect = await apiPost("workflow/detect", { name });
+  if (detect && detect.ok) {
+    state.recipe.defaults = { loras: [], ...(detect.values || {}) };
+  }
+  if (!state.recipe.name) state.recipe.name = name;
+  applyRecipeToForm(state.recipe);
 }
 
-function initToolbar() {
-  $("#btn-new").addEventListener("click", () => {
-    if (state.dirty && !confirm("当前工作流有未保存修改，确定新建？")) return;
-    state.wf = {};
-    state.current = "";
-    state.source = "";
-    state.dirty = false;
-    updateSourceBadge();
-    render();
+async function importFromComfy() {
+  const hist = await apiGet("comfy-history");
+  const item = ((hist && hist.items) || []).find((x) => x.has_workflow);
+  if (!item) {
+    toast("ComfyUI 历史里没有工作流", true);
+    return;
+  }
+  const name = `history-${String(item.prompt_id).slice(0, 8)}`;
+  const res = await apiPost("workflow/import-history", { prompt_id: item.prompt_id, name });
+  if (!res || !res.ok) {
+    toast(res?.error || "导入失败", true);
+    return;
+  }
+  toast("已从 ComfyUI 历史导入");
+  await loadLists();
+  state.slotOptions = res.slot_options || {};
+  state.recipe.workflow = res.name;
+  state.recipe.slots = res.detected_slots || {};
+  applyRecipeToForm(state.recipe);
+  await bindWorkflow(res.name);
+}
+
+async function runGenerate() {
+  readFormIntoRecipe();
+  if (!state.recipe.name) {
+    toast("先保存这套，再试画", true);
+    return;
+  }
+  await saveRecipe();
+  const prompt = $("#test-prompt").value.trim();
+  if (!prompt) {
+    toast("先写一句要画什么", true);
+    return;
+  }
+  $("#preview").textContent = "排队中…";
+  const res = await apiPost("generate", {
+    prompt,
+    recipe: state.recipe.name,
+    size: $("#test-size").value,
   });
-  $("#btn-save").addEventListener("click", async () => {
-    const name = state.current || prompt("新模板名（仅字母数字_-.）：", "my-workflow");
-    if (!name) return;
-    const ok = await saveWorkflow(name);
-    if (ok) await loadWorkflow(name);
-  });
-  $("#btn-saveas").addEventListener("click", async () => {
-    const name = prompt("另存为模板名（仅字母数字_-.）：", "");
-    if (!name) return;
-    await saveWorkflow(name);
-  });
-  $("#btn-delete").addEventListener("click", async () => {
-    if (!state.current) return toast("没有可删除的模板", true);
-    if (!confirm(`确定删除自定义模板 ${state.current}？（内置/技能模板无法删除）`)) return;
-    const res = await apiPost("workflow/delete", { name: state.current });
-    if (!res || !res.ok) {
-      toast(res?.error || "删除失败", true);
+  if (!res || !res.ok) {
+    toast(res?.error || "提交失败", true);
+    $("#preview").textContent = res?.error || "失败";
+    return;
+  }
+  state.runningPid = res.prompt_id;
+  pollResult(res.prompt_id);
+}
+
+async function pollResult(pid) {
+  for (let i = 0; i < 150; i++) {
+    const poll = await apiGet("generate", { pid });
+    if (poll && poll.done) {
+      if (poll.error) {
+        $("#preview").textContent = poll.error;
+        toast(poll.error, true);
+        return;
+      }
+      $("#preview").innerHTML = `<img alt="preview" src="${poll.data_url}" />`;
+      await loadLists();
       return;
     }
-    toast(`已删除 ${state.current}`);
-    await loadTemplates(false);
-    if (state.templates.length) await loadWorkflow(state.templates[0].name);
-  });
-  $("#btn-json").addEventListener("click", openJsonModal);
-  $("#modal-cancel").addEventListener("click", closeJsonModal);
-  $("#modal-apply").addEventListener("click", () => {
-    try {
-      const parsed = JSON.parse($("#modal-json").value);
-      if (typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("需要节点对象");
-      state.wf = parsed;
-      state.dirty = true;
-      closeJsonModal();
-      render();
-      toast("已应用 JSON");
-    } catch (e) {
-      $("#modal-error").textContent = `JSON 解析失败：${e.message}`;
-    }
-  });
-  $("#btn-models").addEventListener("click", async () => {
-    await refreshStatus();
-    toast(state.connected ? "已同步模型清单（见左侧资源栏）" : "未连接，显示的是缓存清单");
-  });
-  $("#btn-refresh").addEventListener("click", refreshStatus);
-  $("#btn-run").addEventListener("click", runGenerate);
-  $("#btn-close-result").addEventListener("click", () => $("#result-panel").classList.add("hidden"));
-  $("#wf-select").addEventListener("change", () => loadWorkflow($("#wf-select").value));
-  window.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !$("#modal").classList.contains("hidden")) closeJsonModal();
-  });
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  $("#preview").textContent = "等待超时";
 }
 
-let _started = false;
+async function saveHistoryAsRecipe(item) {
+  const name = prompt("给这套起个名字", item.recipe ? `${item.recipe}-2` : "新套装");
+  if (!name) return;
+  const res = await apiPost("recipe/from-history", { prompt_id: item.prompt_id, name });
+  if (!res || !res.ok) {
+    toast(res?.error || "保存失败", true);
+    return;
+  }
+  toast("已经存成一套新配方");
+  await loadLists();
+  applyRecipeToForm(res.recipe);
+}
+
+function bindUi() {
+  $("#btn-refresh").addEventListener("click", () => refreshStatus().catch((e) => toast(String(e), true)));
+  $("#btn-save").addEventListener("click", () => saveRecipe().catch((e) => toast(String(e), true)));
+  $("#btn-new-recipe").addEventListener("click", () => applyRecipeToForm(emptyRecipe()));
+  $("#btn-delete-recipe").addEventListener("click", async () => {
+    if (!state.recipe.name) return;
+    if (!confirm(`删掉「${state.recipe.name}」这套？`)) return;
+    const res = await apiPost("recipe/delete", { name: state.recipe.name });
+    if (!res || !res.ok) return toast(res?.error || "删除失败", true);
+    applyRecipeToForm(emptyRecipe());
+    await loadLists();
+  });
+  $("#file-import").addEventListener("change", (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (file) importFile(file).catch((err) => toast(String(err), true));
+    e.target.value = "";
+  });
+  $("#btn-from-comfy").addEventListener("click", () => importFromComfy().catch((e) => toast(String(e), true)));
+  $("#btn-add-lora").addEventListener("click", () => {
+    state.recipe.defaults.loras = state.recipe.defaults.loras || [];
+    state.recipe.defaults.loras.push({ name: "", strength: 0.8 });
+    renderLoras();
+  });
+  $("#btn-run").addEventListener("click", () => runGenerate().catch((e) => toast(String(e), true)));
+  $("#btn-stop").addEventListener("click", async () => {
+    if (!state.runningPid) return;
+    await apiPost("generate/interrupt", { prompt_id: state.runningPid });
+    toast("已请求中断");
+  });
+  $("#recipe-workflow").addEventListener("change", () => {
+    if ($("#recipe-workflow").value) bindWorkflow($("#recipe-workflow").value);
+  });
+  document.querySelectorAll(".size-presets button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const [w, h] = String(btn.dataset.size || "").split(",");
+      if (w) $("#def-width").value = w;
+      if (h) $("#def-height").value = h;
+    });
+  });
+}
 
 async function main() {
-  if (_started) return; // 防 iframe 重复挂载导致重复初始化
-  _started = true;
-  setInitState("正在连接 AstrBot…");
-  let bridge = await waitForBridge();
-  // 超时后自动整页重载一次（会话级标记，防循环）：可解决过期 asset_token 缓存导致的桥加载失败
-  if (!bridge && !sessionStorage.getItem("wf_bridge_reloaded")) {
-    sessionStorage.setItem("wf_bridge_reloaded", "1");
-    location.reload();
-    return;
-  }
+  const overlay = $("#init-overlay");
+  const bridge = await waitForBridge();
   if (!bridge) {
-    showInitError("Bridge 初始化失败（未找到 AstrBotPluginPage）——请通过 AstrBot Dashboard 打开本页面。");
+    $("#init-text").textContent = "请通过 AstrBot Dashboard 打开本页面";
     return;
   }
   try {
-    await bridge.ready();
-  } catch (e) {
-    showInitError(`Bridge 初始化失败（${escapeHtml(String(e))}）——请通过 AstrBot Dashboard 打开本页面。`);
-    return;
+    if (bridge.ready) await bridge.ready();
+  } catch (_) {
+    /* ignore */
   }
-  hideInitState();
-  buildPalette();
-  initToolbar();
-  initCanvasEvents();
-  initPortEvents();
-  initContextMenu();
-  applyTransform();
+  overlay.classList.add("hidden");
+  bindUi();
   try {
-    await Promise.all([refreshStatus(), loadTemplates(false)]);
+    await refreshStatus();
+    await loadLists();
+    if (state.recipes.length) await loadRecipe(state.recipes[0].name);
+    else if (state.templates.length) await bindWorkflow(state.templates[0].name);
   } catch (e) {
-    /* Bridge 不可用时已由 ensureBridge 全屏提示 */
-  }
-  if (state.templates.length) {
-    await loadWorkflow(state.templates[0].name);
-  } else {
-    toast("没有可用模板，请先点击「新建」");
+    toast(String(e), true);
   }
 }
 
-$("#init-retry").addEventListener("click", () => location.reload());
 main();

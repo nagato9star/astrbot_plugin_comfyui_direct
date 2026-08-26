@@ -4,8 +4,8 @@
   },
   "pages": {
     "workflow-editor": {
-      "title": "Workflow Studio",
-      "desc": "可视化编辑与管理 ComfyUI 工作流模板"
+      "title": "配方工作台",
+      "desc": "导入工作流，告诉插件内容写到哪，保存一套给机器人用的默认画法"
     }
   }
 }

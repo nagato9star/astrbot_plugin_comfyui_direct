@@ -1,0 +1,60 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": { "unet_name": "base.safetensors", "weight_dtype": "default" },
+    "_meta": { "title": "底模" }
+  },
+  "2": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "text": "1girl, solo", "clip": ["8", 0] },
+    "_meta": { "title": "正面提示词" }
+  },
+  "3": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "text": "lowres, worst quality", "clip": ["8", 0] },
+    "_meta": { "title": "负向" }
+  },
+  "4": {
+    "class_type": "EmptyLatentImage",
+    "inputs": { "width": 832, "height": 1216, "batch_size": 1 }
+  },
+  "5": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 1,
+      "steps": 20,
+      "cfg": 7,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1,
+      "model": ["7", 0],
+      "positive": ["2", 0],
+      "negative": ["3", 0],
+      "latent_image": ["4", 0]
+    }
+  },
+  "6": {
+    "class_type": "SaveImage",
+    "inputs": { "filename_prefix": "ComfyUI", "images": ["9", 0] }
+  },
+  "7": {
+    "class_type": "Power Lora Loader (rgthree)",
+    "inputs": {
+      "model": ["1", 0],
+      "lora_1": { "on": true, "lora": "style.safetensors", "strength": 0.8 },
+      "lora_2": { "on": false, "lora": "", "strength": 0.8 }
+    }
+  },
+  "8": {
+    "class_type": "CLIPLoader",
+    "inputs": { "clip_name": "clip.safetensors", "type": "stable_diffusion" }
+  },
+  "9": {
+    "class_type": "VAEDecode",
+    "inputs": { "samples": ["5", 0], "vae": ["10", 0] }
+  },
+  "10": {
+    "class_type": "VAELoader",
+    "inputs": { "vae_name": "vae.safetensors" }
+  }
+}

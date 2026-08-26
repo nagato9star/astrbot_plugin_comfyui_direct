@@ -23,7 +23,78 @@
   "default_workflow": {
     "type": "string",
     "default": "anima-v3",
-    "hint": "默认工作流模板名（anima-v3 / nagato-anima / anima-v2，或 JSON 文件路径）"
+    "hint": "默认用哪张工作流图（在配方工作台导入后的名字）"
+  },
+  "default_recipe": {
+    "type": "string",
+    "default": "默认",
+    "hint": "用户只说「画一张」时，机器人用哪套配方"
+  },
+  "llm_tool_mode": {
+    "type": "string",
+    "default": "basic",
+    "options": ["basic", "full"],
+    "hint": "basic=机器人只会画图和查词，简单省钱；full=把调试工具也交给机器人"
+  },
+  "node_slots": {
+    "type": "object",
+    "description": "告诉插件：工作流里哪个格子写用户的话、哪个出图、哪个换底模。选好后机器人就不会填错。导入工作流后选项会刷新，重载插件生效。不会用的格子留空即可。",
+    "items": {
+      "prompt": {
+        "type": "string",
+        "default": "",
+        "hint": "用户要画的内容写到哪（必选）",
+        "options": [""]
+      },
+      "model": {
+        "type": "string",
+        "default": "",
+        "hint": "底模写到哪（想让机器人换模型就选）",
+        "options": [""]
+      },
+      "loras": {
+        "type": "string",
+        "default": "",
+        "hint": "LoRA 写到哪",
+        "options": [""]
+      },
+      "size": {
+        "type": "string",
+        "default": "",
+        "hint": "画面宽高写到哪",
+        "options": [""]
+      },
+      "sampler": {
+        "type": "string",
+        "default": "",
+        "hint": "出图采样写到哪（步数/精细程度，必选）",
+        "options": [""]
+      },
+      "negative": {
+        "type": "string",
+        "default": "",
+        "hint": "不要出现的东西写到哪（可留空）",
+        "options": [""]
+      },
+      "artist": {
+        "type": "string",
+        "default": "",
+        "hint": "画师风格写到哪（可留空）",
+        "options": [""]
+      },
+      "quality": {
+        "type": "string",
+        "default": "",
+        "hint": "画质词写到哪（可留空）",
+        "options": [""]
+      },
+      "trigger_words": {
+        "type": "string",
+        "default": "",
+        "hint": "LoRA 触发词写到哪（可留空）",
+        "options": [""]
+      }
+    }
   },
   "danbooru_base_url": {
     "type": "string",
@@ -69,7 +140,7 @@
   "default_model": {
     "type": "string",
     "default": "",
-    "hint": "默认底模文件名（可用 comfyui_list_models 查看，如 miaomiaoRealskin_anima11.safetensors），留空用模板原值",
+    "hint": "没有配方时的兜底底模。有配方后以配方为准",
     "options": [
       "",
       "anima29B_v10.safetensors",

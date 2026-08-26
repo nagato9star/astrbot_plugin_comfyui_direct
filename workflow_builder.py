@@ -18,6 +18,8 @@ from typing import Any
 
 from astrbot.api import logger
 
+from slot_mapping import apply_slots, detect_slots
+
 # 模板名 -> 文件名；查找顺序：插件数据目录 workflows/（custom）-> skill references 目录
 WORKFLOW_TEMPLATES: dict[str, str] = {
     "anima-v3": "anima-workflow-v3.json",
@@ -511,94 +513,31 @@ class WorkflowBuilder:
         denoise: float | None = None,
         prefix: str | None = None,
     ) -> dict:
-        """加载模板并覆盖参数；None 表示保留模板值。"""
+        """加载模板并覆盖参数；None 表示保留模板值。
+
+        有配方槽位时请走 apply_slots。本方法用自动检测兼容旧调用/冒烟测试。
+        """
         path = self._resolve_template(workflow)
         wf = self._load(path)
-
-        # 负向提示词
-        neg_id = self._find_negative_node(wf)
-        if negative_prompt is not None and neg_id is not None:
-            existing = wf[neg_id]["inputs"]["text"].strip()
-            sep = ", " if existing and not existing.rstrip().endswith(",") else " "
-            wf[neg_id]["inputs"]["text"] = f"{existing}{sep}{negative_prompt}".strip()
-
-        # 五段式提示词角色
-        roles = self._find_role_nodes(wf)
-
-        # 画师串：不传（None）则保留模板默认画师；传空字符串可显式清空
-        artist_id = roles[ROLE_ARTIST]
-        if artist is not None and artist_id is not None:
-            wf[artist_id]["inputs"]["prompt"] = artist
-            self._sync_danbooru_text(wf, artist)
-
-        if trigger_words is not None and roles[ROLE_TRIGGERS]:
-            wf[roles[ROLE_TRIGGERS]]["inputs"]["prompt"] = trigger_words
-        if quality is not None and roles[ROLE_QUALITY]:
-            existing = wf[roles[ROLE_QUALITY]]["inputs"]["prompt"].strip()
-            sep = ", " if existing and not existing.rstrip().endswith(",") else " "
-            wf[roles[ROLE_QUALITY]]["inputs"]["prompt"] = f"{existing}{sep}{quality}".strip()
-        if roles[ROLE_MAIN]:
-            wf[roles[ROLE_MAIN]]["inputs"]["prompt"] = prompt
-        elif roles["main_alt"]:
-            wf[roles["main_alt"]]["inputs"]["text"] = prompt
-
-        # 底模
-        if model is not None:
-            for nid, node in wf.items():
-                if node.get("class_type") == "UNETLoader":
-                    node["inputs"]["unet_name"] = model
-                    break
-
-        # LoRA：Power Lora Loader 优先，其次 LoraLoaderModelOnly 链
-        if lora is not None:
-            parsed = self._parse_lora(lora)
-            applied = self._apply_lora_power_slots(wf, parsed)
-            if not applied:
-                self._apply_lora_chain(wf, parsed)
-
-        # 尺寸
-        if width is not None or height is not None:
-            for nid, node in wf.items():
-                if node.get("class_type") == "EmptyLatentImage":
-                    if width is not None:
-                        node["inputs"]["width"] = width
-                    if height is not None:
-                        node["inputs"]["height"] = height
-                    break
-
-        # KSampler 参数（标准 KSampler 用 seed 字段；Advanced 系用 noise_seed）
-        if any(
-            v is not None
-            for v in (seed, steps, cfg, sampler_name, scheduler, denoise)
+        slots = detect_slots(wf)
+        values: dict[str, Any] = {"prompt": prompt}
+        for key, val in (
+            ("artist", artist),
+            ("trigger_words", trigger_words),
+            ("quality", quality),
+            ("negative", negative_prompt),
+            ("model", model),
+            ("lora", lora),
+            ("width", width),
+            ("height", height),
+            ("seed", seed),
+            ("steps", steps),
+            ("cfg", cfg),
+            ("sampler_name", sampler_name),
+            ("scheduler", scheduler),
+            ("denoise", denoise),
         ):
-            for nid, node in wf.items():
-                ct = node.get("class_type")
-                is_adv = ct in ("KSamplerAdvanced", "XB_ROCmKSamplerAdvanced")
-                if ct != "KSampler" and not is_adv:
-                    continue
-                ins = node["inputs"]
-                if seed is not None:
-                    if "seed" in ins:
-                        ins["seed"] = seed
-                    if is_adv and "noise_seed" in ins:
-                        ins["noise_seed"] = seed
-                if steps is not None and not isinstance(ins.get("steps"), list):
-                    ins["steps"] = steps
-                if cfg is not None:
-                    ins["cfg"] = cfg
-                if sampler_name is not None:
-                    ins["sampler_name"] = sampler_name
-                if scheduler is not None:
-                    ins["scheduler"] = scheduler
-                if denoise is not None:
-                    ins["denoise"] = denoise
-                # 不 break：多段采样链（如 V5 双采）每个采样器都要覆盖 seed
-
-        # 输出前缀
-        if prefix is not None:
-            for nid, node in wf.items():
-                if node.get("class_type") == "SaveImage":
-                    node["inputs"]["filename_prefix"] = prefix
-                    break
-
+            if val is not None:
+                values[key] = val
+        apply_slots(wf, slots, values, prefix=prefix, drop_nodes=list(DROP_NODES))
         return wf

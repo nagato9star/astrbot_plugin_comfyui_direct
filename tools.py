@@ -17,6 +17,7 @@ import random
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 from astrbot.api import FunctionTool, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
@@ -28,6 +29,8 @@ from pydantic.dataclasses import dataclass
 from animadex import AnimaDexClient
 from comfy_client import ComfyUIClient
 from external_search import CivitaiClient, DanbooruClient, GelbooruClient
+from recipe_store import RecipeStore, materialize_values
+from slot_mapping import apply_slots, parse_lora, resolve_size
 from workflow_builder import WorkflowBuilder
 
 
@@ -1504,3 +1507,486 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
         except (ValueError, OSError) as e:
             return f"保存失败：{e}"
         return f"配方已保存: {name}"
+
+
+_DRAW_DESC = (
+    "给用户画一张图，画完直接发到当前会话。"
+    "用户只说「画xxx」时：只填 prompt，其他一律不填，用默认配方。"
+    "用户点名某套配方/画风（如立绘、写实）→填 recipe。"
+    "用户点名底模/LoRA→填 model / lora，可用关键词，不要编文件名；"
+    "拿不准就先 comfyui_lookup。"
+    "用户要竖图/横图/方图→填 size=portrait/landscape/square。"
+    "用户点名画师/画质/不要出现的东西/触发词→填对应字段。"
+    "用户要更精细或更快→才填 steps 或 cfg。"
+    "用户说记住这套/存成某某→填 save_as。"
+    "没点名的参数绝对不要填、不要编造。"
+)
+
+
+def _recipe_enum(store: RecipeStore | None) -> list[str]:
+    if store is None:
+        return []
+    try:
+        return store.names()
+    except Exception:
+        return []
+
+
+def _match_resource(names: list[str], query: str, limit: int = 8) -> list[str]:
+    q = str(query or "").strip().lower().replace("\\", "/")
+    if not q or not names:
+        return []
+    q_base = q.split("/")[-1]
+    exact = []
+    for n in names:
+        base = n.replace("\\", "/").split("/")[-1].lower()
+        if n.lower() == q or base == q_base:
+            exact.append(n)
+    if exact:
+        return exact[:1]
+    return [n for n in names if q in n.lower() or q_base in n.replace("\\", "/").split("/")[-1].lower()][:limit]
+
+
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
+    """按配方生图。节点由配置下拉框指定；底模/LoRA 用配方或本次覆盖。"""
+
+    name: str = "comfyui_draw"
+    description: str = _DRAW_DESC
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "要画的内容。写成 danbooru 风格 tag，必填",
+                },
+                "recipe": {
+                    "type": "string",
+                    "description": "用哪套配方。用户没点名就不要填",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "换底模。用户没点名就不要填。关键词或文件名",
+                },
+                "lora": {
+                    "type": "string",
+                    "description": "换 LoRA。用户没点名就不要填。关键词、文件名，多个用逗号",
+                },
+                "size": {
+                    "type": "string",
+                    "enum": ["portrait", "landscape", "square", "same"],
+                    "description": "portrait竖图 landscape横图 square方图。用户没提画幅就不要填",
+                },
+                "artist": {
+                    "type": "string",
+                    "description": "画师风格。用户没点名画师就不要填",
+                },
+                "quality": {
+                    "type": "string",
+                    "description": "画质词。用户没要求画质就不要填",
+                },
+                "negative": {
+                    "type": "string",
+                    "description": "不要出现的东西。用户没说就不要填",
+                },
+                "trigger_words": {
+                    "type": "string",
+                    "description": "LoRA 触发词。用户没提或 lookup 没给就不要填",
+                },
+                "steps": {
+                    "type": "number",
+                    "description": "采样步数。用户说更精细/更快/改步数才填",
+                },
+                "cfg": {
+                    "type": "number",
+                    "description": "CFG。用户明确说改才填",
+                },
+                "seed": {
+                    "type": "number",
+                    "description": "种子。用户要复现某张图才填，否则不填",
+                },
+                "save_as": {
+                    "type": "string",
+                    "description": "用户说记住这套/存成某某时，填新配方名",
+                },
+            },
+            "required": ["prompt"],
+        }
+    )
+    client: ComfyUIClient | None = None
+    builder: WorkflowBuilder | None = None
+    store: RecipeStore | None = None
+    output_dir: Path | None = None
+    shared: dict = Field(default_factory=dict)
+    config_defaults: dict = Field(default_factory=dict)
+    on_schema_change: Any = None
+
+    def refresh_schema(self) -> None:
+        names = _recipe_enum(self.store)
+        catalog = ""
+        if self.store is not None:
+            try:
+                catalog = self.store.catalog()
+            except Exception:
+                catalog = ""
+        self.description = _DRAW_DESC + (
+            f" 现有配方：{catalog}" if catalog else " 还没有配方，先让主人在工作台保存一套。"
+        )
+        props = self.parameters.setdefault("properties", {})
+        recipe_prop = props.setdefault("recipe", {"type": "string"})
+        if names:
+            recipe_prop["enum"] = names
+            recipe_prop["description"] = "用户点名时才填。可选：" + "、".join(names[:16])
+        else:
+            recipe_prop.pop("enum", None)
+            recipe_prop["description"] = "用户点名时才填。没有配方就不要填"
+
+    async def _resource_lists(self) -> dict:
+        if self.client is None:
+            return {"unet_name": [], "lora_name": []}
+        resources, _ = await self.client.list_resources()
+        return resources
+
+    async def _resolve_model(self, query: str) -> tuple[str | None, str | None]:
+        names = (await self._resource_lists()).get("unet_name") or []
+        hits = _match_resource(names, query)
+        if len(hits) == 1:
+            return hits[0], None
+        if not hits:
+            return None, f"没找到叫「{query}」的底模。可以再搜一下，或让用户说完整文件名。"
+        preview = "、".join(hits[:6])
+        return None, f"「{query}」对上了好几份底模：{preview}。请让用户选一个，或填更完整的名字。"
+
+    async def _resolve_loras(self, raw: Any) -> tuple[list[dict] | None, str | None]:
+        names = (await self._resource_lists()).get("lora_name") or []
+        try:
+            parsed = parse_lora(raw)
+        except ValueError:
+            parsed = [{"name": part.strip()} for part in str(raw).split(",") if part.strip()]
+        if not parsed:
+            return [], None
+        resolved: list[dict] = []
+        for item in parsed:
+            query = str(item.get("name") or "").strip()
+            if not query:
+                continue
+            hits = _match_resource(names, query)
+            if len(hits) == 1:
+                spec = dict(item)
+                spec["name"] = hits[0]
+                resolved.append(spec)
+                continue
+            if not hits:
+                return None, f"没找到叫「{query}」的 LoRA。可以再搜一下，或让用户说完整文件名。"
+            preview = "、".join(hits[:6])
+            return None, f"「{query}」对上了好几份 LoRA：{preview}。请让用户选一个，或填更完整的名字。"
+        return resolved, None
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        prompt = str(kwargs.get("prompt") or "").strip()
+        if not prompt:
+            return "生成失败：prompt 不能为空。"
+        if self.store is None or self.builder is None or self.client is None:
+            return "生成失败：插件未初始化完成。"
+
+        recipe_name = str(kwargs.get("recipe") or "").strip()
+        recipe = self.store.get(recipe_name) if recipe_name else self.store.default()
+        if recipe is None:
+            if recipe_name:
+                return f"没有叫「{recipe_name}」的配方。先跟用户说现有配方名，或请主人在配方工作台里新建一套。"
+            return "还没有配方。请主人先在配方工作台：导入工作流 → 确认「用户要画的内容」和「出图采样」→ 保存。"
+
+        slots = recipe.get("slots") or {}
+        if not slots.get("prompt"):
+            return "这套配方还没指定「用户要画的内容」写到哪。请主人在工作台或配置下拉框里选一下。"
+
+        seed = kwargs.get("seed")
+        if seed is None:
+            seed = random.randint(0, 2**31 - 1)
+
+        model_raw = str(kwargs.get("model") or "").strip()
+        lora_raw = kwargs.get("lora") if kwargs.get("lora") not in (None, "") else kwargs.get("loras")
+        resolved_model = None
+        resolved_loras = None
+        if model_raw:
+            resolved_model, err = await self._resolve_model(model_raw)
+            if err:
+                return err
+            if not slots.get("model"):
+                return "这套配方还没指定底模格子，换不了模型。请主人在工作台里选一下「底模」。"
+        if lora_raw not in (None, ""):
+            resolved_loras, err = await self._resolve_loras(lora_raw)
+            if err:
+                return err
+            if not slots.get("loras"):
+                return "这套配方还没指定 LoRA 格子，换不了 LoRA。请主人在工作台里选一下「LoRA」。"
+
+        if kwargs.get("steps") not in (None, "") or kwargs.get("cfg") not in (None, ""):
+            if not slots.get("sampler"):
+                return "这套配方还没指定出图采样，改不了步数。请主人在工作台里选一下「出图采样」。"
+
+        overrides = {
+            "prompt": prompt,
+            "seed": seed,
+            "artist": kwargs.get("artist"),
+            "quality": kwargs.get("quality"),
+            "trigger_words": kwargs.get("trigger_words"),
+            "negative": kwargs.get("negative_prompt") or kwargs.get("negative"),
+            "model": resolved_model,
+            "loras": resolved_loras,
+            "steps": kwargs.get("steps"),
+            "cfg": kwargs.get("cfg"),
+        }
+        values = materialize_values(recipe, overrides)
+        for key, val in self.config_defaults.items():
+            if key not in values and val not in (None, "", 0, 0.0, []):
+                values[key] = val
+
+        size_token = str(kwargs.get("size") or "").strip()
+        if size_token:
+            values["width"], values["height"] = resolve_size(
+                int(values["width"]) if values.get("width") else None,
+                int(values["height"]) if values.get("height") else None,
+                size_token,
+            )
+
+        try:
+            wf = self.builder.load_template(recipe.get("workflow") or None)
+        except FileNotFoundError as e:
+            return f"生成失败：{e}"
+
+        apply_slots(
+            wf,
+            slots,
+            values,
+            prefix=f"astrbot_{uuid.uuid4().hex[:8]}",
+            drop_nodes=list(recipe.get("drop_nodes") or []),
+        )
+
+        pid, submit_err = await self.client.submit_prompt_detail(wf)
+        if submit_err:
+            return f"生成失败：{submit_err}"
+        if not pid:
+            return "生成失败：无法连接 ComfyUI。"
+        self.shared["last_prompt_id"] = pid
+
+        outputs, wait_err = await _wait_outputs(self.client, pid)
+        if wait_err:
+            return f"生成失败：{wait_err}"
+        if outputs is None:
+            return "生成失败：未获取到执行结果。"
+
+        images = []
+        for node_out in outputs.values():
+            images.extend(node_out.get("images", []))
+        if not images:
+            return "生成完成，但没有输出图片。"
+
+        img = images[0]
+        filename = img["filename"]
+        content = await self.client.download_image(filename, img.get("subfolder", ""))
+        if not content:
+            return f"图片已生成但下载失败（{filename}）。"
+
+        local_path = self.output_dir / filename
+        try:
+            local_path.write_bytes(content)
+        except OSError as e:
+            return f"图片已生成但本地保存失败（{e}）。"
+
+        used = {
+            "model": values.get("model"),
+            "loras": values.get("loras") or values.get("lora"),
+            "width": values.get("width"),
+            "height": values.get("height"),
+            "steps": values.get("steps"),
+            "cfg": values.get("cfg"),
+            "sampler_name": values.get("sampler_name"),
+            "scheduler": values.get("scheduler"),
+            "denoise": values.get("denoise"),
+            "seed": seed,
+        }
+        self.store.save_history(
+            {
+                "prompt_id": pid,
+                "recipe": recipe.get("name"),
+                "recipe_id": recipe.get("id"),
+                "workflow": recipe.get("workflow"),
+                "slots": slots,
+                "drop_nodes": recipe.get("drop_nodes") or [],
+                "prompt": prompt,
+                "values": {k: v for k, v in used.items() if v not in (None, "", [])},
+                "filename": filename,
+                "local_path": str(local_path),
+            }
+        )
+
+        save_as = str(kwargs.get("save_as") or "").strip()
+        saved_note = ""
+        if save_as:
+            try:
+                self.store.save(
+                    {
+                        "name": save_as,
+                        "description": f"从 {recipe.get('name')} 另存",
+                        "workflow": recipe.get("workflow"),
+                        "slots": slots,
+                        "defaults": {k: v for k, v in used.items() if k != "seed" and v not in (None, "", [])},
+                        "drop_nodes": recipe.get("drop_nodes") or [],
+                    }
+                )
+                self.refresh_schema()
+                saved_note = f" 已另存配方 {save_as}。"
+            except ValueError as e:
+                saved_note = f" 另存配方失败：{e}"
+
+        try:
+            event: AstrMessageEvent = context.context.event
+            await event.send(MessageChain().file_image(str(local_path)))
+        except Exception as e:
+            logger.error(f"[ComfyUIDirect] 图片发送失败: {e}")
+            return f"图片已生成但发送失败（{e}）。路径: {local_path}"
+
+        w, h = used.get("width") or "?", used.get("height") or "?"
+        model_note = used.get("model") or "配方原底模"
+        lora_items = used.get("loras") or []
+        if isinstance(lora_items, list) and lora_items:
+            lora_note = ",".join(
+                str(x.get("name") if isinstance(x, dict) else x) for x in lora_items[:4]
+            )
+        else:
+            lora_note = "配方原 LoRA"
+        return (
+            f"已发送。配方={recipe.get('name')} 底模={model_note} "
+            f"lora={lora_note} seed={seed} size={w}x{h}.{saved_note}"
+        )
+
+
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
+    """查角色/画师/LoRA 触发词，短回包。"""
+
+    name: str = "comfyui_lookup"
+    description: str = (
+        "查规范词或已安装的文件名。用户点名角色/画师/底模/LoRA，你又不确定时再用。"
+        "character/artist：把触发词写进 prompt 或 artist。"
+        "model/lora：把返回的文件名填进 comfyui_draw。"
+        "不要自己编 tag 或文件名。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["character", "artist", "model", "lora"],
+                    "description": "character=角色，artist=画师，model=底模文件名，lora=LoRA 文件名与触发词",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "名字（中文/日文/罗马音均可）",
+                },
+            },
+            "required": ["type", "query"],
+        }
+    )
+    danbooru: DanbooruClient | None = None
+    gelbooru: GelbooruClient | None = None
+    animadex: AnimaDexClient | None = None
+    client: ComfyUIClient | None = None
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        kind = str(kwargs.get("type") or "").strip().lower()
+        query = str(kwargs.get("query") or "").strip()
+        if kind not in ("character", "artist", "model", "lora") or not query:
+            return "查询失败：需要 type（character/artist/model/lora）和 query。"
+
+        if kind == "lora":
+            return await self._lookup_lora(query)
+        if kind == "model":
+            return await self._lookup_model(query)
+
+        if kind == "character" and self.animadex is not None:
+            text = await self.animadex.search_characters(query, page=1)
+            if text:
+                clipped = text.strip()
+                if len(clipped) > 800:
+                    clipped = clipped[:800] + "…"
+                return f"【角色 {query}】\n{clipped}"
+
+        if kind == "artist":
+            data = None
+            source = "danbooru"
+            if self.danbooru is not None:
+                data = await self.danbooru.search_artist(query, 20)
+            if data is None and self.gelbooru is not None:
+                data = await self.gelbooru.search_artist(query, 20)
+                source = "gelbooru"
+            if data is None:
+                return f"未找到画师：{query}"
+            aliases = ", ".join((data.get("aliases") or [])[:6])
+            trigger = data.get("artist") or query
+            extra = f" 别名: {aliases}" if aliases else ""
+            return f"【画师 @{trigger}】来源 {source}{extra}\n触发词: @{trigger}"
+
+        data = None
+        source = "danbooru"
+        if self.danbooru is not None:
+            data = await self.danbooru.search_character(query, 20)
+        if data is None and self.gelbooru is not None:
+            data = await self.gelbooru.search_character(query, 20)
+            source = "gelbooru"
+        if data is None:
+            return f"未找到角色：{query}"
+        name = data.get("character") or query
+        aliases = ", ".join((data.get("aliases") or [])[:8])
+        extra = f"\n别名: {aliases}" if aliases else ""
+        return f"【角色 {name}】来源 {source}{extra}\n触发词: {name}"
+
+    async def _lookup_model(self, query: str) -> str:
+        if self.client is None:
+            return "查询失败：ComfyUI 未配置。"
+        resources, _ = await self.client.list_resources()
+        hits = _match_resource(resources.get("unet_name") or [], query)
+        if not hits:
+            return f"未找到匹配底模：{query}"
+        return "【底模】把下面的文件名填进 comfyui_draw 的 model：\n" + "\n".join(hits)
+
+    async def _lookup_lora(self, query: str) -> str:
+        if self.client is None:
+            return "查询失败：ComfyUI 未配置。"
+        resources, _ = await self.client.list_resources()
+        names = resources.get("lora_name") or []
+        meta = resources.get("lora_meta") or {}
+        hits = _match_resource(names, query)
+        if not hits:
+            return f"未找到匹配 LoRA：{query}"
+        lines = ["【LoRA】把文件名填进 comfyui_draw 的 lora："]
+        for name in hits:
+            info = meta.get(name) or {}
+            triggers = info.get("trigger_words") or []
+            if triggers:
+                lines.append(f"{name}\n  触发词: {', '.join(triggers[:8])}")
+            else:
+                lines.append(name)
+        return "\n".join(lines)
+
+
+async def _wait_outputs(client: ComfyUIClient, prompt_id: str) -> tuple[dict | None, str | None]:
+    deadline = time.time() + client.timeout
+    miss = 0
+    while time.time() < deadline:
+        entry = await client.get_history_entry(prompt_id)
+        if entry is not None:
+            st = entry.get("status") or {}
+            if st.get("status_str") == "error":
+                return None, st.get("message") or "执行出错（详见 ComfyUI 日志）"
+            return entry.get("outputs", {}), None
+        miss += 1
+        if miss == 5:
+            logger.warning(
+                f"[ComfyUIDirect] 轮询 {prompt_id} 连续 {miss} 次无响应，继续等待"
+            )
+        await asyncio.sleep(2)
+    return None, f"生成超时（{int(client.timeout)}s）"

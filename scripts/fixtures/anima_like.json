@@ -1,0 +1,64 @@
+{
+  "10": {
+    "class_type": "UNETLoader",
+    "inputs": { "unet_name": "anima.safetensors", "weight_dtype": "default" }
+  },
+  "20": {
+    "class_type": "CR Prompt Text",
+    "inputs": { "prompt": "(@artist:1.2)" }
+  },
+  "21": {
+    "class_type": "CR Prompt Text",
+    "inputs": { "prompt": "masterpiece, best quality" }
+  },
+  "22": {
+    "class_type": "CR Prompt Text",
+    "inputs": { "prompt": "1girl, solo" }
+  },
+  "23": {
+    "class_type": "CR Prompt Text",
+    "inputs": { "prompt": "@trigger" }
+  },
+  "30": {
+    "class_type": "JoinStringMulti",
+    "inputs": {
+      "inputcount": 4,
+      "delimiter": " ",
+      "string_1": ["20", 0],
+      "string_2": ["21", 0],
+      "string_3": ["22", 0],
+      "string_4": ["23", 0]
+    }
+  },
+  "40": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "text": "lowres, worst quality" }
+  },
+  "50": {
+    "class_type": "EmptyLatentImage",
+    "inputs": { "width": 1024, "height": 1536, "batch_size": 1 }
+  },
+  "60": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 0,
+      "steps": 8,
+      "cfg": 1,
+      "sampler_name": "er_sde",
+      "scheduler": "normal",
+      "denoise": 1
+    }
+  },
+  "70": {
+    "class_type": "Power Lora Loader (rgthree)",
+    "inputs": {
+      "model": ["10", 0],
+      "lora_1": { "on": true, "lora": "style.safetensors", "strength": 0.8 },
+      "lora_2": { "on": false, "lora": "", "strength": 0.8 }
+    }
+  },
+  "80": {
+    "class_type": "SaveImage",
+    "inputs": { "filename_prefix": "x", "images": ["60", 0] }
+  }
+}

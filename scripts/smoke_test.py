@@ -6,19 +6,50 @@
 """
 
 import asyncio
+import json
 import sys
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PLUGIN_DIR))
 
+if "astrbot" not in sys.modules:
+    import types
+
+    _astrbot = types.ModuleType("astrbot")
+    _api = types.ModuleType("astrbot.api")
+
+    class _Logger:
+        def warning(self, *a, **k):
+            pass
+
+        def info(self, *a, **k):
+            pass
+
+        def error(self, *a, **k):
+            pass
+
+    _api.logger = _Logger()
+    sys.modules["astrbot"] = _astrbot
+    sys.modules["astrbot.api"] = _api
+
 from comfy_client import ComfyUIClient  # noqa: E402
-from tools import ComfyuiGenerateTool  # noqa: E402
+from recipe_store import RecipeStore  # noqa: E402
+from slot_mapping import (  # noqa: E402
+    apply_slots,
+    detect_slots,
+    parse_node_option,
+    read_current_values,
+    resolve_size,
+    slots_from_config,
+    ui_to_api,
+)
 from workflow_builder import WorkflowBuilder  # noqa: E402
+
+FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 
 PLUGIN = _PLUGIN_DIR
 # 模板在插件数据目录（插件包不含模板）
@@ -30,21 +61,151 @@ def _builder(default_workflow: str = "anima-v3") -> WorkflowBuilder:
     return WorkflowBuilder(plugin_dir=PLUGIN, default_workflow=default_workflow, custom_dir=_CUSTOM_DIR)
 
 
-def test_workflow_build() -> None:
-    """anima-v3 五段式覆盖 + LoRA 插槽 + KSampler。"""
-    b = _builder()
-    wf = b.build(
-        prompt="1girl, garden",
-        artist="(@testartist:1.0)",
-        trigger_words="@f1f",
-        quality="masterpiece, best quality",
-        negative_prompt="bad hands",
-        model="m.safetensors",
-        lora='[{"name":"l1.safetensors","strength":0.5}]',
-        steps=20,
-        cfg=1,
-        seed=1,
+def _load_fixture(name: str) -> dict:
+    return json.loads((FIXTURE_DIR / name).read_text(encoding="utf-8"))
+
+
+def test_slot_mapping_generic() -> None:
+    wf = _load_fixture("mini_workflow.json")
+    slots = detect_slots(wf)
+    assert slots["prompt"]["node"] == "2"
+    assert slots["negative"]["node"] == "3"
+    assert slots["model"]["node"] == "1"
+    assert slots["sampler"]["node"] == "5"
+    assert slots["size"]["node"] == "4"
+    assert slots["loras"]["node"] == "7"
+    values = read_current_values(wf, slots)
+    assert values["model"] == "base.safetensors"
+    assert values["width"] == 832 and values["height"] == 1216
+    assert values["steps"] == 20
+    assert values["loras"][0]["name"] == "style.safetensors"
+    apply_slots(
+        wf,
+        slots,
+        {
+            "prompt": "cat",
+            "model": "other.safetensors",
+            "width": 1024,
+            "height": 1024,
+            "steps": 12,
+            "loras": [{"name": "new.safetensors", "strength": 0.4}],
+            "seed": 9,
+        },
     )
+    assert wf["2"]["inputs"]["text"] == "cat"
+    assert wf["1"]["inputs"]["unet_name"] == "other.safetensors"
+    assert wf["4"]["inputs"]["width"] == 1024
+    assert wf["5"]["inputs"]["steps"] == 12
+    assert wf["5"]["inputs"]["seed"] == 9
+    assert wf["7"]["inputs"]["lora_1"]["lora"] == "new.safetensors"
+    print("  slot mapping generic OK")
+
+
+def test_slot_mapping_anima_like() -> None:
+    wf = _load_fixture("anima_like.json")
+    slots = detect_slots(wf)
+    assert slots["prompt"]["node"] == "22"
+    assert slots["artist"]["node"] == "20"
+    assert slots["quality"]["node"] == "21"
+    assert slots["trigger_words"]["node"] == "23"
+    apply_slots(wf, slots, {"prompt": "1girl, garden", "artist": "(@x:1.0)", "trigger_words": "@t"})
+    assert wf["22"]["inputs"]["prompt"] == "1girl, garden"
+    assert wf["20"]["inputs"]["prompt"] == "(@x:1.0)"
+    assert wf["23"]["inputs"]["prompt"] == "@t"
+    print("  slot mapping anima-like OK")
+
+
+def test_config_dropdown_and_size() -> None:
+    assert parse_node_option("353 — CR Prompt Text — 主提示词") == "353"
+    assert parse_node_option("") == ""
+    slots = slots_from_config(
+        {"prompt": "2 — CLIPTextEncode — 正面提示词", "sampler": "5 — KSampler"}
+    )
+    assert slots["prompt"]["node"] == "2"
+    assert slots["sampler"]["node"] == "5"
+    assert resolve_size(832, 1216, "landscape") == (1216, 832)
+    assert resolve_size(832, 1216, "portrait") == (832, 1216)
+    print("  config dropdown parse OK")
+
+
+def test_recipe_store_and_draw_schema() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        store = RecipeStore(Path(td))
+        wf = _load_fixture("mini_workflow.json")
+        store.bootstrap(workflow_name="mini", wf=wf, config_slots={"prompt": "2", "sampler": "5"})
+        rec = store.default()
+        assert rec is not None
+        assert rec["slots"]["prompt"]["node"] == "2"
+        assert rec["defaults"]["model"] == "base.safetensors"
+        store.save(
+            {
+                "name": "立绘",
+                "workflow": "mini",
+                "slots": rec["slots"],
+                "defaults": rec["defaults"],
+            }
+        )
+        assert "立绘" in store.names()
+        catalog = store.catalog()
+        assert "立绘" in catalog
+        assert "base" in catalog
+        hist_id = "abc123"
+        store.save_history(
+            {
+                "prompt_id": hist_id,
+                "workflow": "mini",
+                "slots": rec["slots"],
+                "values": rec["defaults"],
+                "prompt": "1girl",
+            }
+        )
+        copied = store.recipe_from_history(hist_id, "从历史")
+        assert copied["name"] == "从历史"
+        assert copied["defaults"]["model"] == "base.safetensors"
+    print("  recipe store / draw schema OK")
+
+
+def test_ui_to_api() -> None:
+    ui = {
+        "nodes": [
+            {
+                "id": 3,
+                "type": "KSampler",
+                "title": "采样",
+                "widgets_values": [11, "randomize", 30, 4.5, "euler", "karras", 1],
+                "inputs": [{"name": "model", "link": 1}],
+            },
+            {"id": 4, "type": "UNETLoader", "widgets_values": ["m.safetensors"]},
+        ],
+        "links": [[1, 4, 0, 3, 0, "MODEL"]],
+    }
+    wf = ui_to_api(ui)
+    assert wf["3"]["class_type"] == "KSampler"
+    assert wf["3"]["inputs"]["model"] == ["4", 0]
+    assert wf["3"]["inputs"]["seed"] == 11
+    assert wf["4"]["class_type"] == "UNETLoader"
+    print("  ui to api OK")
+
+
+def test_workflow_build() -> None:
+    """anima-v3 五段式覆盖 + LoRA 插槽 + KSampler。模板不存在则跳过。"""
+    b = _builder()
+    try:
+        wf = b.build(
+            prompt="1girl, garden",
+            artist="(@testartist:1.0)",
+            trigger_words="@f1f",
+            quality="masterpiece, best quality",
+            negative_prompt="bad hands",
+            model="m.safetensors",
+            lora='[{"name":"l1.safetensors","strength":0.5}]',
+            steps=20,
+            cfg=1,
+            seed=1,
+        )
+    except FileNotFoundError:
+        print("  workflow build SKIP (anima-v3 未安装)")
+        return
     assert "445" not in wf
     assert wf["353"]["inputs"]["prompt"] == "1girl, garden"
     assert wf["368"]["inputs"]["prompt"] == "(@testartist:1.0)"
@@ -56,24 +217,29 @@ def test_workflow_build() -> None:
 
 
 def test_defaults_precedence() -> None:
-    """LLM 传参 > 配置默认 > 模板原值。"""
-    tool = ComfyuiGenerateTool(client=None, builder=None, output_dir=None)
-    defaults = {"artist": "@a", "steps": 25, "width": 0, "trigger_words": ""}
-    assert tool._pick(defaults, "artist", None) == "@a"
-    assert tool._pick(defaults, "steps", None) == 25
-    assert tool._pick(defaults, "width", None) is None
-    assert tool._pick(defaults, "trigger_words", None) is None
-    assert tool._pick(defaults, "artist", "@b") == "@b"
+    """配方 defaults 覆盖：显式值优先，0/空视为未配置。"""
+    from recipe_store import materialize_values
+
+    recipe = {"defaults": {"model": "a.safetensors", "steps": 20, "width": 832}}
+    values = materialize_values(recipe, {"prompt": "1girl", "steps": 12, "width": None})
+    assert values["model"] == "a.safetensors"
+    assert values["steps"] == 12
+    assert values["width"] == 832
+    assert values["prompt"] == "1girl"
     print("  defaults precedence OK")
 
 
 def test_lora_list_input() -> None:
     """LLM 直接传数组对象（非 JSON 字符串）时，lora 不能丢。"""
     b = _builder()
-    wf = b.build(
-        prompt="1girl",
-        lora=[{"name": "l1.safetensors", "strength": 0.5}],
-    )
+    try:
+        wf = b.build(
+            prompt="1girl",
+            lora=[{"name": "l1.safetensors", "strength": 0.5}],
+        )
+    except FileNotFoundError:
+        print("  lora list/dict input SKIP (anima-v3 未安装)")
+        return
     assert wf["478"]["inputs"]["lora_1"]["on"] is True
     assert wf["478"]["inputs"]["lora_1"]["lora"] == "l1.safetensors"
     wf2 = b.build(prompt="1girl", lora={"name": "l2.safetensors", "strength": 0.7})
@@ -83,15 +249,13 @@ def test_lora_list_input() -> None:
 
 
 def test_template_management() -> None:
-    b = _builder()
-    wf = b.load_template("anima-v3")  # 数据目录必须有 anima-v3
-    names = [t["name"] for t in b.list_templates()]
-    assert "anima-v3" in names
     with tempfile.TemporaryDirectory() as td:
         b2 = WorkflowBuilder(plugin_dir=PLUGIN, custom_dir=Path(td))
-        b2.save_template("anima-v3", wf)
-        assert "custom" in [t["source"] for t in b2.list_templates() if t["name"] == "anima-v3"]
-        b2.delete_template("anima-v3")
+        wf = _load_fixture("mini_workflow.json")
+        b2.save_template("mini", wf)
+        names = [t["name"] for t in b2.list_templates()]
+        assert "mini" in names
+        b2.delete_template("mini")
     print("  template management OK")
 
 
@@ -128,6 +292,11 @@ def test_cache_atomic() -> None:
 
 def main() -> None:
     print("[smoke] astrbot_plugin_comfyui_direct 冒烟测试")
+    test_slot_mapping_generic()
+    test_slot_mapping_anima_like()
+    test_config_dropdown_and_size()
+    test_recipe_store_and_draw_schema()
+    test_ui_to_api()
     test_workflow_build()
     test_defaults_precedence()
     test_lora_list_input()

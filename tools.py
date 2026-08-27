@@ -30,7 +30,7 @@ from animadex import AnimaDexClient
 from comfy_client import ComfyUIClient
 from external_search import CivitaiClient, DanbooruClient, GelbooruClient
 from recipe_store import RecipeStore, materialize_values
-from slot_mapping import apply_slots, parse_lora, resolve_size
+from slot_mapping import apply_slots, collect_trigger_words, parse_lora, resolve_size
 from workflow_builder import WorkflowBuilder
 
 
@@ -1728,13 +1728,16 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                 return "这套配方还没指定 LoRA 格子，换不了 LoRA。请主人在工作台里选一下「LoRA」。"
 
         if kwargs.get("steps") not in (None, "") or kwargs.get("cfg") not in (None, ""):
-            if not slots.get("sampler"):
+            if not slots.get("sampler") and not slots.get("sampler_2"):
                 return "这套配方还没指定出图采样，改不了步数。请主人在工作台里选一下「出图采样」。"
 
-        # LLM 没传 trigger_words 但传了 lora 时，从 lora_meta 自动查触发词
+        defaults = recipe.get("defaults") or {}
         auto_trigger = None
-        if resolved_loras and not kwargs.get("trigger_words"):
-            auto_trigger = await _auto_fill_trigger_words(self.client, resolved_loras)
+        if not kwargs.get("trigger_words"):
+            if resolved_loras:
+                auto_trigger = await _auto_fill_trigger_words(self.client, resolved_loras)
+            elif not defaults.get("trigger_words") and defaults.get("loras"):
+                auto_trigger = await _auto_fill_trigger_words(self.client, defaults.get("loras"))
 
         overrides = {
             "prompt": prompt,
@@ -1749,6 +1752,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             "cfg": kwargs.get("cfg"),
         }
         values = materialize_values(recipe, overrides)
+        values["seed"] = int(seed)
         for key, val in self.config_defaults.items():
             if key not in values and val not in (None, "", 0, 0.0, []):
                 values[key] = val
@@ -1815,6 +1819,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             "sampler_name": values.get("sampler_name"),
             "scheduler": values.get("scheduler"),
             "denoise": values.get("denoise"),
+            "trigger_words": values.get("trigger_words"),
             "seed": seed,
         }
         self.store.save_history(
@@ -1984,50 +1989,15 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
 
 
 async def _auto_fill_trigger_words(client: ComfyUIClient, lora_input: Any) -> str | None:
-    """从 lora_meta 缓存中按 LoRA 文件名查触发词，拼成逗号分隔串返回。
-
-    lora_input 可以是 parse_lora 后的 list[dict]，也可以是原始 JSON 字符串/数组。
-    如果全部 LoRA 都没缓存到触发词，返回 None（保持原行为）。
-    """
-    if client is None:
-        return None
-    # 先尝试解析出文件名列表
-    try:
-        parsed = parse_lora(lora_input)
-    except Exception:
-        parsed = []
-    if not parsed:
-        # 可能是原始字符串，尝试直接 parse
-        try:
-            parsed = parse_lora(str(lora_input))
-        except Exception:
-            return None
-    if not parsed:
-        return None
-    names = [str(item.get("name") or "").strip() for item in parsed if item.get("name")]
-    if not names:
+    """从 lora_meta 缓存中按 LoRA 文件名查触发词，拼成逗号分隔串返回。"""
+    if client is None or lora_input in (None, "", []):
         return None
     try:
         resources, _ = await client.list_resources()
     except Exception:
         return None
-    lora_meta = resources.get("lora_meta") or {}
-    all_triggers: list[str] = []
-    for name in names:
-        info = lora_meta.get(name)
-        if info and info.get("trigger_words"):
-            all_triggers.extend(info["trigger_words"][:8])
-    if not all_triggers:
-        return None
-    # 去重保序
-    seen: set[str] = set()
-    unique: list[str] = []
-    for t in all_triggers:
-        t = t.strip()
-        if t and t not in seen:
-            seen.add(t)
-            unique.append(t)
-    return ", ".join(unique) if unique else None
+    text = collect_trigger_words(resources.get("lora_meta") or {}, lora_input)
+    return text or None
 
 
 async def _wait_outputs(client: ComfyUIClient, prompt_id: str) -> tuple[dict | None, str | None]:

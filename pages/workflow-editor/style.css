@@ -120,6 +120,17 @@ textarea { resize: vertical; min-height: 90px; }
   gap: 10px;
 }
 .lora-row { display: grid; grid-template-columns: 1fr 90px 36px; gap: 6px; margin-bottom: 6px; }
+#def-trigger-words {
+  width: 100%;
+  resize: vertical;
+  min-height: 44px;
+  background: var(--bg2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font: inherit;
+}
 .row-actions { display: flex; gap: 6px; margin: 8px 0; }
 .preview {
   min-height: 180px;

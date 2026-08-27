@@ -40,6 +40,7 @@ from comfy_client import ComfyUIClient  # noqa: E402
 from recipe_store import RecipeStore  # noqa: E402
 from slot_mapping import (  # noqa: E402
     apply_slots,
+    collect_trigger_words,
     detect_slots,
     parse_node_option,
     read_current_values,
@@ -137,6 +138,7 @@ def test_recipe_store_and_draw_schema() -> None:
         assert rec is not None
         assert rec["slots"]["prompt"]["node"] == "2"
         assert rec["defaults"]["model"] == "base.safetensors"
+        assert "seed" not in rec["defaults"]
         store.save(
             {
                 "name": "立绘",
@@ -217,16 +219,62 @@ def test_workflow_build() -> None:
 
 
 def test_defaults_precedence() -> None:
-    """配方 defaults 覆盖：显式值优先，0/空视为未配置。"""
+    """配方 defaults 覆盖：显式值优先，0/空视为未配置。种子不复用配方旧值。"""
     from recipe_store import materialize_values
 
-    recipe = {"defaults": {"model": "a.safetensors", "steps": 20, "width": 832}}
+    recipe = {"defaults": {"model": "a.safetensors", "steps": 20, "width": 832, "seed": 7}}
     values = materialize_values(recipe, {"prompt": "1girl", "steps": 12, "width": None})
     assert values["model"] == "a.safetensors"
     assert values["steps"] == 12
     assert values["width"] == 832
     assert values["prompt"] == "1girl"
+    assert "seed" not in values
+    values2 = materialize_values(recipe, {"prompt": "1girl", "seed": 99})
+    assert values2["seed"] == 99
     print("  defaults precedence OK")
+
+
+def test_dual_sampler_external_int() -> None:
+    """双采样 + 外联 Int：步数写到两个整数节点，种子写到共享 Int，连线不断开。"""
+    wf = _load_fixture("dual_sampler.json")
+    slots = detect_slots(wf)
+    assert slots["prompt"]["node"] == "2"
+    assert slots["sampler"]["node"] in ("20", "21")
+    assert slots.get("sampler_2", {}).get("node") in ("20", "21")
+    assert slots["sampler"]["node"] != slots["sampler_2"]["node"]
+    values = read_current_values(wf, slots)
+    assert values["steps"] == 8
+    assert "seed" not in values
+    apply_slots(wf, slots, {"prompt": "cat", "steps": 20, "seed": 99})
+    assert wf["2"]["inputs"]["text"] == "cat"
+    assert wf["20"]["inputs"]["steps"] == ["10", 0]
+    assert wf["21"]["inputs"]["steps"] == ["11", 0]
+    assert wf["20"]["inputs"]["noise_seed"] == ["12", 0]
+    assert wf["10"]["inputs"]["value"] == 20
+    assert wf["11"]["inputs"]["value"] == 20
+    assert wf["12"]["inputs"]["value"] == 99
+    # 映射到整数节点时同样能改步数
+    wf2 = _load_fixture("dual_sampler.json")
+    slots2 = dict(slots)
+    slots2["sampler"] = {"node": "10", "field": "value"}
+    apply_slots(wf2, slots2, {"steps": 16, "seed": 3})
+    assert wf2["10"]["inputs"]["value"] == 16
+    assert wf2["11"]["inputs"]["value"] == 16
+    assert wf2["12"]["inputs"]["value"] == 3
+    print("  dual sampler external int OK")
+
+
+def test_collect_trigger_words() -> None:
+    meta = {
+        "a.safetensors": {"trigger_words": ["zoda", "1girl"]},
+        "b.safetensors": {"trigger_words": ["zoda", "maid"]},
+    }
+    text = collect_trigger_words(
+        meta, [{"name": "a.safetensors"}, {"name": "b.safetensors"}]
+    )
+    assert text == "zoda, 1girl, maid"
+    assert collect_trigger_words(meta, []) == ""
+    print("  collect trigger words OK")
 
 
 def test_lora_list_input() -> None:
@@ -299,6 +347,8 @@ def main() -> None:
     test_ui_to_api()
     test_workflow_build()
     test_defaults_precedence()
+    test_dual_sampler_external_int()
+    test_collect_trigger_words()
     test_lora_list_input()
     test_template_management()
     test_submit_error_parse()

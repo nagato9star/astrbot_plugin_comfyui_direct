@@ -35,7 +35,10 @@ RECIPE_VALUE_KEYS = (
     "sampler_name",
     "scheduler",
     "denoise",
-    "seed",
+    "trigger_words",
+    "artist",
+    "quality",
+    "negative",
 )
 
 
@@ -285,7 +288,7 @@ def _clean_defaults(raw: dict) -> dict:
         val = raw[key]
         if val in (None, "", []):
             continue
-        if key in ("width", "height", "steps", "seed") and val == 0:
+        if key in ("width", "height", "steps") and val == 0:
             continue
         if key in ("cfg", "denoise") and val == 0:
             continue
@@ -294,8 +297,9 @@ def _clean_defaults(raw: dict) -> dict:
 
 
 def materialize_values(recipe: dict, overrides: dict[str, Any]) -> dict[str, Any]:
-    """优先级：LLM/请求显式值 > 配方 defaults。"""
+    """优先级：LLM/请求显式值 > 配方 defaults。种子从不复用配方里的旧值。"""
     values = dict(recipe.get("defaults") or {})
+    values.pop("seed", None)
     for key, val in overrides.items():
         if val is None or val == "":
             continue

@@ -93,11 +93,13 @@ class ComfyUIClient:
         timeout: float | None = None,
         attempts: int = RETRY_ATTEMPTS,
         retry_exc: tuple[type[Exception], ...] = RETRYABLE_EXC,
+        log_errors: bool = True,
         label: str = "",
     ) -> httpx.Response | None:
         """带退避重试的 HTTP 请求；仅对连接级异常（ZeroTier 抽风）重试。
 
         4xx/5xx 等明确失败不重试。最终失败返回 None。
+        log_errors=False 时静默失败（不打 ERROR 日志），用于预期可能 404 的探测请求。
         """
         last_exc: Exception | None = None
         for i in range(attempts):
@@ -115,11 +117,12 @@ class ComfyUIClient:
             except httpx.HTTPError as e:
                 last_exc = e
                 break
-        where = f" {label}" if label else ""
-        logger.error(
-            f"[ComfyUIDirect] {method} {self.base_url}{path}{where} 失败 "
-            f"({attempts} 次尝试): {last_exc}"
-        )
+        if log_errors:
+            where = f" {label}" if label else ""
+            logger.error(
+                f"[ComfyUIDirect] {method} {self.base_url}{path}{where} 失败 "
+                f"({attempts} 次尝试): {last_exc}"
+            )
         return None
 
     async def _get(self, path: str, params: dict | None = None) -> Any:
@@ -295,6 +298,7 @@ class ComfyUIClient:
                 f"/view_metadata/{folder}",
                 params={"filename": filename},
                 attempts=1,
+                log_errors=False,
             )
             if resp is None:
                 continue
@@ -402,7 +406,9 @@ class ComfyUIClient:
         某些 ComfyUI 版本/配置下该端点返回空体或非 JSON，
         直接当作"无 embeddings"处理，不刷 WARN 日志。
         """
-        resp = await self._request_with_retry("GET", "/embeddings", attempts=1)
+        resp = await self._request_with_retry(
+            "GET", "/embeddings", attempts=1, log_errors=False
+        )
         if resp is None:
             return None
         try:

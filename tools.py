@@ -289,15 +289,20 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
 
         try:
             pick = lambda key: self._pick(self.defaults, key, kwargs.get(key))  # noqa: E731
+            lora_val = pick("lora")
+            trigger_val = pick("trigger_words")
+            # LLM 没传 trigger_words 时，从 lora_meta 自动查触发词
+            if lora_val and not trigger_val:
+                trigger_val = await _auto_fill_trigger_words(self.client, lora_val)
             wf = self.builder.build(
                 workflow=kwargs.get("workflow"),
                 prompt=prompt,
                 artist=pick("artist"),
-                trigger_words=pick("trigger_words"),
+                trigger_words=trigger_val,
                 quality=pick("quality"),
                 negative_prompt=pick("negative_prompt"),
                 model=pick("model"),
-                lora=pick("lora"),
+                lora=lora_val,
                 width=pick("width"),
                 height=pick("height"),
                 seed=seed,
@@ -1726,12 +1731,17 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             if not slots.get("sampler"):
                 return "这套配方还没指定出图采样，改不了步数。请主人在工作台里选一下「出图采样」。"
 
+        # LLM 没传 trigger_words 但传了 lora 时，从 lora_meta 自动查触发词
+        auto_trigger = None
+        if resolved_loras and not kwargs.get("trigger_words"):
+            auto_trigger = await _auto_fill_trigger_words(self.client, resolved_loras)
+
         overrides = {
             "prompt": prompt,
             "seed": seed,
             "artist": kwargs.get("artist"),
             "quality": kwargs.get("quality"),
-            "trigger_words": kwargs.get("trigger_words"),
+            "trigger_words": kwargs.get("trigger_words") or auto_trigger,
             "negative": kwargs.get("negative_prompt") or kwargs.get("negative"),
             "model": resolved_model,
             "loras": resolved_loras,
@@ -1971,6 +1981,53 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
             else:
                 lines.append(name)
         return "\n".join(lines)
+
+
+async def _auto_fill_trigger_words(client: ComfyUIClient, lora_input: Any) -> str | None:
+    """从 lora_meta 缓存中按 LoRA 文件名查触发词，拼成逗号分隔串返回。
+
+    lora_input 可以是 parse_lora 后的 list[dict]，也可以是原始 JSON 字符串/数组。
+    如果全部 LoRA 都没缓存到触发词，返回 None（保持原行为）。
+    """
+    if client is None:
+        return None
+    # 先尝试解析出文件名列表
+    try:
+        parsed = parse_lora(lora_input)
+    except Exception:
+        parsed = []
+    if not parsed:
+        # 可能是原始字符串，尝试直接 parse
+        try:
+            parsed = parse_lora(str(lora_input))
+        except Exception:
+            return None
+    if not parsed:
+        return None
+    names = [str(item.get("name") or "").strip() for item in parsed if item.get("name")]
+    if not names:
+        return None
+    try:
+        resources, _ = await client.list_resources()
+    except Exception:
+        return None
+    lora_meta = resources.get("lora_meta") or {}
+    all_triggers: list[str] = []
+    for name in names:
+        info = lora_meta.get(name)
+        if info and info.get("trigger_words"):
+            all_triggers.extend(info["trigger_words"][:8])
+    if not all_triggers:
+        return None
+    # 去重保序
+    seen: set[str] = set()
+    unique: list[str] = []
+    for t in all_triggers:
+        t = t.strip()
+        if t and t not in seen:
+            seen.add(t)
+            unique.append(t)
+    return ", ".join(unique) if unique else None
 
 
 async def _wait_outputs(client: ComfyUIClient, prompt_id: str) -> tuple[dict | None, str | None]:

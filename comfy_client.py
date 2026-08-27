@@ -285,13 +285,23 @@ class ComfyUIClient:
 
         按资源目录候选逐个尝试；无元数据头/文件不存在/空响应返回 None。
         folders 传 None 时尝试全部资源目录，否则只试指定目录（避免逐目录 404）。
+        404 时不走重试也不打 ERROR 日志，仅 debug 级别记录。
         """
         if folders is None:
             folders = [f for names in self.METADATA_FOLDERS.values() for f in names]
         for folder in folders:
-            meta = await self._get(f"/view_metadata/{folder}", {"filename": filename})
-            if meta:
-                return meta
+            resp = await self._request_with_retry(
+                "GET",
+                f"/view_metadata/{folder}",
+                params={"filename": filename},
+                attempts=1,
+            )
+            if resp is None:
+                continue
+            try:
+                return resp.json()
+            except ValueError:
+                continue
         return None
 
     # ------------------------------------------------------------------
@@ -387,8 +397,21 @@ class ComfyUIClient:
         return out
 
     async def get_embeddings(self) -> list[str] | None:
-        """GET /embeddings → 嵌入模型名列表（去扩展名）。"""
-        return await self._get("/embeddings")
+        """GET /embeddings → 嵌入模型名列表（去扩展名）。
+
+        某些 ComfyUI 版本/配置下该端点返回空体或非 JSON，
+        直接当作"无 embeddings"处理，不刷 WARN 日志。
+        """
+        resp = await self._request_with_retry("GET", "/embeddings", attempts=1)
+        if resp is None:
+            return None
+        try:
+            data = resp.json()
+            if isinstance(data, list):
+                return data
+            return None
+        except ValueError:
+            return None
 
     async def free_memory(self, unload_models: bool = True, free_cache: bool = True) -> bool:
         """POST /free：卸载模型/清空执行器缓存，释放显存。"""

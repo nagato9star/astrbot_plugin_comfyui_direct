@@ -317,12 +317,34 @@ class ComfyUIClient:
     # tag_frequency 按出现次数取 top N 展示
     TRIGGER_TOP_N = 12
 
+    # 通用 danbooru 标签黑名单：出现在 ss_tag_frequency 高频区但不是风格触发词。
+    # 这些 tag 几乎出现在所有训练集里，作为"触发词"只会污染提示词。
+    _GENERIC_TAG_BLACKLIST: set[str] = {
+        "1girl", "1boy", "solo", "looking at viewer", "smile", "open mouth",
+        "closed mouth", "blush", "simple background", "white background",
+        "long hair", "short hair", "black hair", "blonde hair", "brown hair",
+        "blue eyes", "red eyes", "green eyes", "brown eyes", "purple eyes",
+        "bangs", "hair between eyes", "upper body", "full body", "close-up",
+        "breasts", "large breasts", "small breasts", "medium breasts",
+        "sitting", "standing", "lying", "kneeling", "walking",
+        "outdoors", "indoors", "sky", "cloudy sky", "blue sky",
+        "shirt", "skirt", "dress", "pants", "shoes", "socks",
+        "gloves", "hat", "glasses", "jewelry", "hair ornament",
+        "collared shirt", "long sleeves", "short sleeves", "sleeveless",
+        "bare shoulders", "bare legs", "bare arms", "barefoot",
+        "blush stickers", "hetero", "twintails", "ponytail",
+        "artwork", "official art", "highres", "lowres",
+    }
+
     @staticmethod
     def _extract_trigger_words(meta: dict | None) -> tuple[list[str], str]:
         """从 safetensors 头部元数据提取 LoRA 触发词。
 
         优先级：ss_activation_tags（作者显式指定）> ss_tag_frequency（按频率 top N）
         > ss_dataset_tags（训练集全部 tag 截断）。返回 (触发词列表, 来源标识)。
+
+        ss_tag_frequency 回退时会过滤通用 danbooru 标签，只保留可能为
+        风格/角色触发词的 tag。频率极低（≤1）的也排除。
         """
         if not meta:
             return [], ""
@@ -358,12 +380,13 @@ class ComfyUIClient:
                             k = _clean(k)
                             if k:
                                 counts[k] = counts.get(k, 0.0) + _cnt(v)
+                    # 过滤通用标签 + 频率 ≤1 的杂项
+                    bl = ComfyUIClient._GENERIC_TAG_BLACKLIST
                     ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-                    # 频率 >1 的才可能是激活词（频率 1 多为杂项 tag）
                     tags = [
                         t
                         for t, c in ranked[: ComfyUIClient.TRIGGER_TOP_N]
-                        if c > 1
+                        if c > 1 and t not in bl
                     ]
                     if tags:
                         return tags, "tag_frequency"

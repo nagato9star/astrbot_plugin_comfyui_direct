@@ -1,0 +1,81 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": { "unet_name": "base.safetensors", "weight_dtype": "default" }
+  },
+  "2": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "text": "1girl, solo" },
+    "_meta": { "title": "正面提示词" }
+  },
+  "3": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "text": "lowres, worst quality" },
+    "_meta": { "title": "负向" }
+  },
+  "4": {
+    "class_type": "EmptyLatentImage",
+    "inputs": { "width": 832, "height": 1216, "batch_size": 1 }
+  },
+  "10": {
+    "class_type": "Int",
+    "inputs": { "value": 8 },
+    "_meta": { "title": "步数A" }
+  },
+  "11": {
+    "class_type": "Int",
+    "inputs": { "value": 8 },
+    "_meta": { "title": "步数B" }
+  },
+  "12": {
+    "class_type": "Int",
+    "inputs": { "value": 12345 },
+    "_meta": { "title": "种子" }
+  },
+  "20": {
+    "class_type": "KSamplerAdvanced",
+    "inputs": {
+      "add_noise": "enable",
+      "noise_seed": ["12", 0],
+      "steps": ["10", 0],
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "start_at_step": 0,
+      "end_at_step": 4,
+      "return_with_leftover_noise": "enable",
+      "model": ["1", 0],
+      "positive": ["2", 0],
+      "negative": ["3", 0],
+      "latent_image": ["4", 0]
+    },
+    "_meta": { "title": "第一段采样" }
+  },
+  "21": {
+    "class_type": "XB_ROCmKSamplerAdvanced",
+    "inputs": {
+      "add_noise": "disable",
+      "noise_seed": ["12", 0],
+      "steps": ["11", 0],
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "start_at_step": 4,
+      "end_at_step": 8,
+      "return_with_leftover_noise": "disable",
+      "model": ["1", 0],
+      "positive": ["2", 0],
+      "negative": ["3", 0],
+      "latent_image": ["20", 0]
+    },
+    "_meta": { "title": "第二段采样" }
+  },
+  "30": {
+    "class_type": "VAEDecode",
+    "inputs": { "samples": ["21", 0] }
+  },
+  "31": {
+    "class_type": "SaveImage",
+    "inputs": { "filename_prefix": "x", "images": ["30", 0] }
+  }
+}

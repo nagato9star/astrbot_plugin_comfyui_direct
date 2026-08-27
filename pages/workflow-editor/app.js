@@ -151,6 +151,42 @@ function renderSlots() {
   if (guide) guide.classList.toggle("hidden", !!(state.recipe.workflow || state.templates.length));
 }
 
+function loraTriggerWords(name) {
+  const meta = (state.resources.lora_meta || {})[name] || {};
+  return (meta.trigger_words || []).map((t) => String(t).trim()).filter(Boolean);
+}
+
+function collectLoraTriggerWords() {
+  const seen = new Set();
+  const words = [];
+  for (const item of state.recipe.defaults.loras || []) {
+    for (const t of loraTriggerWords(item.name || "")) {
+      if (!seen.has(t)) {
+        seen.add(t);
+        words.push(t);
+      }
+    }
+  }
+  return words.join(", ");
+}
+
+function syncTriggerWordsFromLoras() {
+  const box = $("#def-trigger-words");
+  if (!box) return;
+  const joined = collectLoraTriggerWords();
+  const cur = box.value.trim();
+  const auto = (box.dataset.auto || "").trim();
+  if (!cur || cur === auto) {
+    box.value = joined;
+    box.dataset.auto = joined;
+  } else if (joined) {
+    const have = new Set(cur.split(",").map((s) => s.trim()).filter(Boolean));
+    const extra = joined.split(",").map((s) => s.trim()).filter((s) => s && !have.has(s));
+    if (extra.length) box.value = `${cur}, ${extra.join(", ")}`;
+  }
+  state.recipe.defaults.trigger_words = box.value.trim();
+}
+
 function renderLoras() {
   const box = $("#lora-list");
   const loras = state.recipe.defaults.loras || [];
@@ -162,6 +198,7 @@ function renderLoras() {
     fillSelect(sel, state.resources.lora_name || [], item.name || "", [""]);
     sel.addEventListener("change", () => {
       state.recipe.defaults.loras[idx].name = sel.value;
+      syncTriggerWordsFromLoras();
     });
     const strength = document.createElement("input");
     strength.type = "number";
@@ -176,6 +213,7 @@ function renderLoras() {
     del.addEventListener("click", () => {
       state.recipe.defaults.loras.splice(idx, 1);
       renderLoras();
+      syncTriggerWordsFromLoras();
     });
     row.append(sel, strength, del);
     box.appendChild(row);
@@ -217,7 +255,13 @@ function renderDefaults() {
   fillSelect($("#def-sampler"), state.samplers, d.sampler_name || "", [""]);
   fillSelect($("#def-scheduler"), state.schedulers, d.scheduler || "", [""]);
   $("#def-denoise").value = d.denoise ?? "";
+  const tw = $("#def-trigger-words");
+  if (tw) {
+    tw.value = d.trigger_words || "";
+    tw.dataset.auto = d.trigger_words || "";
+  }
   renderLoras();
+  if (tw && !tw.value.trim()) syncTriggerWordsFromLoras();
 }
 
 function renderHistory() {
@@ -247,6 +291,8 @@ function readFormIntoRecipe() {
   d.sampler_name = $("#def-sampler").value;
   d.scheduler = $("#def-scheduler").value;
   d.denoise = numOrEmpty($("#def-denoise").value);
+  const tw = $("#def-trigger-words");
+  d.trigger_words = tw ? tw.value.trim() : "";
   state.recipe.defaults = d;
   state.recipe.name = $("#recipe-name").value.trim();
   state.recipe.description = $("#recipe-desc").value.trim();
@@ -497,6 +543,12 @@ function bindUi() {
     state.recipe.defaults.loras.push({ name: "", strength: 0.8 });
     renderLoras();
   });
+  const tw = $("#def-trigger-words");
+  if (tw) {
+    tw.addEventListener("input", () => {
+      state.recipe.defaults.trigger_words = tw.value.trim();
+    });
+  }
   $("#btn-run").addEventListener("click", () => runGenerate().catch((e) => toast(String(e), true)));
   $("#btn-stop").addEventListener("click", async () => {
     if (!state.runningPid) return;

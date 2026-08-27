@@ -18,6 +18,7 @@ from slot_mapping import (
     SLOT_HELP,
     SLOT_ROLES,
     apply_slots,
+    collect_trigger_words,
     detect_slots,
     is_ui_workflow,
     list_nodes,
@@ -341,12 +342,28 @@ class StudioApi:
         seed = body.get("seed")
         if seed is None:
             seed = random.randint(0, 2**31 - 1)
+        defaults = recipe.get("defaults") or {}
+        loras = body.get("loras") or body.get("lora")
+        trigger = body.get("trigger_words")
+        if not trigger:
+            if loras:
+                try:
+                    resources, _ = await self.client.list_resources()
+                    trigger = collect_trigger_words(resources.get("lora_meta") or {}, loras) or None
+                except Exception:
+                    trigger = None
+            elif not defaults.get("trigger_words"):
+                try:
+                    resources, _ = await self.client.list_resources()
+                    trigger = collect_trigger_words(resources.get("lora_meta") or {}, defaults.get("loras")) or None
+                except Exception:
+                    trigger = None
         overrides = {
             "prompt": prompt,
             "seed": seed,
             "artist": body.get("artist"),
             "model": body.get("model"),
-            "loras": body.get("loras") or body.get("lora"),
+            "loras": loras,
             "width": body.get("width"),
             "height": body.get("height"),
             "steps": body.get("steps"),
@@ -354,8 +371,10 @@ class StudioApi:
             "sampler_name": body.get("sampler_name"),
             "scheduler": body.get("scheduler"),
             "denoise": body.get("denoise"),
+            "trigger_words": trigger,
         }
         values = materialize_values(recipe, overrides)
+        values["seed"] = int(seed)
         if body.get("size"):
             values["width"], values["height"] = resolve_size(
                 int(values["width"]) if values.get("width") else None,
@@ -379,7 +398,7 @@ class StudioApi:
         self.shared["last_prompt_id"] = pid
         self.shared["pending_values"] = {
             k: values.get(k)
-            for k in ("model", "loras", "width", "height", "steps", "cfg", "sampler_name", "scheduler", "denoise", "seed")
+            for k in ("model", "loras", "width", "height", "steps", "cfg", "sampler_name", "scheduler", "denoise", "trigger_words", "seed")
         }
         self.shared["pending_recipe"] = recipe
         self.shared["pending_prompt"] = prompt

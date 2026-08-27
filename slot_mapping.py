@@ -25,6 +25,7 @@ SLOT_ROLES: tuple[tuple[str, str], ...] = (
     ("loras", "LoRA"),
     ("size", "画面大小"),
     ("sampler", "出图采样"),
+    ("sampler_2", "第二段采样"),
     ("negative", "不要出现的东西"),
     ("artist", "画师风格"),
     ("quality", "画质词"),
@@ -36,11 +37,12 @@ SLOT_HELP: dict[str, str] = {
     "model": "这套默认用哪颗底模。用户说换模型时也写到这里。",
     "loras": "这套默认挂哪些 LoRA。用户点名 LoRA 时覆盖这里。",
     "size": "宽和高写到这里。竖图/横图也靠它。",
-    "sampler": "步数、精细程度写到这里。必选。",
+    "sampler": "步数、精细程度写到这里。必选。双采样时选第一段。",
+    "sampler_2": "双采样的第二段。没有第二段可留空；步数仍会写到外联整数节点。",
     "negative": "不想看到的东西。没有可留空。",
     "artist": "用户点名画师时写到这里。没有可留空。",
     "quality": "画质词。一般不用动。",
-    "trigger_words": "某些 LoRA 必须带的触发词。没有可留空。",
+    "trigger_words": "某些 LoRA 必须带的触发词。选 LoRA 后会自动填。",
 }
 
 SLOT_CLASS_HINTS: dict[str, tuple[str, ...]] = {
@@ -83,11 +85,158 @@ SLOT_CLASS_HINTS: dict[str, tuple[str, ...]] = {
         "SamplerCustom",
         "SamplerCustomAdvanced",
     ),
+    "sampler_2": (
+        "KSampler",
+        "KSamplerAdvanced",
+        "XB_ROCmKSamplerAdvanced",
+        "KSamplerSelect",
+        "SamplerCustom",
+        "SamplerCustomAdvanced",
+    ),
 }
 
 SAMPLER_CLASSES = set(SLOT_CLASS_HINTS["sampler"])
 POWER_LORA_CLASS = "Power Lora Loader (rgthree)"
 ANIMA_DROP_NODES = ("445", "446", "447")
+
+# 外联整数 / 种子节点：双采样时 steps、seed 常接到这些节点而不是写在采样器 widget 上
+INT_NODE_CLASSES = {
+    "Int",
+    "INT",
+    "Integer",
+    "PrimitiveInt",
+    "Primitive integer",
+    "easy int",
+    "ImpactInt",
+    "CR Integer",
+    "JWInteger",
+    "Int Literal",
+    "CM_Int",
+    "Seed",
+    "Seed Everywhere",
+    "ttN seed",
+    "easy seed",
+}
+SEED_NODE_CLASSES = {
+    "RandomNoise",
+    "Noise_RandomNoise",
+    "Seed",
+    "Seed Everywhere",
+    "easy seed",
+    "ttN seed",
+}
+INT_VALUE_KEYS = ("value", "int", "integer", "number", "seed", "noise_seed")
+
+
+def _is_link(val: Any) -> bool:
+    return isinstance(val, list) and val and not isinstance(val[0], dict)
+
+
+def _is_int_node(node: dict | None) -> bool:
+    if not isinstance(node, dict):
+        return False
+    cls = str(node.get("class_type") or "")
+    if cls in INT_NODE_CLASSES:
+        return True
+    return cls.lower() in {"int", "integer", "primitiveint", "primitive integer"}
+
+
+def _int_field(node: dict) -> str | None:
+    ins = node.get("inputs") or {}
+    for key in INT_VALUE_KEYS:
+        if key in ins and not _is_link(ins.get(key)):
+            return key
+    for key in INT_VALUE_KEYS:
+        if key in ins:
+            return key
+    return "value" if _is_int_node(node) else None
+
+
+def _write_int_node(node: dict, value: int) -> bool:
+    field = _int_field(node)
+    if not field:
+        return False
+    node.setdefault("inputs", {})[field] = int(value)
+    return True
+
+
+def _resolve_linked_value(wf: dict, val: Any) -> Any:
+    """外联整数节点上的当前数值；不是链接则原样返回。"""
+    if not _is_link(val):
+        return val
+    node = wf.get(str(val[0]))
+    if not isinstance(node, dict):
+        return None
+    field = _int_field(node)
+    if not field:
+        return None
+    inner = (node.get("inputs") or {}).get(field)
+    if inner is None or _is_link(inner):
+        return None
+    return inner
+
+
+def _write_numeric_input(wf: dict, node: dict, field: str, value: int | float, *, as_int: bool = True) -> bool:
+    """写采样器字段：若该口外联了整数节点，改整数节点，不断开连线。"""
+    ins = node.setdefault("inputs", {})
+    if field not in ins:
+        return False
+    written: int | float = int(value) if as_int else float(value)
+    cur = ins.get(field)
+    if _is_link(cur):
+        target = wf.get(str(cur[0]))
+        if isinstance(target, dict) and (
+            _is_int_node(target) or str(target.get("class_type") or "") in SEED_NODE_CLASSES
+        ):
+            return _write_int_node(target, int(value))
+        return False
+    ins[field] = written
+    return True
+
+
+def _rank_sampler_ids(wf: dict) -> list[str]:
+    """按「能控步数」排序：带 steps / 外联 Int 的 KSampler 优先于 KSamplerSelect。"""
+    ranked: list[tuple[int, str]] = []
+    for nid, node in wf.items():
+        if not isinstance(node, dict):
+            continue
+        cls = str(node.get("class_type") or "")
+        if cls not in SAMPLER_CLASSES:
+            continue
+        ins = node.get("inputs") or {}
+        score = 0
+        if "steps" in ins:
+            score += 4
+        if _is_link(ins.get("steps")):
+            score += 3
+        if cls in ("KSampler", "KSamplerAdvanced", "XB_ROCmKSamplerAdvanced"):
+            score += 2
+        if "seed" in ins or "noise_seed" in ins:
+            score += 1
+        ranked.append((score, str(nid)))
+    ranked.sort(key=lambda x: (-x[0], int(x[1]) if x[1].isdigit() else 0))
+    return [nid for _, nid in ranked]
+
+
+def collect_trigger_words(lora_meta: dict[str, Any] | None, loras: Any) -> str:
+    """从 lora_meta 按已选 LoRA 拼触发词，去重保序。"""
+    try:
+        parsed = parse_lora(loras)
+    except (ValueError, TypeError):
+        return ""
+    if not parsed or not lora_meta:
+        return ""
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in parsed:
+        name = str(item.get("name") or "").strip()
+        info = lora_meta.get(name) or {}
+        for word in info.get("trigger_words") or []:
+            text = str(word).strip()
+            if text and text not in seen:
+                seen.add(text)
+                unique.append(text)
+    return ", ".join(unique)
 
 _WIDGET_SKIP = {"fixed", "randomize", "increment", "decrement", "increment-1", "decrement-1"}
 
@@ -309,9 +458,11 @@ def detect_slots(wf: dict) -> dict[str, dict]:
     if size_id:
         slots["size"] = _slot(size_id, wf, "size")
 
-    sampler_id = _first_class(wf, SLOT_CLASS_HINTS["sampler"])
-    if sampler_id:
-        slots["sampler"] = _slot(sampler_id, wf, "sampler")
+    sampler_ids = _rank_sampler_ids(wf)
+    if sampler_ids:
+        slots["sampler"] = _slot(sampler_ids[0], wf, "sampler")
+        if len(sampler_ids) > 1:
+            slots["sampler_2"] = _slot(sampler_ids[1], wf, "sampler")
 
     return slots
 
@@ -352,6 +503,8 @@ def infer_field(node: dict, role: str) -> str:
     if role == "size":
         return "width"
     if role == "sampler":
+        if _is_int_node(node):
+            return _int_field(node) or "value"
         if "noise_seed" in ins and "seed" not in ins:
             return "noise_seed"
         return "seed"
@@ -532,14 +685,21 @@ def read_current_values(wf: dict, slots: dict[str, dict]) -> dict[str, Any]:
 
     sampler_slot = slots.get("sampler")
     if sampler_slot:
-        ins = (wf.get(str(sampler_slot["node"])) or {}).get("inputs") or {}
-        for key in ("steps", "cfg", "sampler_name", "scheduler", "denoise", "seed"):
-            val = ins.get(key)
-            if key == "seed":
-                val = ins.get("seed", ins.get("noise_seed"))
-            if val is None or isinstance(val, list):
-                continue
-            values[key] = val
+        node = wf.get(str(sampler_slot["node"])) or {}
+        ins = node.get("inputs") or {}
+        if _is_int_node(node):
+            field = _int_field(node)
+            raw = ins.get(field) if field else None
+            if isinstance(raw, (int, float)):
+                values["steps"] = int(raw)
+        else:
+            for key in ("steps", "cfg", "sampler_name", "scheduler", "denoise"):
+                val = ins.get(key)
+                if _is_link(val):
+                    val = _resolve_linked_value(wf, val)
+                if val is None or isinstance(val, list):
+                    continue
+                values[key] = val
     return values
 
 
@@ -690,9 +850,16 @@ def apply_slots(
                 ins["height"] = int(height)
 
     sampler_spec = slots.get("sampler")
+    sampler2_spec = slots.get("sampler_2")
     sampler_keys = ("steps", "cfg", "sampler_name", "scheduler", "denoise", "seed")
-    if sampler_spec and any(values.get(k) is not None for k in sampler_keys):
-        _apply_sampler(wf, str(sampler_spec["node"]), values)
+    target_id = str(sampler_spec["node"]) if sampler_spec else (
+        str(sampler2_spec["node"]) if sampler2_spec else ""
+    )
+    extra_ids = []
+    if sampler2_spec and str(sampler2_spec["node"]) != target_id:
+        extra_ids.append(str(sampler2_spec["node"]))
+    if target_id and any(values.get(k) is not None for k in sampler_keys):
+        _apply_sampler(wf, target_id, values, extra_ids=extra_ids)
 
     if prefix is not None:
         for node in wf.values():
@@ -730,39 +897,115 @@ def _sync_danbooru_text(wf: dict, artist_text: str) -> None:
             return
 
 
-def _apply_sampler(wf: dict, nid: str, values: dict[str, Any]) -> None:
+def _apply_sampler(
+    wf: dict,
+    nid: str,
+    values: dict[str, Any],
+    extra_ids: list[str] | None = None,
+) -> None:
     node = wf.get(nid)
     if node is None:
         return
-    ins = node.setdefault("inputs", {})
-    is_adv = node.get("class_type") in ("KSamplerAdvanced", "XB_ROCmKSamplerAdvanced")
+
+    sampler_ids = list(dict.fromkeys([*(extra_ids or []), *_rank_sampler_ids(wf)]))
+    if nid not in sampler_ids and str(node.get("class_type") or "") in SAMPLER_CLASSES:
+        sampler_ids.insert(0, nid)
+    primary = nid if nid in sampler_ids else (sampler_ids[0] if sampler_ids else nid)
+
     seed = values.get("seed")
     if seed is not None:
-        if "seed" in ins:
-            ins["seed"] = int(seed)
-        if is_adv and "noise_seed" in ins:
-            ins["noise_seed"] = int(seed)
-        # 双段采样链：种子同步到其它采样器，步数等只写选中的那一个
-        for other in wf.values():
-            if other is node or not isinstance(other, dict):
-                continue
-            if other.get("class_type") not in SAMPLER_CLASSES:
-                continue
-            oins = other.setdefault("inputs", {})
-            if "seed" in oins and not isinstance(oins.get("seed"), list):
-                oins["seed"] = int(seed)
-            if other.get("class_type") in ("KSamplerAdvanced", "XB_ROCmKSamplerAdvanced") and "noise_seed" in oins:
-                oins["noise_seed"] = int(seed)
-    if values.get("steps") is not None and not isinstance(ins.get("steps"), list):
-        ins["steps"] = int(values["steps"])
+        _apply_seed_all(wf, sampler_ids or [nid], int(seed))
+
+    steps = values.get("steps")
+    if steps is not None:
+        if _is_int_node(node):
+            _write_int_node(node, int(steps))
+        _apply_steps_dual(wf, primary, sampler_ids, int(steps), extra_ids=extra_ids or [])
+
+    target = wf.get(primary) if primary else node
+    if target is None or _is_int_node(target):
+        return
+    ins = target.setdefault("inputs", {})
     if values.get("cfg") is not None:
-        ins["cfg"] = float(values["cfg"])
-    if values.get("sampler_name"):
+        if not _write_numeric_input(wf, target, "cfg", float(values["cfg"]), as_int=False):
+            if "cfg" in ins and not _is_link(ins.get("cfg")):
+                ins["cfg"] = float(values["cfg"])
+    if values.get("sampler_name") and "sampler_name" in ins and not _is_link(ins.get("sampler_name")):
         ins["sampler_name"] = str(values["sampler_name"])
-    if values.get("scheduler"):
+    if values.get("scheduler") and "scheduler" in ins and not _is_link(ins.get("scheduler")):
         ins["scheduler"] = str(values["scheduler"])
     if values.get("denoise") is not None:
-        ins["denoise"] = float(values["denoise"])
+        if not _write_numeric_input(wf, target, "denoise", float(values["denoise"]), as_int=False):
+            if "denoise" in ins and not _is_link(ins.get("denoise")):
+                ins["denoise"] = float(values["denoise"])
+
+
+def _apply_seed_all(wf: dict, sampler_ids: list[str], seed: int) -> None:
+    seen: set[str] = set()
+    for sid in sampler_ids:
+        snode = wf.get(sid)
+        if not isinstance(snode, dict):
+            continue
+        ins = snode.get("inputs") or {}
+        for field in ("seed", "noise_seed"):
+            if field in ins:
+                _write_numeric_input(wf, snode, field, seed)
+        noise = ins.get("noise")
+        if _is_link(noise):
+            tid = str(noise[0])
+            tnode = wf.get(tid)
+            if tid not in seen and isinstance(tnode, dict) and str(tnode.get("class_type") or "") in SEED_NODE_CLASSES:
+                _write_int_node(tnode, seed)
+                seen.add(tid)
+
+
+def _apply_steps_to_node(wf: dict, node: dict | None, steps: int, written_ints: set[str]) -> None:
+    if not isinstance(node, dict):
+        return
+    ins = node.get("inputs") or {}
+    if "steps" in ins:
+        cur = ins.get("steps")
+        if _is_link(cur):
+            tid = str(cur[0])
+            tnode = wf.get(tid)
+            if tid not in written_ints and isinstance(tnode, dict) and _is_int_node(tnode):
+                _write_int_node(tnode, steps)
+                written_ints.add(tid)
+            return
+        ins["steps"] = int(steps)
+        return
+    sigmas = ins.get("sigmas")
+    hops = 0
+    while _is_link(sigmas) and hops < 6:
+        hops += 1
+        snode = wf.get(str(sigmas[0]))
+        if not isinstance(snode, dict):
+            break
+        sins = snode.get("inputs") or {}
+        if "steps" in sins:
+            _apply_steps_to_node(wf, snode, steps, written_ints)
+            return
+        sigmas = sins.get("sigmas") or sins.get("input")
+
+
+def _apply_steps_dual(
+    wf: dict,
+    primary: str,
+    sampler_ids: list[str],
+    steps: int,
+    extra_ids: list[str] | None = None,
+) -> None:
+    """步数写到选中采样器；双采样第二段、以及外联了整数节点的其它采样器一并改。"""
+    written: set[str] = set()
+    extra = set(extra_ids or [])
+    _apply_steps_to_node(wf, wf.get(primary), steps, written)
+    for sid in sampler_ids:
+        if sid == primary:
+            continue
+        node = wf.get(sid)
+        ins = (node or {}).get("inputs") or {}
+        if sid in extra or _is_link(ins.get("steps")) or _is_link(ins.get("sigmas")):
+            _apply_steps_to_node(wf, node, steps, written)
 
 
 def _apply_loras(wf: dict, nid: str, parsed: list[dict]) -> None:

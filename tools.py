@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import random
 import time
 import uuid
@@ -27,11 +28,202 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
 from animadex import AnimaDexClient
-from comfy_client import ComfyUIClient
+from comfy_client import ComfyUIClient, safe_output_path
 from external_search import CivitaiClient, DanbooruClient, GelbooruClient
 from recipe_store import RecipeStore, materialize_values
 from slot_mapping import apply_slots, collect_trigger_words, parse_lora, resolve_size
 from workflow_builder import WorkflowBuilder
+
+MAX_LLM_LIST_ITEMS = 30
+MAX_LLM_DETAIL_ITEMS = 8
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """Parse tool booleans safely when a provider sends JSON values as text."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n", ""}:
+        return False
+    return default
+
+
+def _bounded_limit(value: Any, default: int = MAX_LLM_LIST_ITEMS) -> int:
+    try:
+        return min(max(int(value), 1), 50)
+    except (TypeError, ValueError):
+        return default
+
+
+def _number(value: Any, label: str, *, integer: bool = False,
+            minimum: float | None = None, maximum: float | None = None) -> int | float:
+    """Validate a generation number and return a plain finite int/float."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{label} 必须是数字") from e
+    if not math.isfinite(number):
+        raise ValueError(f"{label} 不能是 NaN 或无穷大")
+    if integer and not number.is_integer():
+        raise ValueError(f"{label} 必须是整数")
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{label} 不能小于 {minimum:g}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{label} 不能大于 {maximum:g}")
+    return int(number) if integer else number
+
+
+def _validate_generation_values(values: dict[str, Any]) -> dict[str, Any]:
+    """Normalize numeric generation values before workflow mutation."""
+    result = dict(values)
+    limits = {
+        "seed": (True, 0, 2**63 - 1),
+        "steps": (True, 1, 1000),
+        "cfg": (False, 0, 100),
+        "denoise": (False, 0, 1),
+        "width": (True, 64, 8192),
+        "height": (True, 64, 8192),
+    }
+    for key, (integer, minimum, maximum) in limits.items():
+        value = result.get(key)
+        if value in (None, ""):
+            continue
+        result[key] = _number(
+            value,
+            key,
+            integer=integer,
+            minimum=minimum,
+            maximum=maximum,
+        )
+    return result
+
+
+def _event_scope(context: ContextWrapper[AstrAgentContext]) -> str:
+    """Return a conversation scope for per-session task state."""
+    event = getattr(getattr(context, "context", None), "event", None)
+    if event is None:
+        return "global"
+    umo = getattr(event, "unified_msg_origin", None)
+    if umo:
+        return str(umo)
+    get_session_id = getattr(event, "get_session_id", None)
+    if callable(get_session_id):
+        try:
+            value = get_session_id()
+            if value:
+                return str(value)
+        except Exception:
+            pass
+    try:
+        sender = event.get_sender_id()
+        if sender:
+            return f"sender:{sender}"
+    except Exception:
+        pass
+    return "global"
+
+
+def _remember_prompt_id(
+    shared: dict, context: ContextWrapper[AstrAgentContext], prompt_id: str
+) -> None:
+    """Keep the most recent task per conversation, not one global task."""
+    by_scope = shared.setdefault("last_prompt_ids", {})
+    by_scope[_event_scope(context)] = str(prompt_id)
+
+
+def _last_prompt_id(shared: dict, context: ContextWrapper[AstrAgentContext]) -> str:
+    by_scope = shared.get("last_prompt_ids") or {}
+    return str(by_scope.get(_event_scope(context)) or "")
+
+
+def _usage_tips_text(value: Any) -> str:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return value.strip()[:180]
+    if not isinstance(value, dict):
+        return ""
+    labels = (
+        ("strength", "建议权重"),
+        ("strength_range", "权重范围"),
+        ("clip_strength", "CLIP权重"),
+        ("clip_skip", "CLIP跳过层"),
+    )
+    return ", ".join(
+        f"{label}={value[key]}" for key, label in labels if value.get(key) not in (None, "")
+    )
+
+
+def _lora_info_summary(info: dict, detailed: bool = False) -> list[str]:
+    """Render the compact normalized LoRA record for an LLM response."""
+    lines: list[str] = []
+    categories = info.get("categories") or []
+    tags = info.get("tags") or []
+    if categories:
+        lines.append("类别: " + ", ".join(str(x) for x in categories[:8]))
+    if tags and detailed:
+        lines.append("标签: " + ", ".join(str(x) for x in tags[:16]))
+    if info.get("model_name") and detailed:
+        lines.append("Civitai名称: " + str(info["model_name"]))
+    if info.get("base_model"):
+        lines.append("基础模型: " + str(info["base_model"]))
+    if detailed and info.get("description"):
+        lines.append("用途说明: " + str(info["description"]))
+    tips = _usage_tips_text(info.get("usage_tips"))
+    if tips:
+        lines.append("使用建议: " + tips)
+    if info.get("trigger_words"):
+        lines.append("触发词: " + ", ".join(str(x) for x in info["trigger_words"][:12]))
+    if detailed and info.get("notes"):
+        lines.append("备注: " + str(info["notes"]))
+    return lines
+
+
+def _match_lora_resources(
+    names: list[str], metadata: dict[str, dict], query: str, limit: int = 8
+) -> list[str]:
+    """Match LoRAs by filename, LoRA Manager category/tag, or description."""
+    q = str(query or "").strip().casefold()
+    if not q:
+        return []
+
+    category_hits: list[str] = []
+    for name in names:
+        info = metadata.get(name) or {}
+        categories = {str(x).casefold() for x in info.get("categories") or []}
+        for category, aliases in ComfyUIClient._LORA_CATEGORY_ALIASES.items():
+            if category in categories and any(q == str(alias).casefold() for alias in aliases):
+                category_hits.append(name)
+                break
+    if category_hits:
+        return category_hits[:limit]
+
+    q_base = q.replace("\\", "/").rsplit("/", 1)[-1]
+    hits: list[str] = []
+    for name in names:
+        info = metadata.get(name) or {}
+        search_text = " ".join(
+            str(value)
+            for value in (
+                name,
+                info.get("model_name"),
+                info.get("categories"),
+                info.get("tags"),
+                info.get("description"),
+                info.get("notes"),
+            )
+            if value
+        ).casefold()
+        if q in search_text or q_base in name.replace("\\", "/").rsplit("/", 1)[-1].casefold():
+            hits.append(name)
+    return hits[:limit]
 
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
@@ -41,8 +233,7 @@ class ComfyuiListModelsTool(FunctionTool[AstrAgentContext]):
     name: str = "comfyui_list_models"
     description: str = (
         "查询本机上ComfyUI可用的UNET底模、LoRA、CLIP、VAE、Embedding列表。"
-        "LoRA 会附带从 safetensors 头部读出的触发词"
-        "（ss_activation_tags / ss_tag_frequency 按频率取 top）。"
+        "LoRA 会附带触发词，以及 LoRA Manager/Civitai 的 style、character 等类别、标签和使用建议。"
         "清单会自动同步并本地缓存，ComfyUI离线时返回最近一次同步结果。"
         "用户想知道有什么模型/LoRA/CLIP可用时使用。"
     )
@@ -53,14 +244,39 @@ class ComfyuiListModelsTool(FunctionTool[AstrAgentContext]):
                 "refresh": {
                     "type": "boolean",
                     "description": "是否强制重新从 ComfyUI 同步一次，默认 false（用本地缓存）",
-                }
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["all", "unet", "lora", "clip", "vae", "embedding"],
+                    "description": "只查看某一类资源，默认 all",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "按文件名、LoRA 类别或标签过滤；可选",
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "每类最多返回多少项（1-50，默认 30）",
+                },
             },
         }
     )
     client: ComfyUIClient | None = None
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
-        force = bool(kwargs.get("refresh", False))
+        force = _as_bool(kwargs.get("refresh", False))
+        kind = str(kwargs.get("kind") or "all").strip().lower()
+        field_titles = {
+            "unet": ("unet_name", "UNET 底模"),
+            "lora": ("lora_name", "LoRA"),
+            "clip": ("clip_name", "CLIP"),
+            "vae": ("vae_name", "VAE"),
+            "embedding": ("embeddings", "Embedding"),
+        }
+        if kind != "all" and kind not in field_titles:
+            return "查询失败：kind 仅支持 all/unet/lora/clip/vae/embedding。"
+        query = str(kwargs.get("query") or "").strip().casefold()
+        limit = _bounded_limit(kwargs.get("limit"), MAX_LLM_LIST_ITEMS)
         resources, from_cache = await self.client.list_resources(force_refresh=force)
 
         parts = ["【ComfyUI 可用资源】"]
@@ -68,25 +284,26 @@ class ComfyuiListModelsTool(FunctionTool[AstrAgentContext]):
             parts.append("（来源：本地缓存，自动同步失败时回退）")
         parts.append("")
         lora_meta = resources.get("lora_meta") or {}
-        for field, title in (
-            ("unet_name", "UNET 底模"),
-            ("lora_name", "LoRA"),
-            ("clip_name", "CLIP"),
-            ("vae_name", "VAE"),
-            ("embeddings", "Embedding"),
-        ):
+        fields = list(field_titles.values()) if kind == "all" else [field_titles[kind]]
+        for field, title in fields:
             items = resources.get(field) or []
+            if query:
+                if field == "lora_name":
+                    items = _match_lora_resources(items, lora_meta, query, limit=len(items))
+                else:
+                    items = [item for item in items if query in str(item).casefold()]
             parts.append(f"--- {title} ---")
+            shown_items = items[:limit]
+            if len(items) > limit:
+                parts.append(f"  共 {len(items)} 项，仅显示前 {limit} 项；请继续用 query 筛选。")
             if field == "lora_name":
-                for m in items:
+                for m in shown_items:
                     parts.append(f"  {m}")
                     info = lora_meta.get(m)
-                    if info and info.get("trigger_words"):
-                        parts.append(
-                            f"    触发词: {', '.join(info['trigger_words'])}"
-                        )
-            elif items:
-                parts.extend(f"  {m}" for m in items)
+                    if info:
+                        parts.extend(f"    {line}" for line in _lora_info_summary(info))
+            elif shown_items:
+                parts.extend(f"  {m}" for m in shown_items)
             else:
                 parts.append("  (无)")
             parts.append("")
@@ -99,25 +316,26 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
 
     name: str = "comfyui_generate"
     description: str = (
-        "通过本机的ComfyUI生成一张图片。默认加载 V5 工作流模板（五段式提示词："
+        "通过本机的ComfyUI生成一张图片。默认加载 V6 工作流模板（五段式提示词："
         "主提示词/画师串/质量/lora触发词 四段拼接 + 负向提示词）。\n"
         "【铁律】\n"
-        "1. prompt（tag串）必填。默认模板 V5 是 1024x1024 正方形且易出蹲坐/半身构图，"
+        "1. prompt（tag串）必填。默认模板 V6 是 1024x1024 正方形且易出蹲坐/半身构图，"
         "所以【每次都要按构图传 width/height】：全身站姿→832x1216(2:3)；半身坐姿→768x1024(3:4)；"
         "横版场景→1216x832(3:2)；头像→768x1024；图生图保持原图比例。\n"
-        "2. lora【默认绝不传】！V5 已内置 Turbo-ANIMA-v2.9(0.8) + 5个风格lora（Betabeet-000060 1.0 / "
-        "deepseek_whale_girl_maid 0.75 / zoda_v3_anima 0.5 / anima_context_detailer_base10 0.76 / "
-        "anima_footRepair_v2 1.0）。传 lora 数组=【全量覆盖】Power插槽（顺序映射lora_1..N，多余的关掉），"
-        "只传一个会把默认风格链全顶掉。禁止再传任何 turbo/加速 lora（已内置）。"
-        "真要换链必须传完整新链（含要保留的默认lora），[]或\"none\"=禁用全部（Turbo也归零），别乱用。\n"
-        "3. 只有用户明确要求才覆盖其他参数：提到画师→填 artist（先调 comfyui_booru 查证）；"
+        "2. lora：V6 的 Power Lora Loader 插槽默认全关（on=False），不传 lora = 无任何风格 LoRA。"
+        "需要画风/角色时主动传 lora，传数组 = 顺序映射 Power 插槽 lora_1..lora_N（多余的关掉）。"
+        "禁止传 turbo/加速 lora（独立 Turbo 节点已常驻 0.8）。"
+        "[]或\"none\" = 禁用全部含 Turbo 归零，别乱用。\n"
+        "3. 传了 lora 就必须同步传 trigger_words（@触发词格式），不传触发词 lora 等于白挂。"
+        "传参前先查 comfyui_list_models / comfyui_model_info 获取文件名和触发词，禁止编造。\n"
+        "4. 只有用户明确要求才覆盖其他参数：提到画师→填 artist（先调 comfyui_booru 查证）；"
         "提到角色→务必先用系统自带 search-characters / get-character 查该角色的规范 danbooru tag"
         "（本地 AnimaDex MCP，角色特征以此为准），再把查到的角色 tag 填进 prompt 或 trigger_words，"
         "禁止凭记忆瞎编角色特征；提到换底模→填 model（不知道文件名先查 comfyui_list_models）；"
         "要求画质→填 quality；调参数→填 steps/cfg/sampler_name 等。\n"
-        "4. 用户没有特别要求时，其他参数一律不传，绝不编造模型名/画师名/tag。\n"
-        "5. 生成成功后图片由插件直接发送到当前会话，不要再调用 send_message_to_user 发图。\n"
-        "6. 传 recipe（配方名）时，配方里保存的参数作为底层默认，本参数显式传的值优先；prompt 按需另传。\n"
+        "5. 用户没有特别要求时，其他参数一律不传，绝不编造模型名/画师名/tag。\n"
+        "6. 生成成功后图片由插件直接发送到当前会话，不要再调用 send_message_to_user 发图。\n"
+        "7. 传 recipe（配方名）时，配方里保存的参数作为底层默认，本参数显式传的值优先；prompt 按需另传。\n"
         "正确示例：comfyui_generate(prompt=\"1girl, solo, standing, full body, black hair, street\", width=832, height=1216)"
     )
     parameters: dict = Field(
@@ -134,7 +352,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 },
                 "trigger_words": {
                     "type": "string",
-                    "description": "lora触发词，以 @ 开头的逗号分隔串，如 @deadpuritystyle,@f1f。用户提到 lora/触发词时填，否则留空用模板默认",
+                    "description": "lora触发词，以 @ 开头的逗号分隔串，如 @deadpuritystyle,@f1f。传了 lora 就必须填触发词，否则 lora 无效",
                 },
                 "quality": {
                     "type": "string",
@@ -146,7 +364,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 },
                 "model": {
                     "type": "string",
-                    "description": "底模文件名，如 miaomiaoRealskin_anima11.safetensors。用户指定底模时填，不知道文件名先查 comfyui_list_models",
+                    "description": "底模文件名。必须用 comfyui_list_models 返回的完整名字（可能带子目录前缀，如 Anima\\miaomiaoHarem_anima16.safetensors）；传短名会自动匹配，匹配到多份会要求重填。用户指定底模时填，不知道文件名先查 comfyui_list_models",
                 },
                 "lora": {
                     "type": "string",
@@ -156,7 +374,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                         '[{"name":"anima-base-1-photo-background-v4.safetensors","strength":0.55}]。'
                         "解析器兼容 JSON 字符串、数组对象与 repr 字符串三种传法，"
                         "直接传数组即可，不必手动字符串化。传 [] 或 \"none\" 禁用全部。"
-                        "默认值在插件配置里可配多条（含强度），通常无需传"
+                        "V6 Power 插槽默认全关，不传 = 无风格 LoRA。需要画风时主动传"
                     ),
                 },
                 "steps": {
@@ -193,7 +411,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 },
                 "workflow": {
                     "type": "string",
-                    "description": "工作流模板名（anima-v3 默认 / nagato-anima / anima-v2），也可传 JSON 文件路径",
+                    "description": "工作流模板名（V6 默认 / V5 旧版），也可传 JSON 文件路径",
                 },
                 "recipe": {
                     "type": "string",
@@ -208,7 +426,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
     output_dir: Path | None = None
     shared: dict = Field(default_factory=dict)  # 跨工具共享状态（如 last_prompt_id）
     defaults: dict = Field(default_factory=dict)  # 插件配置里的生成默认值（LLM 不传时使用）
-    recipe_dir: Path | None = None  # 配方目录（comfyui_recipe 保存的）
+    store: RecipeStore | None = None  # 配方存储（统一用 RecipeStore）
 
     @staticmethod
     def _pick(defaults: dict, key: str, value: Any) -> Any:
@@ -225,18 +443,24 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
 
     def _load_recipe(self, name: str) -> dict | None:
         """按配方名读本地配方 JSON，返回配方参数 dict；不存在返回 None。"""
-        if not self.recipe_dir or not name:
+        if not self.store or not name:
             return None
-        safe = "".join(c for c in name if c.isalnum() or c in "-_")
-        if safe != name:
+        recipe = self.store.get(name)
+        if recipe is None:
             return None
-        p = self.recipe_dir / f"{safe}.json"
-        if not p.is_file():
-            return None
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
+        # 把 RecipeStore 格式转成 generate 工具期望的 flat kwargs
+        defaults = dict(recipe.get("defaults") or {})
+        flat: dict[str, Any] = {}
+        flat["workflow"] = recipe.get("workflow") or ""
+        # defaults 里的 loras 要转回 lora 参数串
+        loras = defaults.pop("loras", None) if isinstance(defaults, dict) else None
+        for k, v in defaults.items():
+            flat[k] = v
+        if "negative" in flat and "negative_prompt" not in flat:
+            flat["negative_prompt"] = flat.pop("negative")
+        if loras:
+            flat["lora"] = json.dumps(loras, ensure_ascii=False)
+        return flat
 
     async def _wait_outputs(self, prompt_id: str) -> tuple[dict | None, str | None]:
         """轮询执行结果，返回 (outputs, 错误信息)。执行失败/超时返回错误信息。
@@ -289,11 +513,37 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
 
         try:
             pick = lambda key: self._pick(self.defaults, key, kwargs.get(key))  # noqa: E731
+            # 底模名解析：传短名/basename 时在资源列表里匹配出完整路径（如 Anima\xxx.safetensors），
+            # 避免 ComfyUI 校验 Value not in list；列表拉不到则保持原值交给提交阶段报错。
+            model_val = pick("model")
+            if model_val and self.client is not None:
+                try:
+                    resources, _ = await self.client.list_resources()
+                    hits = _match_resource(resources.get("unet_name") or [], str(model_val))
+                except Exception:
+                    hits = []
+                if len(hits) == 1:
+                    kwargs["model"] = hits[0]
+                elif len(hits) > 1:
+                    preview = "、".join(hits[:5])
+                    return (
+                        f"生成失败：底模「{model_val}」匹配到多份：{preview}。"
+                        "请让用户选一个或填完整文件名。"
+                    )
             lora_val = pick("lora")
             trigger_val = pick("trigger_words")
-            # LLM 没传 trigger_words 时，从 lora_meta 自动查触发词
-            if lora_val and not trigger_val:
-                trigger_val = await _auto_fill_trigger_words(self.client, lora_val)
+            generation_values = _validate_generation_values(
+                {
+                    "seed": seed,
+                    "width": pick("width"),
+                    "height": pick("height"),
+                    "steps": pick("steps"),
+                    "cfg": pick("cfg"),
+                    "denoise": pick("denoise"),
+                }
+            )
+            seed = generation_values["seed"]
+            # 自动填 lora 触发词已禁用（33号要求，lora_meta 触发词乱提示），需要时显式传 trigger_words
             wf = self.builder.build(
                 workflow=kwargs.get("workflow"),
                 prompt=prompt,
@@ -303,14 +553,14 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 negative_prompt=pick("negative_prompt"),
                 model=pick("model"),
                 lora=lora_val,
-                width=pick("width"),
-                height=pick("height"),
-                seed=seed,
-                steps=pick("steps"),
-                cfg=pick("cfg"),
+                width=generation_values.get("width"),
+                height=generation_values.get("height"),
+                seed=generation_values.get("seed"),
+                steps=generation_values.get("steps"),
+                cfg=generation_values.get("cfg"),
                 sampler_name=pick("sampler_name"),
                 scheduler=pick("scheduler"),
-                denoise=pick("denoise"),
+                denoise=generation_values.get("denoise"),
                 prefix=f"astrbot_{uuid.uuid4().hex[:8]}",
             )
         except FileNotFoundError as e:
@@ -326,7 +576,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 "生成失败：无法连接 ComfyUI，请确认本机已开机且ComfyUI已启动、"
                 "插件配置的地址（IP/端口）正确。"
             )
-        self.shared["last_prompt_id"] = pid
+        _remember_prompt_id(self.shared, context, pid)
 
         outputs, wait_err = await self._wait_outputs(pid)
         if wait_err:
@@ -350,10 +600,10 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 f"可手动访问 {self.client.base_url}/view?filename={filename}&type=output 查看。"
             )
 
-        local_path = self.output_dir / filename
         try:
+            local_path = safe_output_path(self.output_dir, filename)
             local_path.write_bytes(content)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             logger.error(f"[ComfyUIDirect] 写入图片失败: {e}")
             return f"图片已生成但本地保存失败（{e}）。文件名: {filename}"
 
@@ -404,23 +654,23 @@ class ComfyuiInterruptTool(FunctionTool[AstrAgentContext]):
     shared: dict = Field(default_factory=dict)
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
-        pid = str(kwargs.get("prompt_id") or "").strip() or self.shared.get(
-            "last_prompt_id"
+        pid = str(kwargs.get("prompt_id") or "").strip() or _last_prompt_id(
+            self.shared, context
         )
-        remove = bool(kwargs.get("remove_from_queue", False))
+        remove = _as_bool(kwargs.get("remove_from_queue", False))
 
         if remove and pid:
             await self.client.delete_queue_items([pid])
+        if not pid:
+            return "中断失败：当前会话没有可中断的生成任务。请传入明确的 prompt_id。"
         ok = await self.client.interrupt(prompt_id=pid or None)
         if not ok:
             return "中断失败：无法连接 ComfyUI。"
-        if pid:
-            parts = [f"已请求中断任务 {pid}。"]
-            if remove:
-                parts.append("该任务已从待执行队列移除。")
-            parts.append("若任务已执行完毕则无需处理。")
-            return "".join(parts)
-        return "已请求全局中断（当前运行中的任务将被停止）。"
+        parts = [f"已请求中断任务 {pid}。"]
+        if remove:
+            parts.append("该任务已从待执行队列移除。")
+        parts.append("若任务已执行完毕则无需处理。")
+        return "".join(parts)
 
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
@@ -467,7 +717,7 @@ class ComfyuiQueueTool(FunctionTool[AstrAgentContext]):
         if pending_ids:
             parts.append(f"待执行: {', '.join(pending_ids[:5])}" + ("…" if len(pending_ids) > 5 else ""))
 
-        if kwargs.get("include_gpu", True):
+        if _as_bool(kwargs.get("include_gpu", True), default=True):
             stats = await self.client.get_system_stats()
             if stats:
                 sysinfo = stats.get("system", {})
@@ -540,7 +790,10 @@ class ComfyuiBooruTool(FunctionTool[AstrAgentContext]):
         query = str(kwargs.get("query") or "").strip()
         if source not in ("danbooru", "gelbooru") or kind not in ("artist", "character") or not query:
             return "查询失败：需要 source（danbooru/gelbooru）、type（artist/character）与 query 参数。"
-        limit = min(max(int(kwargs.get("limit") or 30), 1), 50)
+        try:
+            limit = min(max(int(kwargs.get("limit") or 30), 1), 50)
+        except (TypeError, ValueError):
+            limit = 30
 
         # 主源查询失败（danbooru 镜像 403/无结果）时自动回退 gelbooru，不用让 LLM 手动重试
         primary = self.danbooru if source == "danbooru" else self.gelbooru
@@ -636,8 +889,11 @@ class ComfyuiCivitaiSearchTool(FunctionTool[AstrAgentContext]):
         query = str(kwargs.get("query") or "").strip()
         if not query:
             return "查询失败：query 不能为空。"
-        limit = min(max(int(kwargs.get("limit") or 5), 1), 10)
-        nsfw = bool(kwargs.get("nsfw", False))
+        try:
+            limit = min(max(int(kwargs.get("limit") or 5), 1), 10)
+        except (TypeError, ValueError):
+            limit = 5
+        nsfw = _as_bool(kwargs.get("nsfw", False))
 
         items = await self.client.search_images(query, limit, nsfw)
         if not items:
@@ -707,18 +963,20 @@ class ComfyuiModelInfoTool(FunctionTool[AstrAgentContext]):
 
     @staticmethod
     def _extract_trigger_words(meta: dict) -> list[str]:
-        """从 safetensors 元数据提取 LoRA 触发词（ss_tag_frequency 的顶层键）。"""
-        freq = meta.get("ss_tag_frequency")
-        if isinstance(freq, dict):
-            entries = sorted(
-                ((str(k), int(v)) for k, v in freq.items() if k),
-                key=lambda x: x[1],
-                reverse=True,
-            )
-            return [k for k, _ in entries[:10]]
-        return []
+        """从 safetensors 元数据提取触发词，兼容字符串/嵌套频率表。"""
+        words, _source = ComfyUIClient._extract_trigger_words(meta)
+        return words
 
     async def _query_local(self, name: str) -> str:
+        # LoRA Manager 保存的 sidecar/Civitai 信息比 safetensors 头部更完整，
+        # 尤其是 style/character 分类、用途说明和推荐权重。
+        manager_meta = await self.client.get_lora_manager_metadata(name)
+        manager_info = ComfyUIClient.normalize_lora_metadata(manager_meta)
+        if manager_info:
+            lines = [f"【LoRA Manager】{name}"]
+            lines.extend(_lora_info_summary(manager_info, detailed=True))
+            return "\n".join(lines)
+
         meta = await self.client.get_model_metadata(name)
         if not meta:
             return f"本地未找到模型 {name}，或该文件没有元数据头部（可试 source=civitai 在线搜索）。"
@@ -775,6 +1033,13 @@ class ComfyuiModelInfoTool(FunctionTool[AstrAgentContext]):
                     parts.append(f"触发词: {', '.join(tw[:10])}")
                 else:
                     parts.append("触发词: 未记录")
+            tags = [str(tag).strip() for tag in (item.get("tags") or []) if str(tag).strip()]
+            if tags:
+                parts.append(f"标签: {', '.join(tags[:12])}")
+            description = " ".join(str(item.get("description") or "").split())
+            if description:
+                suffix = "…" if len(description) > 320 else ""
+                parts.append(f"用途说明: {description[:320]}{suffix}")
         return "\n".join(parts)
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
@@ -810,7 +1075,7 @@ class ComfyuiAnimadexTool(FunctionTool[AstrAgentContext]):
         "search-copyrights 等 MCP 工具的本地封装，二者任选其一即可，不要重复调用。"
         "用户点名作品角色（如 忍野忍/妃咲/铃兰/初音ミク）或指定画师风格时，"
         "先调用本工具查到规范触发词，再把结果填进 comfyui_generate 的 prompt/artist 参数，"
-        "不要凭记忆编 tag。中文名/日文名/英文罗马音均可搜（中文会自动映射）。"
+        "不要凭记忆编 tag。搜索时优先用日文原名或英文罗马音（如 himari、初音ミク），罗马音命中率最高；中文虽可搜但自动映射不保证全中，中文查不到就换罗马音重搜。"
         "想拿角色详细设定/关联 LoRA 时，用 type=character 搜索后在结果里取 slug，"
         "再调 get_character 拉完整信息。"
     )
@@ -825,7 +1090,7 @@ class ComfyuiAnimadexTool(FunctionTool[AstrAgentContext]):
                 },
                 "query": {
                     "type": "string",
-                    "description": "角色名/画师名/系列名（中文名/日文名/罗马音均可，如 妃咲、初音ミク）",
+                    "description": "角色名/画师名/系列名。最好用罗马音或日文原名（如 himari、ヒマリ）；中文能用但映射不全",
                 },
                 "page": {
                     "type": "number",
@@ -932,9 +1197,9 @@ class ComfyuiRunWorkflowTool(FunctionTool[AstrAgentContext]):
             return f"运行失败：{submit_err}"
         if not pid:
             return "运行失败：无法连接 ComfyUI。"
-        self.shared["last_prompt_id"] = pid
+        _remember_prompt_id(self.shared, context, pid)
 
-        wait = bool(kwargs.get("wait", True))
+        wait = _as_bool(kwargs.get("wait", True), default=True)
         if not wait:
             return f"工作流已提交，prompt_id: {pid}（可稍后用 comfyui_job 查状态）"
 
@@ -958,10 +1223,10 @@ class ComfyuiRunWorkflowTool(FunctionTool[AstrAgentContext]):
                 content = await self.client.download_image(filename, subfolder)
                 if not content:
                     return f"工作流执行完成，图片下载失败（{filename}）。prompt_id: {pid}"
-                local_path = self.output_dir / filename
                 try:
+                    local_path = safe_output_path(self.output_dir, filename)
                     local_path.write_bytes(content)
-                except OSError as e:
+                except (OSError, ValueError) as e:
                     return f"工作流执行完成但本地保存失败（{e}）。prompt_id: {pid}"
                 try:
                     event: AstrMessageEvent = context.context.event
@@ -1008,7 +1273,9 @@ class ComfyuiJobTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         action = str(kwargs.get("action") or "status").strip().lower()
-        pid = str(kwargs.get("prompt_id") or "").strip() or self.shared.get("last_prompt_id", "")
+        pid = str(kwargs.get("prompt_id") or "").strip() or _last_prompt_id(
+            self.shared, context
+        )
 
         if action == "queue":
             queue = await self.client.get_queue()
@@ -1111,11 +1378,11 @@ class ComfyuiFetchOutputsTool(FunctionTool[AstrAgentContext]):
             content = await self.client.download_image(filename, subfolder)
             if not content:
                 continue
-            local_path = self.output_dir / filename
             try:
+                local_path = safe_output_path(self.output_dir, filename)
                 local_path.write_bytes(content)
                 saved.append(str(local_path))
-            except OSError:
+            except (OSError, ValueError):
                 continue
         if not saved:
             return f"任务 {pid} 图片全部下载失败（链路问题？）。"
@@ -1188,7 +1455,7 @@ class ComfyuiFreeMemoryTool(FunctionTool[AstrAgentContext]):
     client: ComfyUIClient | None = None
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
-        unload = bool(kwargs.get("unload_models", True))
+        unload = _as_bool(kwargs.get("unload_models", True), default=True)
         ok = await self.client.free_memory(unload_models=unload, free_cache=True)
         return "已请求释放显存（卸载模型+清缓存）。" if ok else "释放失败：无法连接 ComfyUI。"
 
@@ -1229,7 +1496,9 @@ class ComfyuiNodesTool(FunctionTool[AstrAgentContext]):
             return "查询失败：无法连接 ComfyUI。"
         if action == "list":
             names = sorted(obj.keys())
-            return "全部节点类 (" + str(len(names)) + "):\n" + ", ".join(names)
+            shown = names[:MAX_LLM_LIST_ITEMS]
+            suffix = f"\n（共 {len(names)} 个，仅显示前 {MAX_LLM_LIST_ITEMS} 个；用 search 精确查找）" if len(names) > len(shown) else ""
+            return "全部节点类 (" + str(len(names)) + "):\n" + ", ".join(shown) + suffix
         if action == "get":
             if not query:
                 return "查询失败：query（节点类名）不能为空。"
@@ -1392,7 +1661,9 @@ class ComfyuiModelsSearchTool(FunctionTool[AstrAgentContext]):
             names = [n for n in names if query in n.lower()]
         if not names:
             return f"{folder} 下未找到匹配模型。"
-        return f"【{folder}】模型 ({len(names)}):\n" + "\n".join(sorted(names))
+        shown = sorted(names)[:MAX_LLM_LIST_ITEMS]
+        suffix = f"\n（共 {len(names)} 个，仅显示前 {MAX_LLM_LIST_ITEMS} 个；请继续用 query 筛选）" if len(names) > len(shown) else ""
+        return f"【{folder}】模型 ({len(names)}):\n" + "\n".join(shown) + suffix
 
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
@@ -1441,13 +1712,8 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
             },
         }
     )
-    recipe_dir: Path | None = None
-
-    def _path(self, name: str) -> Path:
-        safe = "".join(c for c in name if c.isalnum() or c in "-_")
-        if not safe or safe != name:
-            raise ValueError(f"配方名不合法: {name}（仅允许字母数字-_）")
-        return self.recipe_dir / f"{safe}.json"
+    store: RecipeStore | None = None
+    allow_delete: bool = False
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         action = str(kwargs.get("action") or "save").strip().lower()
@@ -1456,59 +1722,86 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
             return "操作失败：action 仅支持 save/list/load/delete。"
 
         if action == "list":
-            if not self.recipe_dir.is_dir():
-                return "没有已保存的配方。"
-            files = sorted(self.recipe_dir.glob("*.json"))
-            if not files:
+            names = _recipe_enum(self.store)
+            if not names:
                 return "没有已保存的配方。"
             parts = ["【已保存配方】"]
-            for f in files:
-                try:
-                    data = json.loads(f.read_text(encoding="utf-8"))
-                    p = (data.get("prompt") or "")[:40]
-                    parts.append(f"- {f.stem}: {p}...")
-                except (OSError, json.JSONDecodeError):
-                    continue
+            if self.store is not None:
+                for row in self.store.list():
+                    desc = (row.get("description") or "")[:40]
+                    parts.append(f"- {row.get('name') or row['id']}: {desc}")
             return "\n".join(parts)
 
         if not name:
             return "操作失败：name 不能为空。"
 
         if action == "delete":
-            p = self._path(name)
-            if p.is_file():
-                p.unlink()
+            if not self.allow_delete:
+                return "为避免模型误删配方，删除操作请在 Workflow Studio 中手动完成。"
+            if self.store is not None and self.store.delete(name):
                 return f"已删除配方: {name}"
             return f"配方不存在: {name}"
 
         if action == "load":
-            p = self._path(name)
-            if not p.is_file():
+            recipe = self.store.get(name) if self.store else None
+            if recipe is None:
                 return f"配方不存在: {name}"
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as e:
-                return f"读取配方失败: {e}"
-            return "配方参数:\n" + json.dumps(data, ensure_ascii=False, indent=2)
+            defaults = recipe.get("defaults") or {}
+            info = {
+                "name": recipe.get("name") or name,
+                "workflow": recipe.get("workflow") or "",
+                "prompt": defaults.get("prompt") or "",
+                "model": defaults.get("model") or "",
+                "lora": json.dumps(defaults.get("loras") or [], ensure_ascii=False),
+                "width": defaults.get("width") or "",
+                "height": defaults.get("height") or "",
+                "steps": defaults.get("steps") or "",
+                "cfg": defaults.get("cfg") or "",
+                "sampler_name": defaults.get("sampler_name") or "",
+                "scheduler": defaults.get("scheduler") or "",
+                "denoise": defaults.get("denoise") or "",
+                "trigger_words": defaults.get("trigger_words") or "",
+                "artist": defaults.get("artist") or "",
+                "quality": defaults.get("quality") or "",
+                "negative_prompt": defaults.get("negative") or "",
+            }
+            return "配方参数:\n" + json.dumps(info, ensure_ascii=False, indent=2)
 
         # save
         prompt = str(kwargs.get("prompt") or "").strip()
         if not prompt:
             return "保存失败：prompt 不能为空。"
-        keys = (
-            "artist", "quality", "trigger_words", "negative_prompt", "model",
-            "lora", "steps", "cfg", "sampler_name", "scheduler", "denoise",
-            "width", "height", "seed", "workflow",
-        )
-        data = {"name": name, "prompt": prompt}
-        for k in keys:
-            v = kwargs.get(k)
+        lora_val = kwargs.get("lora")
+        if lora_val:
+            try:
+                parsed_loras = parse_lora(lora_val)
+            except ValueError as e:
+                return f"保存失败：{e}"
+        else:
+            parsed_loras = []
+        # prompt 是配方的复现输入；不能误存为 trigger_words，否则下次会把整段
+        # 主提示词拼进 LoRA 触发词节点。
+        defaults: dict[str, Any] = {"prompt": prompt}
+        for key in ("artist", "quality", "model", "sampler_name", "scheduler", "workflow"):
+            v = kwargs.get(key)
             if v is not None and v != "":
-                data[k] = v
+                defaults[key] = v
+        if kwargs.get("negative_prompt"):
+            defaults["negative"] = kwargs["negative_prompt"]
+        if parsed_loras:
+            defaults["loras"] = parsed_loras
+        for key in ("steps", "cfg", "denoise", "width", "height"):
+            v = kwargs.get(key)
+            if v is not None:
+                defaults[key] = v
         try:
-            p = self._path(name)
-            self.recipe_dir.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            assert self.store is not None
+            self.store.save({
+                "name": name,
+                "description": prompt[:60],
+                "workflow": kwargs.get("workflow") or "",
+                "defaults": defaults,
+            })
         except (ValueError, OSError) as e:
             return f"保存失败：{e}"
         return f"配方已保存: {name}"
@@ -1519,7 +1812,8 @@ _DRAW_DESC = (
     "用户只说「画xxx」时：只填 prompt，其他一律不填，用默认配方。"
     "用户点名某套配方/画风（如立绘、写实）→填 recipe。"
     "用户点名底模/LoRA→填 model / lora，可用关键词，不要编文件名；"
-    "拿不准就先 comfyui_lookup。"
+    "涉及某种 LoRA 画风或角色时，先用 comfyui_lookup(type=\"lora\", query=\"style/character/标签\")，"
+    "按返回的实际文件名、分类、用途和触发词选择，不要凭文件名猜 LoRA 用途；拿不准就先 comfyui_lookup。"
     "用户要竖图/横图/方图→填 size=portrait/landscape/square。"
     "用户点名画师/画质/不要出现的东西/触发词→填对应字段。"
     "用户要更精细或更快→才填 steps 或 cfg。"
@@ -1664,7 +1958,9 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         return None, f"「{query}」对上了好几份底模：{preview}。请让用户选一个，或填更完整的名字。"
 
     async def _resolve_loras(self, raw: Any) -> tuple[list[dict] | None, str | None]:
-        names = (await self._resource_lists()).get("lora_name") or []
+        resources = await self._resource_lists()
+        names = resources.get("lora_name") or []
+        metadata = resources.get("lora_meta") or {}
         try:
             parsed = parse_lora(raw)
         except ValueError:
@@ -1676,7 +1972,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             query = str(item.get("name") or "").strip()
             if not query:
                 continue
-            hits = _match_resource(names, query)
+            hits = _match_lora_resources(names, metadata, query)
             if len(hits) == 1:
                 spec = dict(item)
                 spec["name"] = hits[0]
@@ -1732,19 +2028,14 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                 return "这套配方还没指定出图采样，改不了步数。请主人在工作台里选一下「出图采样」。"
 
         defaults = recipe.get("defaults") or {}
-        auto_trigger = None
-        if not kwargs.get("trigger_words"):
-            if resolved_loras:
-                auto_trigger = await _auto_fill_trigger_words(self.client, resolved_loras)
-            elif not defaults.get("trigger_words") and defaults.get("loras"):
-                auto_trigger = await _auto_fill_trigger_words(self.client, defaults.get("loras"))
+        # 自动填 lora 触发词已禁用（33号要求），需要时显式传 trigger_words
 
         overrides = {
             "prompt": prompt,
             "seed": seed,
             "artist": kwargs.get("artist"),
             "quality": kwargs.get("quality"),
-            "trigger_words": kwargs.get("trigger_words") or auto_trigger,
+            "trigger_words": kwargs.get("trigger_words"),
             "negative": kwargs.get("negative_prompt") or kwargs.get("negative"),
             "model": resolved_model,
             "loras": resolved_loras,
@@ -1752,38 +2043,47 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             "cfg": kwargs.get("cfg"),
         }
         values = materialize_values(recipe, overrides)
-        values["seed"] = int(seed)
         for key, val in self.config_defaults.items():
             if key not in values and val not in (None, "", 0, 0.0, []):
                 values[key] = val
 
         size_token = str(kwargs.get("size") or "").strip()
-        if size_token:
-            values["width"], values["height"] = resolve_size(
-                int(values["width"]) if values.get("width") else None,
-                int(values["height"]) if values.get("height") else None,
-                size_token,
-            )
+        try:
+            values["seed"] = _number(seed, "seed", integer=True, minimum=0, maximum=2**63 - 1)
+            values = _validate_generation_values(values)
+            seed = values["seed"]
+            if size_token:
+                values["width"], values["height"] = resolve_size(
+                    int(values["width"]) if values.get("width") else None,
+                    int(values["height"]) if values.get("height") else None,
+                    size_token,
+                )
+                values = _validate_generation_values(values)
+        except ValueError as e:
+            return f"生成失败：参数错误（{e}）"
 
         try:
             wf = self.builder.load_template(recipe.get("workflow") or None)
         except FileNotFoundError as e:
             return f"生成失败：{e}"
 
-        apply_slots(
-            wf,
-            slots,
-            values,
-            prefix=f"astrbot_{uuid.uuid4().hex[:8]}",
-            drop_nodes=list(recipe.get("drop_nodes") or []),
-        )
+        try:
+            apply_slots(
+                wf,
+                slots,
+                values,
+                prefix=f"astrbot_{uuid.uuid4().hex[:8]}",
+                drop_nodes=list(recipe.get("drop_nodes") or []),
+            )
+        except (TypeError, ValueError) as e:
+            return f"生成失败：参数错误（{e}）"
 
         pid, submit_err = await self.client.submit_prompt_detail(wf)
         if submit_err:
             return f"生成失败：{submit_err}"
         if not pid:
             return "生成失败：无法连接 ComfyUI。"
-        self.shared["last_prompt_id"] = pid
+        _remember_prompt_id(self.shared, context, pid)
 
         outputs, wait_err = await _wait_outputs(self.client, pid)
         if wait_err:
@@ -1803,13 +2103,14 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         if not content:
             return f"图片已生成但下载失败（{filename}）。"
 
-        local_path = self.output_dir / filename
         try:
+            local_path = safe_output_path(self.output_dir, filename)
             local_path.write_bytes(content)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             return f"图片已生成但本地保存失败（{e}）。"
 
         used = {
+            "prompt": prompt,
             "model": values.get("model"),
             "loras": values.get("loras") or values.get("lora"),
             "width": values.get("width"),
@@ -1886,7 +2187,8 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
     description: str = (
         "查规范词或已安装的文件名。用户点名角色/画师/底模/LoRA，你又不确定时再用。"
         "character/artist：把触发词写进 prompt 或 artist。"
-        "model/lora：把返回的文件名填进 comfyui_draw。"
+        "model/lora：把返回的文件名填进 comfyui_draw。LoRA 的 query 还支持 LoRA Manager/Civitai "
+        "分类或标签，例如 style/character/concept/风格/角色；结果会带用途说明、推荐权重和触发词。"
         "不要自己编 tag 或文件名。"
     )
     parameters: dict = Field(
@@ -1901,6 +2203,10 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
                 "query": {
                     "type": "string",
                     "description": "名字（中文/日文/罗马音均可）",
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "type=lora 时最多返回几项（1-8，默认 5）",
                 },
             },
             "required": ["type", "query"],
@@ -1918,7 +2224,7 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
             return "查询失败：需要 type（character/artist/model/lora）和 query。"
 
         if kind == "lora":
-            return await self._lookup_lora(query)
+            return await self._lookup_lora(query, _bounded_limit(kwargs.get("limit"), 5))
         if kind == "model":
             return await self._lookup_model(query)
 
@@ -1968,23 +2274,22 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
             return f"未找到匹配底模：{query}"
         return "【底模】把下面的文件名填进 comfyui_draw 的 model：\n" + "\n".join(hits)
 
-    async def _lookup_lora(self, query: str) -> str:
+    async def _lookup_lora(self, query: str, limit: int = 5) -> str:
         if self.client is None:
             return "查询失败：ComfyUI 未配置。"
         resources, _ = await self.client.list_resources()
         names = resources.get("lora_name") or []
         meta = resources.get("lora_meta") or {}
-        hits = _match_resource(names, query)
+        hits = _match_lora_resources(
+            names, meta, query, limit=min(limit, MAX_LLM_DETAIL_ITEMS)
+        )
         if not hits:
-            return f"未找到匹配 LoRA：{query}"
+            return f"未找到匹配 LoRA：{query}（可按文件名、style/character 分类或标签查询）"
         lines = ["【LoRA】把文件名填进 comfyui_draw 的 lora："]
         for name in hits:
             info = meta.get(name) or {}
-            triggers = info.get("trigger_words") or []
-            if triggers:
-                lines.append(f"{name}\n  触发词: {', '.join(triggers[:8])}")
-            else:
-                lines.append(name)
+            lines.append(name)
+            lines.extend(f"  {line}" for line in _lora_info_summary(info, detailed=True))
         return "\n".join(lines)
 
 

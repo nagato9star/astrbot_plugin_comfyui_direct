@@ -1,7 +1,7 @@
 """配方与生成历史。
 
 配方保存的是人选定的节点映射，以及底模 / LoRA / 比例 / KSampler 参数。
-prompt 每次由 LLM 填，不作为配方身份。
+prompt 可以随历史一起保存，但配方生成时仍以本次 LLM 显式传入的 prompt 为准。
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from slot_mapping import (
 
 _SLUG_RE = re.compile(r"[^\w\u4e00-\u9fff-]+", re.UNICODE)
 RECIPE_VALUE_KEYS = (
+    "prompt",
     "model",
     "loras",
     "width",
@@ -187,13 +188,16 @@ class RecipeStore:
         entry = self.history_get(prompt_id)
         if entry is None:
             raise ValueError(f"历史不存在: {prompt_id}")
+        defaults = dict(entry.get("values") or entry.get("defaults") or {})
+        if entry.get("prompt") and "prompt" not in defaults:
+            defaults["prompt"] = entry["prompt"]
         recipe = {
             "id": slugify(name),
             "name": name,
             "description": description or entry.get("description") or "",
             "workflow": entry.get("workflow") or "",
             "slots": entry.get("slots") or {},
-            "defaults": _clean_defaults(entry.get("values") or entry.get("defaults") or {}),
+            "defaults": _clean_defaults(defaults),
             "drop_nodes": list(entry.get("drop_nodes") or []),
         }
         return self.save(recipe)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import re
 from typing import Any
 
@@ -125,7 +126,25 @@ SEED_NODE_CLASSES = {
     "easy seed",
     "ttN seed",
 }
-INT_VALUE_KEYS = ("value", "int", "integer", "number", "seed", "noise_seed")
+INT_VALUE_KEYS = ("value", "int", "integer", "number", "Number", "seed", "noise_seed")
+
+LORA_STRENGTH_MIN = -10.0
+LORA_STRENGTH_MAX = 10.0
+
+
+def normalize_lora_strength(value: Any, default: float = 0.8) -> float:
+    """Validate a LoRA weight before putting it into a ComfyUI workflow."""
+    try:
+        strength = float(default if value is None else value)
+    except (TypeError, ValueError) as e:
+        raise ValueError("LoRA strength 必须是数字") from e
+    if not math.isfinite(strength):
+        raise ValueError("LoRA strength 不能是 NaN 或无穷大")
+    if not LORA_STRENGTH_MIN <= strength <= LORA_STRENGTH_MAX:
+        raise ValueError(
+            f"LoRA strength 必须在 {LORA_STRENGTH_MIN:g} 到 {LORA_STRENGTH_MAX:g} 之间"
+        )
+    return strength
 
 
 def _is_link(val: Any) -> bool:
@@ -693,13 +712,16 @@ def read_current_values(wf: dict, slots: dict[str, dict]) -> dict[str, Any]:
             if isinstance(raw, (int, float)):
                 values["steps"] = int(raw)
         else:
-            for key in ("steps", "cfg", "sampler_name", "scheduler", "denoise"):
+            for key in ("steps", "cfg", "sampler_name", "sampler", "scheduler", "denoise"):
                 val = ins.get(key)
                 if _is_link(val):
                     val = _resolve_linked_value(wf, val)
                 if val is None or isinstance(val, list):
                     continue
-                values[key] = val
+                if key == "sampler" and "sampler" not in values:
+                    values["sampler_name"] = val
+                else:
+                    values[key] = val
     return values
 
 
@@ -720,8 +742,8 @@ def _read_loras(node: dict) -> list[dict]:
             if not name:
                 continue
             try:
-                strength = float(spec.get("strength", 0.8))
-            except (TypeError, ValueError):
+                strength = normalize_lora_strength(spec.get("strength", 0.8))
+            except ValueError:
                 strength = 0.8
             out.append({"name": name, "strength": strength})
         return out
@@ -729,8 +751,10 @@ def _read_loras(node: dict) -> list[dict]:
     if not name:
         return []
     try:
-        strength = float(ins.get("strength_model", ins.get("strength", 0.8)))
-    except (TypeError, ValueError):
+        strength = normalize_lora_strength(
+            ins.get("strength_model", ins.get("strength", 0.8))
+        )
+    except ValueError:
         strength = 0.8
     return [{"name": name, "strength": strength}]
 
@@ -753,6 +777,13 @@ def parse_lora(lora: Any) -> list[dict]:
                 parsed = ast.literal_eval(txt)
             except (ValueError, SyntaxError) as e:
                 raise ValueError(f"lora 参数格式错误: {lora}") from e
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    elif isinstance(parsed, str):
+        parsed = [parsed]
+    elif not isinstance(parsed, list):
+        raise ValueError(f"lora 参数格式错误: {lora}")
+
     out: list[dict] = []
     for item in parsed:
         if isinstance(item, dict):
@@ -930,8 +961,12 @@ def _apply_sampler(
         if not _write_numeric_input(wf, target, "cfg", float(values["cfg"]), as_int=False):
             if "cfg" in ins and not _is_link(ins.get("cfg")):
                 ins["cfg"] = float(values["cfg"])
-    if values.get("sampler_name") and "sampler_name" in ins and not _is_link(ins.get("sampler_name")):
-        ins["sampler_name"] = str(values["sampler_name"])
+    if values.get("sampler_name"):
+        sname = str(values["sampler_name"])
+        if "sampler_name" in ins and not _is_link(ins.get("sampler_name")):
+            ins["sampler_name"] = sname
+        elif "sampler" in ins and not _is_link(ins.get("sampler")):
+            ins["sampler"] = sname
     if values.get("scheduler") and "scheduler" in ins and not _is_link(ins.get("scheduler")):
         ins["scheduler"] = str(values["scheduler"])
     if values.get("denoise") is not None:
@@ -1028,7 +1063,7 @@ def _apply_loras(wf: dict, nid: str, parsed: list[dict]) -> None:
                 ins[slot] = {
                     "on": True,
                     "lora": str(spec.get("name") or "").strip(),
-                    "strength": float(spec.get("strength", 0.8)),
+                    "strength": normalize_lora_strength(spec.get("strength", 0.8)),
                 }
             else:
                 ins[slot]["on"] = False
@@ -1053,9 +1088,9 @@ def _apply_loras(wf: dict, nid: str, parsed: list[dict]) -> None:
             if spec.get("name"):
                 tins["lora_name"] = str(spec["name"])
             if "strength" in spec:
-                tins["strength_model"] = float(spec["strength"])
+                tins["strength_model"] = normalize_lora_strength(spec["strength"])
                 if "strength_clip" in tins and not isinstance(tins.get("strength_clip"), list):
-                    tins["strength_clip"] = float(spec["strength"])
+                    tins["strength_clip"] = normalize_lora_strength(spec["strength"])
         else:
             tins["strength_model"] = 0.0
 

@@ -127,6 +127,24 @@ DEFAULT_WORKFLOW = "anima-v3"
 
 
 BASIC_LLM_TOOLS = {"comfyui_draw", "comfyui_lookup"}
+# 这些工具可能读取任意本地文件、执行未经映射的自定义节点或影响其他任务，
+# 默认不交给模型；需要时由管理员显式打开配置。
+LLM_UNSAFE_TOOLS = {
+    "comfyui_run_workflow",
+    "comfyui_upload_file",
+    "comfyui_free_memory",
+}
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """Parse config booleans without treating the string ``"false"`` as true."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 def _options_target(schema: dict, key: str) -> dict | None:
@@ -268,7 +286,7 @@ def parse_default_lora(raw: Any) -> str:
     "astrbot_plugin_comfyui_direct",
     "长门九曜",
     "局域网直连ComfyUI API，按配方生图",
-    "2.2.0",
+    "2.3.0",
 )
 class ComfyUIDirectPlugin(Star):
     """通过局域网直连ComfyUI API生成图片和查询模型。"""
@@ -326,6 +344,8 @@ class ComfyUIDirectPlugin(Star):
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._schema_path = Path(__file__).resolve().parent / "_conf_schema.json"
         llm_tool_mode = str(cfg.get("llm_tool_mode") or "basic").strip().lower()
+        allow_llm_unsafe_tools = _as_bool(cfg.get("allow_llm_unsafe_tools", False))
+        lora_manager_enabled = _as_bool(cfg.get("lora_manager_enabled", True))
         default_recipe_name = str(cfg.get("default_recipe") or "默认").strip() or "默认"
         node_slots_cfg = cfg.get("node_slots") if isinstance(cfg.get("node_slots"), dict) else {}
         self._node_slots_cfg = node_slots_cfg
@@ -336,7 +356,11 @@ class ComfyUIDirectPlugin(Star):
             timeout=timeout,
             cache_file=data_dir / "comfyui_models.json",
             cache_ttl=ttl,
+            lora_manager_enabled=lora_manager_enabled,
         )
+        self._civitai = CivitaiClient(api_key=civitai_key)
+        # 注入 civitai 客户端到 ComfyUIClient，用于本地无触发词时在线回退
+        self._client.civitai_client = self._civitai
         self._builder = WorkflowBuilder(
             plugin_dir=Path(__file__).resolve().parent,
             default_workflow=default_workflow,
@@ -350,7 +374,6 @@ class ComfyUIDirectPlugin(Star):
         shared: dict = {}
         self._danbooru = DanbooruClient(base_urls=danbooru_urls)
         self._gelbooru = GelbooruClient(base_url=gelbooru_url)
-        self._civitai = CivitaiClient(api_key=civitai_key)
         self._animadex = AnimaDexClient(
             mcp_url=str(cfg.get("animadex_mcp_url") or "http://127.0.0.1:11451/mcp"),
             timeout=float(cfg.get("animadex_timeout") or 8.0),
@@ -382,7 +405,7 @@ class ComfyUIDirectPlugin(Star):
                 output_dir=self._output_dir,
                 shared=shared,
                 defaults=defaults,
-                recipe_dir=data_dir / "recipes",
+                store=self._store,
             ),
             ComfyuiInterruptTool(client=self._client, shared=shared),
             ComfyuiQueueTool(client=self._client),
@@ -401,12 +424,16 @@ class ComfyUIDirectPlugin(Star):
             ComfyuiValidateWorkflowTool(client=self._client),
             ComfyuiUploadFileTool(client=self._client),
             ComfyuiModelsSearchTool(client=self._client),
-            ComfyuiRecipeTool(recipe_dir=data_dir / "recipes"),
+            ComfyuiRecipeTool(
+                store=self._store,
+                allow_delete=allow_llm_unsafe_tools,
+            ),
         ]
-        if llm_tool_mode != "full":
-            for t in tools:
-                if t.name not in BASIC_LLM_TOOLS:
-                    t.active = False
+        for t in tools:
+            if llm_tool_mode != "full" and t.name not in BASIC_LLM_TOOLS:
+                t.active = False
+            elif t.name in LLM_UNSAFE_TOOLS and not allow_llm_unsafe_tools:
+                t.active = False
         self.context.add_llm_tools(*tools)
         for t in tools:
             t.handler_module_path = self.__class__.__module__
@@ -438,7 +465,7 @@ class ComfyUIDirectPlugin(Star):
             logger.warning(f"[ComfyUIDirect] 下拉选项同步任务启动失败: {e}")
 
         logger.info(
-            f"[ComfyUIDirect] 已加载 v2.2.0 | ComfyUI: {self._client.base_url} "
+            f"[ComfyUIDirect] 已加载 v2.3.0 | ComfyUI: {self._client.base_url} "
             f"| 默认模板: {default_workflow} | 工具模式: {llm_tool_mode} | 数据目录: {data_dir}"
         )
 

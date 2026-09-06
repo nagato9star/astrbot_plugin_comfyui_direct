@@ -11,7 +11,7 @@ from typing import Any
 
 from astrbot.api import logger
 
-from comfy_client import ComfyUIClient
+from comfy_client import ComfyUIClient, safe_output_path
 from recipe_store import RecipeStore, materialize_values
 from slot_mapping import (
     SLOT_BASIC,
@@ -395,13 +395,19 @@ class StudioApi:
         pid, err = await self.client.submit_prompt_detail(wf)
         if err:
             return _json({"ok": False, "error": err})
-        self.shared["last_prompt_id"] = pid
-        self.shared["pending_values"] = {
-            k: values.get(k)
-            for k in ("model", "loras", "width", "height", "steps", "cfg", "sampler_name", "scheduler", "denoise", "trigger_words", "seed")
+        pending_runs = self.shared.setdefault("web_pending_runs", {})
+        pending_runs[pid] = {
+            "values": {
+                k: values.get(k)
+                for k in ("model", "loras", "width", "height", "steps", "cfg", "sampler_name", "scheduler", "denoise", "trigger_words", "seed")
+            },
+            "recipe": recipe,
+            "prompt": prompt,
         }
-        self.shared["pending_recipe"] = recipe
-        self.shared["pending_prompt"] = prompt
+        # 防止浏览器一直提交试跑导致内存中的任务元数据无限增长。
+        if len(pending_runs) > 64:
+            for old_pid in list(pending_runs)[:-64]:
+                pending_runs.pop(old_pid, None)
         return _json({"ok": True, "prompt_id": pid})
 
     async def generate_poll(self) -> Any:
@@ -425,13 +431,18 @@ class StudioApi:
         )
         if not content:
             return _json({"ok": True, "done": True, "error": f"图片下载失败: {img['filename']}"})
-        local_path = self.output_dir / img["filename"]
+        try:
+            local_path = safe_output_path(self.output_dir, img["filename"])
+        except ValueError as e:
+            return _json({"ok": True, "done": True, "error": str(e)})
         try:
             local_path.write_bytes(content)
         except OSError:
             pass
-        recipe = self.shared.get("pending_recipe") or {}
-        values = self.shared.get("pending_values") or {}
+        pending_runs = self.shared.get("web_pending_runs") or {}
+        pending = pending_runs.get(pid) or {}
+        recipe = pending.get("recipe") or {}
+        values = pending.get("values") or {}
         self.store.save_history(
             {
                 "prompt_id": pid,
@@ -440,12 +451,13 @@ class StudioApi:
                 "workflow": recipe.get("workflow"),
                 "slots": recipe.get("slots") or {},
                 "drop_nodes": recipe.get("drop_nodes") or [],
-                "prompt": self.shared.get("pending_prompt") or "",
+                "prompt": pending.get("prompt") or "",
                 "values": {k: v for k, v in values.items() if v not in (None, "", [])},
                 "filename": img["filename"],
                 "local_path": str(local_path),
             }
         )
+        pending_runs.pop(pid, None)
         return _json(
             {
                 "ok": True,
@@ -490,7 +502,7 @@ def register_web_apis(
     if store is None or output_dir is None:
         logger.error("[ComfyUIDirect] WebUI 缺少 recipe store，跳过注册")
         return
-    api = StudioApi(client, builder, store, output_dir, shared or {}, draw_tool)
+    api = StudioApi(client, builder, store, output_dir, shared if shared is not None else {}, draw_tool)
     routes = [
         ("/status", api.status, ["GET"], "ComfyUI 状态"),
         ("/workflows", api.list_workflows, ["GET"], "列出工作流"),

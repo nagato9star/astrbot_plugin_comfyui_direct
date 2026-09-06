@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import ast
 import json
 import re
 from pathlib import Path
@@ -18,7 +17,7 @@ from typing import Any
 
 from astrbot.api import logger
 
-from slot_mapping import apply_slots, detect_slots
+from slot_mapping import apply_slots, detect_slots, normalize_lora_strength, parse_lora
 
 # 模板名 -> 文件名；查找顺序：插件数据目录 workflows/（custom）-> skill references 目录
 WORKFLOW_TEMPLATES: dict[str, str] = {
@@ -345,37 +344,8 @@ class WorkflowBuilder:
 
     @staticmethod
     def _parse_lora(lora: Any) -> list[dict]:
-        """解析 lora 参数：list/dict、JSON 字符串、或 Python repr 字符串；[]/none/null/"" 表示禁用全部。
-
-        兼容 LLM 直接把数组对象传进来、或框架强转成 repr 字符串的情况——
-        否则 lora 会被静默当成空，导致全部丢失。
-        """
-        if isinstance(lora, list):
-            parsed = lora
-        elif isinstance(lora, dict):
-            parsed = [lora]
-        else:
-            txt = str(lora).strip() if lora is not None else ""
-            if not txt or txt.lower() in ("none", "null"):
-                return []
-            try:
-                parsed = json.loads(txt)
-            except ValueError:
-                # 兼容框架把数组对象强转成的 Python repr（单引号），如
-                # [{'name': 'x.safetensors', 'strength': 0.55}]
-                try:
-                    parsed = ast.literal_eval(txt)
-                except (ValueError, SyntaxError) as e:
-                    raise ValueError(f"lora 参数格式错误: {lora}") from e
-        out: list[dict] = []
-        for item in parsed:
-            if isinstance(item, dict):
-                out.append(item)
-            elif isinstance(item, str):
-                out.append({"name": item})  # 裸文件名兜底
-            else:
-                raise ValueError(f"lora 参数格式错误: {lora}")
-        return out
+        """Use the shared LoRA parser so generate/draw accept identical input."""
+        return parse_lora(lora)
 
     def _collect_lora_chain(self, wf: dict) -> list[str]:
         """按模型链顺序收集模板中的 LoraLoaderModelOnly 节点ID（从底模开始追踪）。"""
@@ -432,7 +402,7 @@ class WorkflowBuilder:
                 ins[slot] = {
                     "on": True,
                     "lora": str(spec.get("name") or "").strip(),
-                    "strength": float(spec.get("strength", 0.8)),
+                    "strength": normalize_lora_strength(spec.get("strength", 0.8)),
                 }
             else:
                 ins[slot]["on"] = False  # 多余的插槽关掉，保留原 lora 名便于恢复
@@ -468,7 +438,7 @@ class WorkflowBuilder:
                     "inputs": {
                         "model": [prev, 0],
                         "lora_name": str(spec["name"]),
-                        "strength_model": float(spec.get("strength", 0.8)),
+                        "strength_model": normalize_lora_strength(spec.get("strength", 0.8)),
                     },
                     "class_type": "LoraLoaderModelOnly",
                 }
@@ -483,7 +453,7 @@ class WorkflowBuilder:
                 if "name" in spec:
                     wf[nid]["inputs"]["lora_name"] = str(spec["name"])
                 if "strength" in spec:
-                    wf[nid]["inputs"]["strength_model"] = float(spec["strength"])
+                    wf[nid]["inputs"]["strength_model"] = normalize_lora_strength(spec["strength"])
             else:
                 # 链上多余的 LoRA 权重归零（等效禁用）
                 wf[nid]["inputs"]["strength_model"] = 0.0

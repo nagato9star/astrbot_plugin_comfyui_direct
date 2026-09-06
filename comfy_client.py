@@ -9,9 +9,12 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
+import mimetypes
+import re
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import httpx
@@ -39,15 +42,46 @@ RETRY_BACKOFF = 0.8
 # /object_info 中各节点类的资源字段（class_type -> 字段名）
 RESOURCE_FIELDS: dict[str, str] = {
     "UNETLoader": "unet_name",
+    "UNETLoaderGGUF": "unet_name",
+    "UnetLoaderGGUF": "unet_name",
+    "CheckpointLoaderSimple": "unet_name",
+    "CheckpointLoader": "unet_name",
     "LoraLoaderModelOnly": "lora_name",
+    "LoraLoader": "lora_name",
+    "LoraLoaderModelOnly (rgthree)": "lora_name",
     "CLIPLoader": "clip_name",
     "VAELoader": "vae_name",
+}
+
+# ComfyUI 自带节点和常见自定义节点使用的资源输入名。按输入名扫描比只按
+# class_type 扫描更耐用，同时仍限制在明确的模型字段，避免把普通字符串选项混进清单。
+RESOURCE_INPUT_TARGETS: dict[str, str] = {
+    "unet_name": "unet_name",
+    "ckpt_name": "unet_name",
+    "lora_name": "lora_name",
+    "clip_name": "clip_name",
+    "vae_name": "vae_name",
 }
 
 # rgthree 的 Power Lora Loader：插槽字段 lora_1..lora_N 里也提供可选 LoRA 列表
 POWER_LORA_CLASS = "Power Lora Loader (rgthree)"
 # 模型文件扩展名（识别 object_info 里的资源文件名）
-MODEL_EXTS = (".safetensors", ".ckpt", ".pt", ".pth", ".sft", ".bin")
+MODEL_EXTS = (".safetensors", ".ckpt", ".pt", ".pth", ".sft", ".bin", ".gguf")
+
+LORA_MANAGER_NEGATIVE_RETRY_SECONDS = 60.0
+CIVITAI_LORA_CACHE_SECONDS = 24 * 60 * 60
+
+
+def safe_output_path(output_dir: Path, filename: str) -> Path:
+    """Return a path confined to output_dir, even if ComfyUI returns a path-like name."""
+    name = PurePosixPath(str(filename).replace("\\", "/")).name
+    if not name or name in (".", ".."):
+        raise ValueError("ComfyUI 返回了无效输出文件名")
+    root = output_dir.resolve()
+    target = (root / name).resolve()
+    if target.parent != root:
+        raise ValueError("ComfyUI 输出文件名越界")
+    return target
 
 
 class ComfyUIClient:
@@ -60,6 +94,7 @@ class ComfyUIClient:
         timeout: float = 300.0,
         cache_file: Path | None = None,
         cache_ttl: int = 600,
+        lora_manager_enabled: bool = True,
     ) -> None:
         self.host = host
         self.port = port
@@ -67,7 +102,16 @@ class ComfyUIClient:
         self.timeout = timeout
         self.cache_file = cache_file
         self.cache_ttl = cache_ttl
+        self.lora_manager_enabled = bool(lora_manager_enabled)
+        self._lora_manager_available: bool | None = None
+        self._lora_manager_checked_at = 0.0
+        # Civitai 只是最后的补全来源；按文件名缓存命中和未命中，避免每次
+        # 资源清单 TTL 到期都对全部 LoRA 重复搜索。
+        self._civitai_lora_cache: dict[str, tuple[float, dict | None]] = {}
         self._client: httpx.AsyncClient | None = None
+        self._resource_lock = asyncio.Lock()
+        # 可选：civitai 客户端，用于本地 metadata 无触发词时在线回退
+        self.civitai_client = None
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -195,6 +239,7 @@ class ComfyUIClient:
             return None, f"无法连接 ComfyUI（{self.base_url}）：{last_err}"
         if resp.status_code != 200:
             msg = f"ComfyUI 返回 HTTP {resp.status_code}"
+            hints: list[str] = []
             try:
                 body = resp.json()
                 err = body.get("error", {})
@@ -202,12 +247,36 @@ class ComfyUIClient:
                 if err:
                     msg = f"{err.get('message', msg)}"
                 if node_errors:
-                    detail = next(iter(node_errors.values()))
-                    if isinstance(detail, dict) and detail.get("errors"):
-                        e0 = detail["errors"][0]
-                        msg += f"（节点 {e0.get('node_id', '?')}: {e0.get('message', '?')}）"
+                    parts = []
+                    for nid, detail in node_errors.items():
+                        if not isinstance(detail, dict):
+                            continue
+                        cls = detail.get("class_type") or "?"
+                        for e0 in detail.get("errors") or []:
+                            info = e0.get("extra_info") or {}
+                            param = info.get("input_name") or e0.get("details") or "?"
+                            bad = info.get("input_value")
+                            seg = f"节点{nid}({cls}) 参数「{param}」"
+                            if bad is not None:
+                                seg += f" 值「{str(bad)[:80]}」"
+                            seg += f": {e0.get('message', '?')}"
+                            parts.append(seg)
+                            if info.get("input_name") in (
+                                "unet_name",
+                                "ckpt_name",
+                                "lora_name",
+                                "vae_name",
+                            ):
+                                hints.append(
+                                    "模型/LoRA 文件名请用 comfyui_list_models 返回的完整路径"
+                                    "（可能带子目录前缀，如 Anima\\xxx.safetensors）"
+                                )
+                    if parts:
+                        msg += "（" + "；".join(parts[:3]) + "）"
             except (ValueError, AttributeError):
                 pass
+            if hints:
+                msg += "。提示：" + "；".join(sorted(set(hints)))
             logger.error(f"[ComfyUIDirect] 提交失败: {msg}")
             return None, msg
         try:
@@ -309,6 +378,344 @@ class ComfyUIClient:
         return None
 
     # ------------------------------------------------------------------
+    # LoRA Manager metadata: remote ComfyUI plugin API, optional
+    # ------------------------------------------------------------------
+
+    _LORA_CATEGORY_ALIASES: dict[str, tuple[str, ...]] = {
+        "style": ("style", "styles", "风格", "画风"),
+        "character": ("character", "characters", "角色", "人物"),
+        "concept": ("concept", "concepts", "概念"),
+        "outfit": ("outfit", "clothing", "服装", "穿搭"),
+        "pose": ("pose", "poses", "姿势"),
+        "background": ("background", "背景"),
+        "effect": ("effect", "effects", "特效"),
+        "object": ("object", "物体"),
+    }
+
+    @staticmethod
+    def _metadata_values(value: Any) -> list[str]:
+        if isinstance(value, (list, tuple, set)):
+            values = value
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, list):
+                values = parsed
+            else:
+                values = text.split(",")
+        else:
+            return []
+        result: list[str] = []
+        for item in values:
+            text = str(item or "").strip(" \ufeff\u200b\u200c")
+            if text and text not in result:
+                result.append(text)
+        return result
+
+    @staticmethod
+    def _clean_description(value: Any, limit: int = 480) -> str:
+        if value is None:
+            return ""
+        text = html.unescape(re.sub(r"<[^>]+>", " ", str(value)))
+        text = re.sub(r"\s+", " ", text).strip()
+        return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+    @classmethod
+    def _lora_categories(cls, tags: list[str]) -> list[str]:
+        categories: list[str] = []
+        for tag in tags:
+            lowered = tag.casefold().strip()
+            for category, aliases in cls._LORA_CATEGORY_ALIASES.items():
+                if any(lowered == alias.casefold() for alias in aliases):
+                    if category not in categories:
+                        categories.append(category)
+                    break
+        return categories
+
+    @staticmethod
+    def _usage_tips(value: Any) -> dict | str | None:
+        if isinstance(value, dict):
+            return value or None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError):
+                return ComfyUIClient._clean_description(text, 240)
+            if isinstance(parsed, dict):
+                return parsed or None
+            return ComfyUIClient._clean_description(text, 240)
+        return None
+
+    @classmethod
+    def normalize_lora_metadata(
+        cls, metadata: dict | None, fallback: dict | None = None
+    ) -> dict:
+        """Convert LoRA Manager/Civitai metadata into a small LLM-safe record."""
+        metadata = metadata if isinstance(metadata, dict) else {}
+        fallback = fallback if isinstance(fallback, dict) else {}
+        civitai = metadata.get("civitai")
+        civitai = civitai if isinstance(civitai, dict) else {}
+        civitai_model = civitai.get("model")
+        civitai_model = civitai_model if isinstance(civitai_model, dict) else {}
+
+        tags: list[str] = []
+        for value in (
+            metadata.get("tags"),
+            civitai_model.get("tags"),
+            civitai.get("tags"),
+            fallback.get("tags"),
+        ):
+            for tag in cls._metadata_values(value):
+                if tag not in tags:
+                    tags.append(tag)
+
+        trigger_words: list[str] = []
+        for value in (
+            civitai.get("trainedWords"),
+            metadata.get("trainedWords"),
+            fallback.get("trigger_words"),
+        ):
+            for word in cls._metadata_values(value):
+                if word not in trigger_words:
+                    trigger_words.append(word)
+
+        categories = cls._lora_categories(tags)
+        for value in (
+            metadata.get("categories"),
+            metadata.get("category"),
+            civitai_model.get("categories"),
+            civitai_model.get("category"),
+        ):
+            for category in cls._metadata_values(value):
+                if category not in categories:
+                    categories.append(category)
+        for category in cls._metadata_values(fallback.get("categories")):
+            if category not in categories:
+                categories.append(category)
+
+        description = (
+            metadata.get("modelDescription")
+            or civitai_model.get("description")
+            or metadata.get("description")
+            or civitai.get("description")
+            or fallback.get("description")
+        )
+        usage_tips = cls._usage_tips(
+            metadata.get("usage_tips") or fallback.get("usage_tips")
+        )
+        notes = cls._clean_description(
+            metadata.get("notes") or fallback.get("notes"), 240
+        )
+        base_model = (
+            metadata.get("base_model")
+            or civitai.get("baseModel")
+            or fallback.get("base_model")
+        )
+        model_name = (
+            metadata.get("model_name")
+            or civitai_model.get("name")
+            or fallback.get("model_name")
+        )
+        source = (
+            metadata.get("_source")
+            or metadata.get("metadata_source")
+            or fallback.get("source")
+            or ("lora_manager" if metadata else "")
+        )
+
+        result: dict[str, Any] = {}
+        if trigger_words:
+            result["trigger_words"] = trigger_words[: cls.TRIGGER_TOP_N]
+        if source:
+            result["source"] = source
+        if categories:
+            result["categories"] = categories
+        if tags:
+            result["tags"] = tags[:24]
+        if model_name:
+            result["model_name"] = cls._clean_description(model_name, 160)
+        if base_model:
+            result["base_model"] = cls._clean_description(base_model, 80)
+        description = cls._clean_description(description)
+        if description:
+            result["description"] = description
+        if usage_tips:
+            result["usage_tips"] = usage_tips
+        if notes:
+            result["notes"] = notes
+        return result
+
+    @classmethod
+    def _civitai_item_metadata(cls, item: dict) -> dict:
+        version = (item.get("modelVersions") or [{}])[0]
+        if not isinstance(version, dict):
+            version = {}
+        model = {
+            "name": item.get("name") or "",
+            "description": item.get("description") or "",
+            "tags": item.get("tags") or [],
+            "type": item.get("type") or "",
+        }
+        return {
+            "_source": "civitai",
+            "model_name": item.get("name") or "",
+            "base_model": version.get("baseModel") or "",
+            "modelDescription": item.get("description") or "",
+            "tags": item.get("tags") or [],
+            "civitai": {
+                "type": item.get("type") or version.get("type") or "",
+                "baseModel": version.get("baseModel") or "",
+                "trainedWords": version.get("trainedWords") or [],
+                "description": version.get("description") or "",
+                "model": model,
+            },
+        }
+
+    @staticmethod
+    def _lora_key_variants(value: Any) -> list[str]:
+        text = str(value or "").replace("\\", "/").strip().strip("/")
+        if not text:
+            return []
+        lowered = text.casefold()
+        base = lowered.rsplit("/", 1)[-1]
+        stem = base
+        for ext in MODEL_EXTS:
+            if stem.endswith(ext):
+                stem = stem[: -len(ext)]
+                break
+        return list(dict.fromkeys((lowered, base, stem)))
+
+    @classmethod
+    def _index_lora_manager_items(cls, items: list[dict]) -> dict[str, dict]:
+        index: dict[str, dict] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            metadata = item.get("metadata")
+            if isinstance(metadata, dict):
+                merged = dict(metadata)
+                for key, value in item.items():
+                    merged.setdefault(key, value)
+                item = merged
+            for field in ("file_path", "relative_path", "file_name", "model_name", "name"):
+                for key in cls._lora_key_variants(item.get(field)):
+                    index.setdefault(key, item)
+        return index
+
+    def _lora_manager_probe_allowed(self) -> bool:
+        if not self.lora_manager_enabled:
+            return False
+        if self._lora_manager_available is False:
+            return (
+                time.monotonic() - self._lora_manager_checked_at
+                >= LORA_MANAGER_NEGATIVE_RETRY_SECONDS
+            )
+        return True
+
+    def _set_lora_manager_available(self, available: bool) -> None:
+        self._lora_manager_available = available
+        self._lora_manager_checked_at = time.monotonic()
+
+    async def get_lora_manager_catalog(self) -> dict[str, dict]:
+        """Fetch the LoRA Manager listing and index it by path/name.
+
+        The endpoint is optional; a missing LoRA Manager is treated as a normal
+        condition so the existing safetensors/Civitai fallbacks keep working.
+        """
+        if not self._lora_manager_probe_allowed():
+            return {}
+        items: list[dict] = []
+        page = 1
+        total_pages = 1
+        while page <= total_pages and page <= 100:
+            resp = await self._request_with_retry(
+                "GET",
+                "/api/lm/loras/list",
+                params={"page": page, "page_size": 100, "sort_by": "name"},
+                attempts=1,
+                log_errors=False,
+            )
+            if resp is None:
+                self._set_lora_manager_available(False)
+                return {}
+            try:
+                data = resp.json()
+            except ValueError:
+                self._set_lora_manager_available(False)
+                return {}
+            if isinstance(data, dict):
+                page_items = data.get("items") or data.get("models") or []
+                items.extend(x for x in page_items if isinstance(x, dict))
+                try:
+                    total_pages = max(1, int(data.get("total_pages") or 1))
+                except (TypeError, ValueError):
+                    total_pages = 1
+            elif isinstance(data, list):
+                items.extend(x for x in data if isinstance(x, dict))
+                total_pages = 1
+            else:
+                self._set_lora_manager_available(False)
+                return {}
+            page += 1
+        self._set_lora_manager_available(True)
+        return self._index_lora_manager_items(items)
+
+    async def get_lora_manager_metadata(self, filename: str) -> dict | None:
+        """Fetch one LoRA Manager record for model-info fallback."""
+        if not self._lora_manager_probe_allowed():
+            return None
+        resp = await self._request_with_retry(
+            "GET",
+            "/api/lm/loras/metadata",
+            params={"file_path": filename},
+            attempts=1,
+            log_errors=False,
+        )
+        if resp is not None:
+            try:
+                data = resp.json()
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                metadata = data.get("metadata")
+                if isinstance(metadata, dict):
+                    self._set_lora_manager_available(True)
+                    return metadata
+
+        # Older LoRA Manager versions expose the pieces separately.
+        pieces: dict[str, Any] = {}
+        for path, key, params in (
+            ("/api/lm/loras/model-description", "modelDescription", {"file_path": filename}),
+            ("/api/lm/loras/usage-tips-by-path", "usage_tips", {"relative_path": filename}),
+            ("/api/lm/loras/get-trigger-words", "trainedWords", {"name": filename}),
+        ):
+            response = await self._request_with_retry(
+                "GET", path, params=params, attempts=1, log_errors=False
+            )
+            if response is None:
+                continue
+            try:
+                data = response.json()
+            except ValueError:
+                continue
+            if isinstance(data, dict):
+                value = data.get(key)
+                if value not in (None, "", [], {}):
+                    pieces[key] = value
+        if pieces:
+            self._set_lora_manager_available(True)
+            return pieces
+        return None
+
+    # ------------------------------------------------------------------
     # LoRA 触发词：从 safetensors 头部元数据提取，随清单缓存
     # ------------------------------------------------------------------
 
@@ -400,25 +807,97 @@ class ComfyUIClient:
         return [], ""
 
     async def _fetch_lora_trigger_words(
-        self, lora_names: list[str]
+        self,
+        lora_names: list[str],
+        lora_manager_catalog: dict[str, dict] | None = None,
     ) -> dict[str, dict]:
-        """并发读各 LoRA 的 safetensors 头部，提取触发词。
+        """同步 LoRA 的触发词、分类、标签和用途信息。
 
-        返回 {文件名: {"trigger_words": [...], "source": "activation|tag_frequency|dataset"}}。
-        单个失败只记 warning 跳过，不阻塞整个清单同步。
+        优先级为 LoRA Manager → safetensors 头部 → Civitai 名称搜索。
+        返回的是裁剪后的 LLM 安全记录，避免把完整 HTML/大对象塞进上下文。
         """
         sem = asyncio.Semaphore(8)
+        online_sem = asyncio.Semaphore(4)
         out: dict[str, dict] = {}
+        lora_manager_catalog = lora_manager_catalog or {}
 
         async def one(name: str) -> None:
             async with sem:
+                # LoRA Manager 的 /list 已经带有 sidecar/Civitai 元数据。
+                manager_meta = None
+                for key in self._lora_key_variants(name):
+                    manager_meta = lora_manager_catalog.get(key)
+                    if manager_meta:
+                        break
+                if manager_meta is None and self._lora_manager_probe_allowed():
+                    try:
+                        manager_meta = await self.get_lora_manager_metadata(name)
+                    except Exception as e:
+                        logger.warning(f"[ComfyUIDirect] 读取 {name} LoRA Manager 信息失败: {e}")
+
+                manager_info = self.normalize_lora_metadata(manager_meta)
+                # LoRA Manager 通常已经带有 Civitai trainedWords；有触发词时
+                # 不再为同一个文件额外读取 safetensors 头部。
+                if manager_info.get("trigger_words"):
+                    out[name] = manager_info
+                    return
+
+                # 先试本地 safetensors 头部，再合并 LoRA Manager 信息。
+                local_info: dict = {}
                 try:
                     meta = await self.get_model_metadata(name, folders=["loras"])
                     words, source = self._extract_trigger_words(meta)
                     if words:
-                        out[name] = {"trigger_words": words, "source": source}
+                        local_info = {"trigger_words": words, "source": source}
                 except Exception as e:
-                    logger.warning(f"[ComfyUIDirect] 读取 {name} 触发词失败: {e}")
+                    logger.warning(f"[ComfyUIDirect] 读取 {name} 本地触发词失败: {e}")
+
+                info = self.normalize_lora_metadata(manager_meta, fallback=local_info)
+                if info:
+                    out[name] = info
+                    if info.get("trigger_words"):
+                        return
+
+                # 本地没有 → civitai 在线回退；命中和未命中都做短期缓存。
+                if self.civitai_client:
+                    try:
+                        # 去掉扩展名，用文件名 stem 搜索
+                        stem = name
+                        for ext in MODEL_EXTS:
+                            if stem.casefold().endswith(ext):
+                                stem = stem[: -len(ext)]
+                                break
+                        cache_key = stem.casefold().strip()
+                        cached = self._civitai_lora_cache.get(cache_key)
+                        if cached and time.monotonic() - cached[0] < CIVITAI_LORA_CACHE_SECONDS:
+                            if cached[1]:
+                                out[name] = self.normalize_lora_metadata(
+                                    cached[1], fallback=info
+                                )
+                            return
+                        async with online_sem:
+                            items = await self.civitai_client.search_models(
+                                stem, types="LORA", limit=3
+                            )
+                        selected: dict | None = None
+                        for item in items:
+                            versions = item.get("modelVersions") or []
+                            if not versions:
+                                continue
+                            civitai_info = self.normalize_lora_metadata(
+                                self._civitai_item_metadata(item), fallback=info
+                            )
+                            if civitai_info:
+                                selected = self._civitai_item_metadata(item)
+                                out[name] = self.normalize_lora_metadata(
+                                    selected, fallback=info
+                                )
+                                break
+                        self._civitai_lora_cache[cache_key] = (
+                            time.monotonic(), selected
+                        )
+                    except Exception as e:
+                        logger.warning(f"[ComfyUIDirect] civitai 回退查询 {name} 失败: {e}")
 
         await asyncio.gather(*(one(n) for n in lora_names))
         return out
@@ -458,10 +937,13 @@ class ComfyUIClient:
 
     async def upload_image(self, filename: str, content: bytes) -> tuple[str | None, str | None]:
         """POST /upload/image：上传图片到 ComfyUI input 目录，返回 (文件名, 错误)。"""
+        mime_type, _ = mimetypes.guess_type(filename)
+        if not mime_type or not mime_type.startswith("image/"):
+            return None, "只允许上传图片文件（png/jpg/jpeg/webp/gif 等）"
         try:
             resp = await self.client.post(
                 "/upload/image",
-                files={"image": (filename, content, "image/png")},
+                files={"image": (filename, content, mime_type)},
                 data={"overwrite": "true"},
             )
         except httpx.HTTPError as e:
@@ -494,7 +976,7 @@ class ComfyUIClient:
         out = []
         for it in data:
             name = it if isinstance(it, str) else (it or {}).get("name")
-            if isinstance(name, str) and name.endswith(MODEL_EXTS):
+            if isinstance(name, str) and name.casefold().endswith(MODEL_EXTS):
                 out.append(name)
         return out
 
@@ -551,15 +1033,33 @@ class ComfyUIClient:
     @staticmethod
     def _extract_resources(obj: dict) -> dict[str, list[str]]:
         """从 /object_info 提取各节点类的资源清单。"""
-        out: dict[str, list[str]] = {}
-        for cls, field in RESOURCE_FIELDS.items():
-            info = obj.get(cls, {})
-            raw = info.get("input", {}).get("required", {}).get(field, [])
-            # object_info 返回格式: [ [model1, model2, ...] ]
-            if isinstance(raw, list) and raw and isinstance(raw[0], list):
-                out[field] = list(raw[0])
-            else:
-                out[field] = []
+        out: dict[str, list[str]] = {
+            "unet_name": [],
+            "lora_name": [],
+            "clip_name": [],
+            "vae_name": [],
+        }
+
+        def append_options(target: str, raw: Any) -> None:
+            if not isinstance(raw, list) or not raw:
+                return
+            options = raw[0] if isinstance(raw[0], list) else []
+            for value in options:
+                if isinstance(value, str) and value and value not in out[target]:
+                    out[target].append(value)
+
+        # 同时扫 required/optional，兼容自定义节点把模型选择器声明在 optional 的情况。
+        for info in obj.values():
+            if not isinstance(info, dict):
+                continue
+            inputs = info.get("input") or {}
+            for section in (inputs.get("required") or {}, inputs.get("optional") or {}):
+                if not isinstance(section, dict):
+                    continue
+                for input_name, target in RESOURCE_INPUT_TARGETS.items():
+                    if input_name in section:
+                        append_options(target, section[input_name])
+
         # rgthree 的 Power Lora Loader：lora 插槽是嵌套结构（如 lora_1 里含 "lora": [[...]]），
         # 递归收集所有含 lora 键名的模型文件名
         pl = obj.get(POWER_LORA_CLASS, {})
@@ -572,7 +1072,7 @@ class ComfyUIClient:
                 and isinstance(val[0], list)
             ):
                 for name in val[0]:
-                    if isinstance(name, str) and name.endswith(MODEL_EXTS) and name not in out["lora_name"]:
+                    if isinstance(name, str) and name.casefold().endswith(MODEL_EXTS) and name not in out["lora_name"]:
                         out["lora_name"].append(name)
             elif isinstance(val, dict):
                 for sub_key, sub_val in val.items():
@@ -580,7 +1080,7 @@ class ComfyUIClient:
                         continue
                     if isinstance(sub_val, list) and sub_val and isinstance(sub_val[0], list):
                         for name in sub_val[0]:
-                            if isinstance(name, str) and name.endswith(MODEL_EXTS) and name not in out["lora_name"]:
+                            if isinstance(name, str) and name.casefold().endswith(MODEL_EXTS) and name not in out["lora_name"]:
                                 out["lora_name"].append(name)
         return out
 
@@ -626,8 +1126,10 @@ class ComfyUIClient:
                 resources["embeddings"] = []
             # LoRA 触发词：读 safetensors 头部元数据，失败不阻塞清单
             try:
+                lora_manager_catalog = await self.get_lora_manager_catalog()
                 resources["lora_meta"] = await self._fetch_lora_trigger_words(
-                    resources.get("lora_name", [])
+                    resources.get("lora_name", []),
+                    lora_manager_catalog=lora_manager_catalog,
                 )
             except Exception as e:
                 logger.warning(f"[ComfyUIDirect] 同步 LoRA 触发词失败，忽略: {e}")
@@ -645,47 +1147,62 @@ class ComfyUIClient:
         未过期且非强制刷新时直接用缓存；过期则重新从 ComfyUI 同步；
         ComfyUI 离线时回退本地缓存，保证清单不因本机关机而丢失。
         """
-        if not force_refresh and self.cache_file and self.cache_file.exists():
+        async with self._resource_lock:
+            if not force_refresh and self.cache_file and self.cache_file.exists():
+                cached = self._load_cache()
+                if cached and (
+                    self.cache_ttl <= 0
+                    or time.time() - cached.get("fetched_at", 0) < self.cache_ttl
+                ) and (
+                    not self.lora_manager_enabled
+                    or cached.get("lora_metadata_v2") is True
+                ):
+                    return cached["resources"], True
+
+            resources = await self._fetch_resources()
+            if resources is not None:
+                data = {
+                    "fetched_at": time.time(),
+                    "lora_metadata_v2": True,
+                    "resources": resources,
+                }
+                self._save_cache(data)
+                return data["resources"], False
+
             cached = self._load_cache()
-            if cached and (
-                self.cache_ttl <= 0
-                or time.time() - cached.get("fetched_at", 0) < self.cache_ttl
-            ):
+            if cached:
+                logger.warning("[ComfyUIDirect] ComfyUI 离线，回退本地缓存模型清单")
                 return cached["resources"], True
-
-        resources = await self._fetch_resources()
-        if resources is not None:
-            data = {"fetched_at": time.time(), "resources": resources}
-            self._save_cache(data)
-            return data["resources"], False
-
-        cached = self._load_cache()
-        if cached:
-            logger.warning("[ComfyUIDirect] ComfyUI 离线，回退本地缓存模型清单")
-            return cached["resources"], True
-        return {
-            "unet_name": [],
-            "lora_name": [],
-            "clip_name": [],
-            "vae_name": [],
-            "embeddings": [],
-        }, False
+            return {
+                "unet_name": [],
+                "lora_name": [],
+                "clip_name": [],
+                "vae_name": [],
+                "embeddings": [],
+            }, False
 
     async def warm_up_cache(self) -> None:
         """插件加载时后台预热资源清单（自动同步）。
 
         ComfyUI 刚启动时 /object_info 可能尚未就绪（空响应），最多重试 3 次。
         """
-        for attempt in range(1, 4):
-            try:
-                resources = await self._fetch_resources()
-                if resources is not None:
-                    self._save_cache({"fetched_at": time.time(), "resources": resources})
-                    return
-            except Exception as e:
-                logger.warning(
-                    f"[ComfyUIDirect] 预热资源清单失败（第 {attempt}/3 次）: {e}"
-                )
-            if attempt < 3:
-                await asyncio.sleep(8)
+        async with self._resource_lock:
+            for attempt in range(1, 4):
+                try:
+                    resources = await self._fetch_resources()
+                    if resources is not None:
+                        self._save_cache(
+                            {
+                                "fetched_at": time.time(),
+                                "lora_metadata_v2": True,
+                                "resources": resources,
+                            }
+                        )
+                        return
+                except Exception as e:
+                    logger.warning(
+                        f"[ComfyUIDirect] 预热资源清单失败（第 {attempt}/3 次）: {e}"
+                    )
+                if attempt < 3:
+                    await asyncio.sleep(8)
         logger.warning("[ComfyUIDirect] 预热资源清单失败（3 次尝试后放弃，将按需同步）")

@@ -31,7 +31,7 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 | **对机器人说话就画** | 默认只填要画的内容，底模和 LoRA 用你保存的配方 |
 | **点名再改** | 换配方 / 底模 / LoRA / 画幅 / 画师 / 画质 / 步数，用户没说就不改 |
 | **配方工作台** | 导入图、确认格子、保存一套默认画法，还能试一张 |
-| **查一下再画** | 角色、画师、底模、LoRA 不确定时先查短列表 |
+| **查一下再画** | 角色、画师、底模、LoRA 不确定时先查短列表；LoRA 支持 style / character 等分类 |
 
 ## 🚀 快速开始
 
@@ -74,9 +74,11 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 | `comfyui_port` | `8188` | ComfyUI 端口 |
 | `comfyui_timeout` | `300` | 生成等待超时（秒） |
 | `model_cache_ttl` | `600` | 模型清单缓存刷新间隔（秒），0 表示每次强制同步 |
+| `lora_manager_enabled` | `true` | 复用 ComfyUI LoRA Manager 的分类、标签、用途说明、推荐权重和触发词；未安装时自动跳过 |
 | `default_workflow` | `anima-v3` | 默认工作流模板名 |
 | `default_recipe` | `默认` | LLM 不指定 recipe 时使用的配方 |
-| `llm_tool_mode` | `basic` | `basic` 只暴露 draw/lookup；`full` 打开全部调试工具 |
+| `llm_tool_mode` | `basic` | `basic` 只暴露 draw/lookup；`full` 打开诊断工具 |
+| `allow_llm_unsafe_tools` | `false` | 是否允许 LLM 执行任意工作流、读取本地图片上传、释放显存和删除配方；默认关闭 |
 | `node_slots` | 空 | 下拉框：哪个节点是提示词 / KSampler / 底模 / LoRA / 尺寸。导入工作流后自动刷新，重载插件生效 |
 | `danbooru_base_url` | `https://danbooru.donmai.us` | danbooru 接口地址（国内可换镜像） |
 | `gelbooru_base_url` | `https://gelbooru.com` | gelbooru DAPI 地址（镜像可换） |
@@ -123,7 +125,7 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 
 | 工具 | 说明 |
 |:---|:---|
-| `comfyui_list_models` | 查询可用底模 / LoRA / CLIP / VAE / Embedding（可选 `refresh` 强制同步） |
+| `comfyui_list_models` | 查询可用底模 / LoRA / CLIP / VAE / Embedding；支持 `kind`、`query`、`limit` 筛选，LoRA 显示分类、标签、推荐权重和触发词 |
 | `comfyui_generate` | 生成图片，可选 model / lora / steps / cfg / sampler / denoise / width / height / seed / workflow 等 |
 | `comfyui_prompt_optimize` | 把自然语言需求优化为 Danbooru tags，内置角色 tag 校正 |
 | `comfyui_interrupt` | 中断生成（`prompt_id` 可选，默认最近一次），可同时取消排队任务 |
@@ -131,6 +133,10 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 | `comfyui_civitai_search` | 搜参考图并返回生成配方（模型/prompt/负向/sampler/steps/cfg/seed） |
 | `comfyui_model_info` | 查模型/LoRA 元数据与触发词（`source`=local / civitai） |
 | `comfyui_queue` | 查询队列与 GPU 显存状态 |
+
+默认不会把 `comfyui_run_workflow`、`comfyui_upload_file`、`comfyui_free_memory` 交给 LLM，且 `comfyui_recipe` 的删除动作也要求在 Workflow Studio 手动完成。确有需要时，先开启 `allow_llm_unsafe_tools`。
+
+LoRA 查询示例：`comfyui_lookup(type="lora", query="style")`、`query="character"`、`query="风格"`。匹配范围包括 LoRA 文件名、LoRA Manager/Civitai 标签、分类和用途说明；生成时仍会使用实际安装的文件名和已记录的触发词。`comfyui_list_models(kind="lora", query="style", limit=10)` 可只返回指定分类，减少 LLM 上下文占用。
 
 ## 🖥️ WebUI：Workflow Studio
 

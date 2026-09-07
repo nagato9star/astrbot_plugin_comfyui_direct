@@ -32,7 +32,13 @@ from pydantic.dataclasses import dataclass
 from animadex import AnimaDexClient
 from comfy_client import ComfyUIClient, safe_output_path
 from external_search import CivitaiClient, DanbooruClient, GelbooruClient
-from recipe_store import RecipeStore, materialize_values, model_family, recipe_family
+from recipe_store import (
+    RecipeStore,
+    materialize_values,
+    model_family,
+    recipe_family,
+    resolve_generation_entry,
+)
 from slot_mapping import apply_slots, collect_trigger_words, parse_lora, resolve_size
 from workflow_builder import WorkflowBuilder
 
@@ -327,7 +333,9 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
         "省略 lora 会沿用默认设置，传入列表会覆盖对应 LoRA；已有独立加速节点的模板沿用其加速设置。"
         "用户明确要求关闭 LoRA 时可传 \"[]\" 或 \"none\"，旧模板的此操作也会关闭独立加速 LoRA。"
         "角色/画师名称不确定时用 comfyui_lookup 查询；底模、采样参数等按用户要求调整，其余沿用默认值。"
-        "省略 recipe 时自动使用当前默认配方，包括其中保存的 LoRA；传 recipe 时使用指定配方的默认值，本次显式传入的参数优先。生成成功后回复结果即可，图片已由插件发送。"
+        "recipe 与 workflow 是两个独立入口：传 recipe 时把参数填进该配方绑定的基底工作流（含其保存的 LoRA）；"
+        "传 workflow 时按该模板生成、不套配方；两者都省略时优先默认配方，没有默认配方才用配置的默认工作流模板。"
+        "生成成功后回复结果即可，图片已由插件发送。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -401,11 +409,11 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 },
                 "workflow": {
                     "type": "string",
-                    "description": "工作流模板名，也可传 JSON 文件路径；省略时使用插件配置的默认模板",
+                    "description": "工作流模板入口：传模板名或 JSON 路径时按该模板生成，不套配方（显式 recipe 优先于 workflow）。两者都省略时先用默认配方，没有默认配方再用插件配置的默认模板",
                 },
                 "recipe": {
                     "type": "string",
-                    "description": "已保存的配方名。不传则使用当前默认配方；传入后加载该配方默认参数，本次显式传入的参数优先",
+                    "description": "配方入口：已保存的配方名。传入后按该配方绑定的基底工作流出图，配方默认参数兜底，本次显式传入的参数优先；不传则用当前默认配方",
                 },
             },
             "required": ["prompt"],
@@ -487,20 +495,33 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
         if not prompt:
             return "生成失败：prompt（主提示词）不能为空。"
 
-        # 配方覆盖：传了 recipe 名，配方里有的参数作为底层默认（LLM 显式传值仍优先）
+        # 双入口判定：显式 recipe > 显式 workflow > 默认配方 > 配置默认模板。
+        # 显式 workflow 必须强制走模板入口，避免被默认配方静默吞掉。
         recipe_name = str(kwargs.get("recipe") or "").strip()
+        workflow_param = str(kwargs.get("workflow") or "").strip()
+        has_default = False
+        if not recipe_name and not workflow_param and self.store is not None:
+            has_default = self.store.default() is not None
+        entry, entry_name = resolve_generation_entry(
+            recipe_name, workflow_param, has_default_recipe=has_default
+        )
         explicit_kwargs = dict(kwargs)
-        recipe_data = self._load_recipe_data(recipe_name)
-        recipe = self._load_recipe(recipe_name)
-        if recipe_name and recipe is None:
-            return f"生成失败：配方不存在（{recipe_name}）。可先 comfyui_recipe list 查看。"
-        if recipe is not None:
-            merged = dict(recipe)
+        recipe_data = None
+        if entry == "recipe":
+            recipe_data = self._load_recipe_data(entry_name)
+            if recipe_data is None:
+                return f"生成失败：配方不存在（{entry_name}）。可先 comfyui_recipe list 查看。"
+            if not (recipe_data.get("slots") or {}).get("prompt"):
+                display = str(recipe_data.get("name") or entry_name or "默认")
+                return (
+                    f"生成失败：配方「{display}」还没指定主提示词节点，"
+                    "请主人在配方工作台或配置下拉框里选一下。"
+                )
+            merged = dict(self._load_recipe(entry_name) or {})
             merged.pop("name", None)
             merged.pop("prompt", None)  # prompt 以本参数为准
-            # 把配方值塞进 kwargs（LLM 传的值覆盖）
-            merged_kwargs = {**merged, **kwargs}
-            kwargs = merged_kwargs
+            # 把配方值塞进 kwargs（LLM 传的值覆盖），供底模短名解析沿用
+            kwargs = {**merged, **kwargs}
             prompt = str(kwargs.get("prompt") or "").strip() or prompt
 
         seed = kwargs.get("seed")
@@ -586,7 +607,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                     },
                 )
                 for key, val in self.defaults.items():
-                    if key not in values and val not in (None, "", 0, 0.0):
+                    if key not in values and val not in (None, "", 0, 0.0, []):
                         values["negative" if key == "negative_prompt" else key] = val
                 values = _validate_generation_values(values)
                 wf = self.builder.load_template(recipe_data.get("workflow") or None)
@@ -1729,8 +1750,10 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
         "把一次生成的全部参数（prompt/artist/quality/trigger_words/negative_prompt/model/lora/"
         "steps/cfg/sampler/scheduler/denoise/width/height/seed/workflow）保存为命名配方，"
         "之后可以列出、读取、删除。配方存本地 JSON 文件。"
+        "保存时会绑定一个基底工作流：显式传 workflow 用它，否则沿用默认配方绑定的工作流，"
+        "再没有就用插件配置的默认模板；节点映射也从同工作流的现有配方继承。"
         "用户想复现某张图、保存常用风格参数时使用。"
-        "action=save（保存，需 name + 至少 prompt）/ action=list（列出）/ "
+        "action=save（保存，需 name + 至少 prompt）/ action=list（列出）/"
         "action=load（读取一个配方，返回全部参数）/ action=delete（删除）。"
         "load 出的参数可直接传给 comfyui_generate 复现。"
     )
@@ -1762,12 +1785,17 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
                 "width": {"type": "number", "description": "宽度"},
                 "height": {"type": "number", "description": "高度"},
                 "seed": {"type": "number", "description": "种子"},
-                "workflow": {"type": "string", "description": "工作流模板名"},
+                "workflow": {
+                    "type": "string",
+                    "description": "save 时绑定的基底工作流模板名；省略则沿用默认配方的工作流，再没有就用配置默认模板",
+                },
             },
         }
     )
     store: RecipeStore | None = None
     allow_delete: bool = False
+    builder: WorkflowBuilder | None = None
+    default_workflow: str = ""
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         action = str(kwargs.get("action") or "save").strip().lower()
@@ -1836,7 +1864,7 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
         # prompt 是配方的复现输入；不能误存为 trigger_words，否则下次会把整段
         # 主提示词拼进 LoRA 触发词节点。
         defaults: dict[str, Any] = {"prompt": prompt}
-        for key in ("artist", "quality", "model", "sampler_name", "scheduler", "workflow"):
+        for key in ("artist", "quality", "model", "sampler_name", "scheduler"):
             v = kwargs.get(key)
             if v is not None and v != "":
                 defaults[key] = v
@@ -1848,17 +1876,40 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
             v = kwargs.get(key)
             if v is not None:
                 defaults[key] = v
+
+        # 配方必须绑定一个基底工作流：显式指定 > 默认配方绑定的 > 配置默认模板。
+        workflow_name = str(kwargs.get("workflow") or "").strip()
+        if workflow_name and self.builder is not None:
+            try:
+                self.builder.resolve_workflow_path(workflow_name)
+            except (FileNotFoundError, ValueError):
+                workflow_name = ""
+        if not workflow_name:
+            base = self.store.default() if self.store else None
+            workflow_name = (
+                str((base or {}).get("workflow") or "").strip() or self.default_workflow
+            )
+        # 槽位映射跟着基底工作流走：同工作流的现有配方（默认配方优先）已映射
+        # 过主提示词就直接继承，避免存出没有槽位、生成时无法填 prompt 的配方。
+        slots: dict = {}
+        slot_from = ""
+        if self.store is not None:
+            slots, slot_from = self.store.base_slots_for(workflow_name)
         try:
             assert self.store is not None
             self.store.save({
                 "name": name,
                 "description": prompt[:60],
-                "workflow": kwargs.get("workflow") or "",
+                "workflow": workflow_name,
+                "slots": slots,
                 "defaults": defaults,
             })
         except (ValueError, OSError) as e:
             return f"保存失败：{e}"
-        return f"配方已保存: {name}"
+        note = f"配方已保存: {name}（基底工作流 {workflow_name or '未绑定'}"
+        if slot_from:
+            note += f"，节点映射沿用「{slot_from}」"
+        return note + "）"
 
 
 _DRAW_DESC = (

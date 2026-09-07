@@ -306,6 +306,51 @@ def test_defaults_precedence() -> None:
     print("  defaults precedence OK")
 
 
+def test_generation_entry_resolution() -> None:
+    """双入口判定：显式 recipe > 显式 workflow > 默认配方 > 模板。"""
+    from recipe_store import resolve_generation_entry
+
+    assert resolve_generation_entry("Krea", "anima-v3", has_default_recipe=True) == (
+        "recipe",
+        "Krea",
+    )
+    # 显式 workflow 强制模板入口，不被默认配方吞掉
+    assert resolve_generation_entry("", "anima-v3", has_default_recipe=True) == (
+        "workflow",
+        "anima-v3",
+    )
+    assert resolve_generation_entry("", "", has_default_recipe=True) == ("recipe", "")
+    assert resolve_generation_entry("", "", has_default_recipe=False) == ("workflow", "")
+    print("  generation entry resolution OK")
+
+
+def test_recipe_base_slots_binding() -> None:
+    """配方保存继承基底工作流的槽位映射：默认配方优先，其次同工作流配方。"""
+    with tempfile.TemporaryDirectory() as td:
+        store = RecipeStore(Path(td))
+        assert store.base_slots_for("mini") == ({}, "")
+        wf = _load_fixture("mini_workflow.json")
+        store.bootstrap(workflow_name="mini", wf=wf, config_slots={"prompt": "2", "sampler": "5"})
+        slots, src = store.base_slots_for("mini")
+        assert slots["prompt"]["node"] == "2"
+        assert src == "默认"
+        store.save(
+            {
+                "name": "立绘",
+                "workflow": "mini",
+                "slots": slots,
+                "defaults": {"model": "a.safetensors"},
+            }
+        )
+        slots2, src2 = store.base_slots_for("mini")
+        assert slots2["prompt"]["node"] == "2"
+        assert src2 == "默认"
+        # 未绑定 / 无同工作流配方时无可继承映射
+        assert store.base_slots_for("") == ({}, "")
+        assert store.base_slots_for("other-wf") == ({}, "")
+    print("  recipe base slots binding OK")
+
+
 def test_dual_sampler_external_int() -> None:
     """双采样 + 外联 Int：步数写到两个整数节点，种子写到共享 Int，连线不断开。"""
     wf = _load_fixture("dual_sampler.json")
@@ -421,6 +466,8 @@ def main() -> None:
     test_ui_to_api()
     test_workflow_build()
     test_defaults_precedence()
+    test_generation_entry_resolution()
+    test_recipe_base_slots_binding()
     test_dual_sampler_external_int()
     test_collect_trigger_words()
     test_lora_list_input()

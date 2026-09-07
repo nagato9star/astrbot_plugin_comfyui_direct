@@ -76,8 +76,8 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 | `comfyui_timeout` | `300` | 生成等待超时（秒） |
 | `model_cache_ttl` | `600` | 模型清单缓存刷新间隔（秒），0 表示每次强制同步 |
 | `lora_manager_enabled` | `true` | 复用 ComfyUI LoRA Manager 的分类、标签、用途说明、推荐权重和触发词；未安装时自动跳过 |
-| `default_workflow` | `anima-v3` | 默认工作流模板名 |
-| `default_recipe` | `默认` | LLM 不指定 recipe 时使用的配方 |
+| `default_workflow` | `anima-v3` | 默认工作流模板名（生成未选配方时的模板入口基底） |
+| `default_recipe` | `默认` | LLM 不指定 recipe 时的默认配方；recipe 与 workflow 是两个独立生成入口 |
 | `llm_tool_mode` | `basic` | `basic` 只暴露 draw/lookup；`full` 打开诊断工具 |
 | `allow_llm_unsafe_tools` | `false` | 是否允许 LLM 执行任意工作流、读取本地图片上传、释放显存和删除配方；默认关闭 |
 | `node_slots` | 空 | 下拉框：哪个节点是提示词 / KSampler / 底模 / LoRA / 尺寸。导入工作流后自动刷新，重载插件生效 |
@@ -136,7 +136,7 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 | 工具 | 说明 |
 |:---|:---|
 | `comfyui_list_models` | 查询可用底模 / LoRA / CLIP / VAE / Embedding；支持 `kind`、`query`、`limit` 筛选，LoRA 显示分类、标签、推荐权重和触发词 |
-| `comfyui_generate` | 按模板或保存的配方生图；可显式覆盖 model / lora / steps / cfg / sampler / denoise / width / height / seed / workflow 等 |
+| `comfyui_generate` | 按配方或工作流模板生图（两个独立入口：显式 `recipe` 把参数填进配方绑定的基底工作流，显式 `workflow` 按模板生成不套配方，都省略时优先默认配方）；可显式覆盖 model / lora / steps / cfg / sampler / denoise / width / height / seed 等 |
 | `comfyui_interrupt` | 中断生成（`prompt_id` 可选，默认最近一次），可同时取消排队任务 |
 | `comfyui_booru` | 查画师/角色触发词与常用 tag（`source`=danbooru/gelbooru） |
 | `comfyui_civitai_search` | 搜参考图并返回生成配方（模型/prompt/负向/sampler/steps/cfg/seed） |
@@ -149,7 +149,7 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 | `comfyui_nodes` | 搜索节点类或查询节点输入输出结构 |
 | `comfyui_validate_workflow` | 提交前检查工作流节点和必填输入 |
 | `comfyui_models_search` | 按目录搜索已安装的模型文件 |
-| `comfyui_recipe` | 保存、列出、加载配方；删除动作需额外开关 |
+| `comfyui_recipe` | 保存、列出、加载配方；保存时绑定基底工作流并继承同工作流的节点映射；删除动作需额外开关 |
 | `comfyui_run_workflow` | 运行指定工作流 JSON 并发送结果，需额外开关 |
 | `comfyui_upload_file` | 上传本地图片至 ComfyUI 的 input 目录，需额外开关 |
 | `comfyui_free_memory` | 请求卸载模型、释放显存，需额外开关 |

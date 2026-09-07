@@ -286,7 +286,7 @@ def parse_default_lora(raw: Any) -> str:
     "astrbot_plugin_comfyui_direct",
     "长门九曜",
     "局域网直连ComfyUI API，按配方生图",
-    "2.3.0",
+    "2.3.1",
 )
 class ComfyUIDirectPlugin(Star):
     """通过局域网直连ComfyUI API生成图片和查询模型。"""
@@ -427,6 +427,8 @@ class ComfyUIDirectPlugin(Star):
             ComfyuiRecipeTool(
                 store=self._store,
                 allow_delete=allow_llm_unsafe_tools,
+                builder=self._builder,
+                default_workflow=default_workflow,
             ),
         ]
         for t in tools:
@@ -449,6 +451,7 @@ class ComfyUIDirectPlugin(Star):
                 self._output_dir,
                 shared,
                 self._draw_tool,
+                config_defaults=defaults,
             )
         except Exception as e:
             logger.error(f"[ComfyUIDirect] WebUI 接口注册失败: {e}")
@@ -465,7 +468,7 @@ class ComfyUIDirectPlugin(Star):
             logger.warning(f"[ComfyUIDirect] 下拉选项同步任务启动失败: {e}")
 
         logger.info(
-            f"[ComfyUIDirect] 已加载 v2.3.0 | ComfyUI: {self._client.base_url} "
+            f"[ComfyUIDirect] 已加载 v2.3.1 | ComfyUI: {self._client.base_url} "
             f"| 默认模板: {default_workflow} | 工具模式: {llm_tool_mode} | 数据目录: {data_dir}"
         )
 

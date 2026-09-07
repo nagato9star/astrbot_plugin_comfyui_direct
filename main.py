@@ -366,7 +366,7 @@ class ComfyUIDirectPlugin(Star):
             default_workflow=default_workflow,
             custom_dir=data_dir / "workflows",
         )
-        self._store = RecipeStore(data_dir)
+        self._store = RecipeStore(data_dir, preferred_default=default_recipe_name)
         self._apply_config_to_default_recipe(
             default_workflow, node_slots_cfg, defaults, default_recipe_name
         )

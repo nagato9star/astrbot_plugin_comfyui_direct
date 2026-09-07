@@ -102,6 +102,76 @@ def test_slot_mapping_generic() -> None:
     print("  slot mapping generic OK")
 
 
+def test_power_lora_dynamic_slots() -> None:
+    """保存的 LoRA 必须能注入原本没有 lora_N 的 Power Loader。"""
+    wf = {
+        "30": {
+            "class_type": "Power Lora Loader (rgthree)",
+            "inputs": {"model": ["19", 0], "clip": ["17", 0]},
+        }
+    }
+    slots = {"loras": {"node": "30", "field": "lora"}}
+    apply_slots(
+        wf,
+        slots,
+        {
+            "loras": [
+                {"name": "Krea-2\\krea2-masterpieces-v51.safetensors", "strength": 0.8},
+                {"name": "Krea-2\\second.safetensors", "strength": 0.65},
+            ]
+        },
+    )
+    inputs = wf["30"]["inputs"]
+    assert inputs["lora_1"] == {
+        "on": True,
+        "lora": "Krea-2\\krea2-masterpieces-v51.safetensors",
+        "strength": 0.8,
+    }
+    assert inputs["lora_2"]["on"] is True
+    assert inputs["lora_2"]["strength"] == 0.65
+    apply_slots(wf, slots, {"loras": []})
+    assert inputs["lora_1"]["on"] is False
+    assert inputs["lora_2"]["on"] is False
+    print("  power lora dynamic slots OK")
+
+
+def test_power_lora_reuses_matching_slot() -> None:
+    """Krea2 预留在 lora_2 的文件名应在原槽位启用。"""
+    wf = {
+        "30": {
+            "class_type": "Power Lora Loader (rgthree)",
+            "inputs": {
+                "lora_1": {
+                    "on": False,
+                    "lora": "Krea-2\\krea2_vrchat photography style.safetensors",
+                    "strength": 1,
+                },
+                "lora_2": {
+                    "on": False,
+                    "lora": "Krea-2\\krea2-masterpieces-v51.safetensors",
+                    "strength": 1,
+                },
+            },
+        }
+    }
+    apply_slots(
+        wf,
+        {"loras": {"node": "30", "field": "lora"}},
+        {
+            "loras": [
+                {"name": "Krea-2\\krea2-masterpieces-v51.safetensors", "strength": 0.8}
+            ]
+        },
+    )
+    assert wf["30"]["inputs"]["lora_1"]["on"] is False
+    assert wf["30"]["inputs"]["lora_2"] == {
+        "on": True,
+        "lora": "Krea-2\\krea2-masterpieces-v51.safetensors",
+        "strength": 0.8,
+    }
+    print("  power lora matching slot OK")
+
+
 def test_slot_mapping_anima_like() -> None:
     wf = _load_fixture("anima_like.json")
     slots = detect_slots(wf)
@@ -151,6 +221,8 @@ def test_recipe_store_and_draw_schema() -> None:
         catalog = store.catalog()
         assert "立绘" in catalog
         assert "base" in catalog
+        preferred = RecipeStore(Path(td), preferred_default="立绘")
+        assert preferred.default()["name"] == "立绘"
         hist_id = "abc123"
         store.save_history(
             {
@@ -341,6 +413,8 @@ def test_cache_atomic() -> None:
 def main() -> None:
     print("[smoke] astrbot_plugin_comfyui_direct 冒烟测试")
     test_slot_mapping_generic()
+    test_power_lora_dynamic_slots()
+    test_power_lora_reuses_matching_slot()
     test_slot_mapping_anima_like()
     test_config_dropdown_and_size()
     test_recipe_store_and_draw_schema()

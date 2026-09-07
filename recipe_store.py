@@ -53,9 +53,58 @@ def _short_file(name: str) -> str:
     return text[:-12] if text.endswith(".safetensors") else text
 
 
+# 模型家族启发式：从底模文件名猜结构系（CLIP/引导/分辨率档是否通用）。
+# 顺序即优先级——先匹配具体家族关键词，再落宽泛的 sdxl/sd15。
+_FAMILY_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("krea", "krea"),
+    ("qwen", "qwen"),
+    ("flux", "flux"),
+    ("chroma", "chroma"),
+    ("anima", "anima"),
+    ("noobai", "illustrious"),
+    ("illustrious", "illustrious"),
+    ("pony", "pony"),
+    ("hunyuan", "hunyuan"),
+    ("wan", "wan"),
+    ("ltxv", "ltxv"),
+    ("hidream", "hidream"),
+    ("sd3", "sd3"),
+    ("sd_xl", "sdxl"),
+    ("sdxl", "sdxl"),
+    ("v1-5", "sd15"),
+    ("sd15", "sd15"),
+    ("sd1", "sd15"),
+)
+
+
+def model_family(model_name: str) -> str:
+    """从底模文件名猜模型家族；猜不出返回空串（空串 = 不做家族校验）。"""
+    text = str(model_name or "").replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if not text:
+        return ""
+    for keyword, family in _FAMILY_KEYWORDS:
+        if keyword in text:
+            return family
+    return ""
+
+
+def recipe_family(recipe: dict) -> str:
+    """配方的模型家族：显式 family 字段优先，否则从默认底模名猜。
+
+    兼容完整配方（defaults.model）与 list() 摘要行（顶层 model）两种形态。
+    """
+    recipe = recipe or {}
+    explicit = str(recipe.get("family") or "").strip().casefold()
+    if explicit:
+        return explicit
+    model = ((recipe.get("defaults") or {}).get("model")) or recipe.get("model") or ""
+    return model_family(model)
+
+
 class RecipeStore:
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, preferred_default: str = "") -> None:
         self.data_dir = data_dir
+        self.preferred_default = str(preferred_default or "").strip()
         self.recipe_dir = data_dir / "recipes"
         self.history_dir = data_dir / "history"
         self.recipe_dir.mkdir(parents=True, exist_ok=True)
@@ -110,6 +159,7 @@ class RecipeStore:
         return None
 
     def default(self, preferred: str = "") -> dict | None:
+        preferred = str(preferred or self.preferred_default or "").strip()
         if preferred:
             found = self.get(preferred)
             if found:
@@ -138,6 +188,14 @@ class RecipeStore:
             "drop_nodes": list(recipe.get("drop_nodes") or []),
             "updated_at": int(time.time()),
         }
+        # 可选扩展字段：家族、画幅档位、提示词风格（换家族模型/跨系画幅用）
+        for key in ("family", "prompt_style"):
+            val = str(recipe.get(key) or "").strip()
+            if val:
+                data[key] = val.casefold()
+        presets = recipe.get("size_presets")
+        if isinstance(presets, dict) and presets:
+            data["size_presets"] = presets
         path = self.path_for(rid)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return data
@@ -264,6 +322,7 @@ class RecipeStore:
             "name": data.get("name") or stem,
             "description": data.get("description") or "",
             "workflow": data.get("workflow") or "",
+            "family": data.get("family") or "",
             "model": defaults.get("model") or "",
             "loras": [
                 str(x.get("name") or x)

@@ -1,5 +1,7 @@
 """LLM 工具定义（dataclass FunctionTool 模式，v4.5.7+ 推荐）。
 
+comfyui_draw：按配方生图，可按画面需求选用已安装 LoRA（默认启用）
+comfyui_lookup：查询角色/画师/底模/LoRA，支持按用途选择 LoRA（默认启用）
 comfyui_list_models：查询模型/LoRA/CLIP/VAE/Embedding 清单（自动同步缓存）
 comfyui_generate：生成图片（可选模型/LoRA/KSampler 参数）
 comfyui_interrupt：中断生成 / 取消排队任务
@@ -30,7 +32,7 @@ from pydantic.dataclasses import dataclass
 from animadex import AnimaDexClient
 from comfy_client import ComfyUIClient, safe_output_path
 from external_search import CivitaiClient, DanbooruClient, GelbooruClient
-from recipe_store import RecipeStore, materialize_values
+from recipe_store import RecipeStore, materialize_values, model_family, recipe_family
 from slot_mapping import apply_slots, collect_trigger_words, parse_lora, resolve_size
 from workflow_builder import WorkflowBuilder
 
@@ -235,7 +237,7 @@ class ComfyuiListModelsTool(FunctionTool[AstrAgentContext]):
         "查询本机上ComfyUI可用的UNET底模、LoRA、CLIP、VAE、Embedding列表。"
         "LoRA 会附带触发词，以及 LoRA Manager/Civitai 的 style、character 等类别、标签和使用建议。"
         "清单会自动同步并本地缓存，ComfyUI离线时返回最近一次同步结果。"
-        "用户想知道有什么模型/LoRA/CLIP可用时使用。"
+        "用户询问可用资源，或绘图时需要按画风、角色、服饰、效果挑选已安装 LoRA 时使用。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -316,27 +318,16 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
 
     name: str = "comfyui_generate"
     description: str = (
-        "通过本机的ComfyUI生成一张图片。默认加载 V6 工作流模板（五段式提示词："
-        "主提示词/画师串/质量/lora触发词 四段拼接 + 负向提示词）。\n"
-        "【铁律】\n"
-        "1. prompt（tag串）必填。默认模板 V6 是 1024x1024 正方形且易出蹲坐/半身构图，"
-        "所以【每次都要按构图传 width/height】：全身站姿→832x1216(2:3)；半身坐姿→768x1024(3:4)；"
-        "横版场景→1216x832(3:2)；头像→768x1024；图生图保持原图比例。\n"
-        "2. lora：V6 的 Power Lora Loader 插槽默认全关（on=False），不传 lora = 无任何风格 LoRA。"
-        "需要画风/角色时主动传 lora，传数组 = 顺序映射 Power 插槽 lora_1..lora_N（多余的关掉）。"
-        "禁止传 turbo/加速 lora（独立 Turbo 节点已常驻 0.8）。"
-        "[]或\"none\" = 禁用全部含 Turbo 归零，别乱用。\n"
-        "3. 传了 lora 就必须同步传 trigger_words（@触发词格式），不传触发词 lora 等于白挂。"
-        "传参前先查 comfyui_list_models / comfyui_model_info 获取文件名和触发词，禁止编造。\n"
-        "4. 只有用户明确要求才覆盖其他参数：提到画师→填 artist（先调 comfyui_booru 查证）；"
-        "提到角色→务必先用系统自带 search-characters / get-character 查该角色的规范 danbooru tag"
-        "（本地 AnimaDex MCP，角色特征以此为准），再把查到的角色 tag 填进 prompt 或 trigger_words，"
-        "禁止凭记忆瞎编角色特征；提到换底模→填 model（不知道文件名先查 comfyui_list_models）；"
-        "要求画质→填 quality；调参数→填 steps/cfg/sampler_name 等。\n"
-        "5. 用户没有特别要求时，其他参数一律不传，绝不编造模型名/画师名/tag。\n"
-        "6. 生成成功后图片由插件直接发送到当前会话，不要再调用 send_message_to_user 发图。\n"
-        "7. 传 recipe（配方名）时，配方里保存的参数作为底层默认，本参数显式传的值优先；prompt 按需另传。\n"
-        "正确示例：comfyui_generate(prompt=\"1girl, solo, standing, full body, black hair, street\", width=832, height=1216)"
+        "按当前默认配方或指定工作流生成图片，完成后直接发送到当前会话。日常按配方绘图可用 comfyui_draw。"
+        "prompt 必填；未覆盖的参数沿用配方、插件配置或模板默认值，width/height 可按构图需求填写。"
+        "当 LoRA 有助于实现用户要求的画风、角色、服饰或效果时，可主动查询并选用，用户无需点名 LoRA 或提供文件名。"
+        "先用 comfyui_lookup(type=\"lora\", query=需求关键词) 或 comfyui_list_models(kind=\"lora\")，"
+        "依据返回的用途说明、模型适用信息和推荐权重选择，再将实际文件名写入 lora 的 JSON 数组字符串。"
+        "使用已记录的触发词时同步填写 trigger_words，保留原词格式；查询未提供触发词时可省略该字段并继续使用 LoRA。"
+        "省略 lora 会沿用默认设置，传入列表会覆盖对应 LoRA；已有独立加速节点的模板沿用其加速设置。"
+        "用户明确要求关闭 LoRA 时可传 \"[]\" 或 \"none\"，旧模板的此操作也会关闭独立加速 LoRA。"
+        "角色/画师名称不确定时用 comfyui_lookup 查询；底模、采样参数等按用户要求调整，其余沿用默认值。"
+        "省略 recipe 时自动使用当前默认配方，包括其中保存的 LoRA；传 recipe 时使用指定配方的默认值，本次显式传入的参数优先。生成成功后回复结果即可，图片已由插件发送。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -348,11 +339,11 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 },
                 "artist": {
                     "type": "string",
-                    "description": "画师串，格式如 @画师名（@加名字即可，逗号分隔，不用写权重）。用户提到画师/画风时此参数必须填写（先用 comfyui_booru 查证）；不传则保留模板默认画师，传空字符串可清空画师",
+                    "description": "画师串，格式如 @画师名，逗号分隔。用户指定画师时填写，可用 comfyui_lookup 查询规范名称；省略则沿用默认画师。一般画风需求也可通过提示词或 LoRA 实现",
                 },
                 "trigger_words": {
                     "type": "string",
-                    "description": "lora触发词，以 @ 开头的逗号分隔串，如 @deadpuritystyle,@f1f。传了 lora 就必须填触发词，否则 lora 无效",
+                    "description": "所选 LoRA 的已知触发词，从 lookup/model_info 返回值或用户提供的信息中取用，保留原始格式，多个用逗号分隔。选用 LoRA 时可同步填写，无需用户另外提出；查询未提供时可省略并继续使用 LoRA",
                 },
                 "quality": {
                     "type": "string",
@@ -369,12 +360,11 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 "lora": {
                     "type": "string",
                     "description": (
-                        "LoRA 覆盖，按 Power Lora Loader 插槽 lora_1..lora_8 顺序"
-                        "（旧模板按 LoRA 链顺序），每项含 name 与 strength，如 "
-                        '[{"name":"anima-base-1-photo-background-v4.safetensors","strength":0.55}]。'
-                        "解析器兼容 JSON 字符串、数组对象与 repr 字符串三种传法，"
-                        "直接传数组即可，不必手动字符串化。传 [] 或 \"none\" 禁用全部。"
-                        "V6 Power 插槽默认全关，不传 = 无风格 LoRA。需要画风时主动传"
+                        "本次使用的 LoRA 列表，可按画面需求主动查询并选用已安装资源。"
+                        "传 JSON 数组字符串，每项包含查询得到的 name，可附推荐 strength，例如 "
+                        '[{"name":"style.safetensors","strength":0.55}]（文件名用实际查询结果替换）。'
+                        "按 Power 插槽或旧模板 LoRA 链顺序覆盖；要保留的原 LoRA 也需列入。"
+                        "省略则沿用默认设置；用户要求关闭时传 \"[]\" 或 \"none\""
                     ),
                 },
                 "steps": {
@@ -411,11 +401,11 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 },
                 "workflow": {
                     "type": "string",
-                    "description": "工作流模板名（V6 默认 / V5 旧版），也可传 JSON 文件路径",
+                    "description": "工作流模板名，也可传 JSON 文件路径；省略时使用插件配置的默认模板",
                 },
                 "recipe": {
                     "type": "string",
-                    "description": "配方名：从已保存的配方（comfyui_recipe save 的）加载参数并覆盖本参数。传了 recipe 时以配方为准，本参数没传的项用配方值",
+                    "description": "已保存的配方名。不传则使用当前默认配方；传入后加载该配方默认参数，本次显式传入的参数优先",
                 },
             },
             "required": ["prompt"],
@@ -442,10 +432,8 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
         return d
 
     def _load_recipe(self, name: str) -> dict | None:
-        """按配方名读本地配方 JSON，返回配方参数 dict；不存在返回 None。"""
-        if not self.store or not name:
-            return None
-        recipe = self.store.get(name)
+        """读配方并转成 generate 参数；省略 name 时读取当前默认配方。"""
+        recipe = self._load_recipe_data(name)
         if recipe is None:
             return None
         # 把 RecipeStore 格式转成 generate 工具期望的 flat kwargs
@@ -461,6 +449,12 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
         if loras:
             flat["lora"] = json.dumps(loras, ensure_ascii=False)
         return flat
+
+    def _load_recipe_data(self, name: str) -> dict | None:
+        """读取完整配方，供 generate 保留 workflow 与槽位映射。"""
+        if not self.store:
+            return None
+        return self.store.get(name) if name else self.store.default()
 
     async def _wait_outputs(self, prompt_id: str) -> tuple[dict | None, str | None]:
         """轮询执行结果，返回 (outputs, 错误信息)。执行失败/超时返回错误信息。
@@ -495,10 +489,12 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
 
         # 配方覆盖：传了 recipe 名，配方里有的参数作为底层默认（LLM 显式传值仍优先）
         recipe_name = str(kwargs.get("recipe") or "").strip()
-        if recipe_name:
-            recipe = self._load_recipe(recipe_name)
-            if recipe is None:
-                return f"生成失败：配方不存在（{recipe_name}）。可先 comfyui_recipe list 查看。"
+        explicit_kwargs = dict(kwargs)
+        recipe_data = self._load_recipe_data(recipe_name)
+        recipe = self._load_recipe(recipe_name)
+        if recipe_name and recipe is None:
+            return f"生成失败：配方不存在（{recipe_name}）。可先 comfyui_recipe list 查看。"
+        if recipe is not None:
             merged = dict(recipe)
             merged.pop("name", None)
             merged.pop("prompt", None)  # prompt 以本参数为准
@@ -544,25 +540,83 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
             )
             seed = generation_values["seed"]
             # 自动填 lora 触发词已禁用（33号要求，lora_meta 触发词乱提示），需要时显式传 trigger_words
-            wf = self.builder.build(
-                workflow=kwargs.get("workflow"),
-                prompt=prompt,
-                artist=pick("artist"),
-                trigger_words=trigger_val,
-                quality=pick("quality"),
-                negative_prompt=pick("negative_prompt"),
-                model=pick("model"),
-                lora=lora_val,
-                width=generation_values.get("width"),
-                height=generation_values.get("height"),
-                seed=generation_values.get("seed"),
-                steps=generation_values.get("steps"),
-                cfg=generation_values.get("cfg"),
-                sampler_name=pick("sampler_name"),
-                scheduler=pick("scheduler"),
-                denoise=generation_values.get("denoise"),
-                prefix=f"astrbot_{uuid.uuid4().hex[:8]}",
-            )
+            prefix = f"astrbot_{uuid.uuid4().hex[:8]}"
+            if recipe_data is not None:
+                # 配方生成必须走保存的 workflow + slots。此前这里把配方压平成
+                # builder.build() 参数，导致 Power Lora Loader 的动态 lora_N
+                # 插槽完全绕过，WebUI 能选到的 LoRA 在机器人调用时不会提交。
+                values = materialize_values(
+                    recipe_data,
+                    {
+                        "prompt": prompt,
+                        "artist": explicit_kwargs.get("artist"),
+                        "trigger_words": explicit_kwargs.get("trigger_words"),
+                        "quality": explicit_kwargs.get("quality"),
+                        "negative": explicit_kwargs.get("negative_prompt")
+                        or explicit_kwargs.get("negative"),
+                        # model_val 已完成资源名解析；配方里保存的短名也要沿用
+                        # 解析后的完整路径，避免 ComfyUI 校验时再次丢失。
+                        "model": kwargs.get("model") if model_val is not None else None,
+                        "loras": (
+                            parse_lora(
+                                explicit_kwargs.get(
+                                    "lora",
+                                    explicit_kwargs.get("loras"),
+                                )
+                            )
+                            if (
+                                "lora" in explicit_kwargs
+                                or "loras" in explicit_kwargs
+                            )
+                            and explicit_kwargs.get(
+                                "lora",
+                                explicit_kwargs.get("loras"),
+                            )
+                            not in (None, "")
+                            else None
+                        ),
+                        "width": explicit_kwargs.get("width"),
+                        "height": explicit_kwargs.get("height"),
+                        "steps": explicit_kwargs.get("steps"),
+                        "cfg": explicit_kwargs.get("cfg"),
+                        "sampler_name": explicit_kwargs.get("sampler_name"),
+                        "scheduler": explicit_kwargs.get("scheduler"),
+                        "denoise": explicit_kwargs.get("denoise"),
+                        "seed": generation_values.get("seed"),
+                    },
+                )
+                for key, val in self.defaults.items():
+                    if key not in values and val not in (None, "", 0, 0.0):
+                        values["negative" if key == "negative_prompt" else key] = val
+                values = _validate_generation_values(values)
+                wf = self.builder.load_template(recipe_data.get("workflow") or None)
+                apply_slots(
+                    wf,
+                    recipe_data.get("slots") or {},
+                    values,
+                    prefix=prefix,
+                    drop_nodes=list(recipe_data.get("drop_nodes") or []),
+                )
+            else:
+                wf = self.builder.build(
+                    workflow=kwargs.get("workflow"),
+                    prompt=prompt,
+                    artist=pick("artist"),
+                    trigger_words=trigger_val,
+                    quality=pick("quality"),
+                    negative_prompt=pick("negative_prompt"),
+                    model=pick("model"),
+                    lora=lora_val,
+                    width=generation_values.get("width"),
+                    height=generation_values.get("height"),
+                    seed=generation_values.get("seed"),
+                    steps=generation_values.get("steps"),
+                    cfg=generation_values.get("cfg"),
+                    sampler_name=pick("sampler_name"),
+                    scheduler=pick("scheduler"),
+                    denoise=generation_values.get("denoise"),
+                    prefix=prefix,
+                )
         except FileNotFoundError as e:
             return f"生成失败：{e}"
         except (ValueError, json.JSONDecodeError) as e:
@@ -1808,17 +1862,20 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
 
 
 _DRAW_DESC = (
-    "给用户画一张图，画完直接发到当前会话。"
-    "用户只说「画xxx」时：只填 prompt，其他一律不填，用默认配方。"
-    "用户点名某套配方/画风（如立绘、写实）→填 recipe。"
-    "用户点名底模/LoRA→填 model / lora，可用关键词，不要编文件名；"
-    "涉及某种 LoRA 画风或角色时，先用 comfyui_lookup(type=\"lora\", query=\"style/character/标签\")，"
-    "按返回的实际文件名、分类、用途和触发词选择，不要凭文件名猜 LoRA 用途；拿不准就先 comfyui_lookup。"
-    "用户要竖图/横图/方图→填 size=portrait/landscape/square。"
-    "用户点名画师/画质/不要出现的东西/触发词→填对应字段。"
-    "用户要更精细或更快→才填 steps 或 cfg。"
-    "用户说记住这套/存成某某→填 save_as。"
-    "没点名的参数绝对不要填、不要编造。"
+    "按配方为用户画一张图，完成后直接发送到当前会话。prompt 必填，其余参数可按需覆盖。"
+    "普通绘图可以只填 prompt，沿用默认配方。"
+    "当 LoRA 有助于实现用户要求的画风、角色、服饰或效果时，可主动查询并选用，用户无需点名 LoRA 或提供文件名。"
+    "先用 comfyui_lookup(type=\"lora\", query=需求关键词)，如 style、character、服饰或效果标签；"
+    "根据返回的用途说明、模型适用信息和推荐权重选择，将实际文件名填入 lora。"
+    "使用已记录的触发词时同步填写 trigger_words；查询未提供触发词时可省略该字段并继续使用 LoRA。"
+    "传入 lora 会覆盖配方映射节点的列表，要保留的原 LoRA 也需列入；用户要求沿用配方或已有设置足够时省略 lora。"
+    "用户选择配方或底模时填写 recipe/model；要求画幅时填写 size=portrait/landscape/square；"
+    "画师、画质、负向内容、steps、cfg 等按用户要求调整，未调整的项沿用默认值。"
+    "用户要求记住这套参数时填写 save_as。"
+    "换底模时插件会校验模型家族：跨系模型（如 anima 配方换 krea/qwen）会自动切到同系配方，"
+    "没有同系配方则报错让主人先建，此时转告用户即可，不要重试别的模型名。"
+    "不同系模型请用对应系配方的画法（krea/qwen/flux 用自然语言描述，不要 danbooru 画师串）。"
+    "模型和 LoRA 文件名使用查询结果，触发词保留已知原词格式。"
 )
 
 
@@ -1858,7 +1915,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "要画的内容。写成 danbooru 风格 tag，必填",
+                    "description": "要画的内容，必填。按配方模型组织提示词：Anima 使用 danbooru 风格 tag，Krea/Qwen/Flux 使用自然语言描述",
                 },
                 "recipe": {
                     "type": "string",
@@ -1870,7 +1927,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                 },
                 "lora": {
                     "type": "string",
-                    "description": "换 LoRA。用户没点名就不要填。关键词、文件名，多个用逗号",
+                    "description": "本次使用的 LoRA，可按画风、角色、服饰或效果需求主动查询并选用，无需用户提供名称。填写查询得到的文件名或唯一关键词，多个用逗号；指定权重时传 JSON 数组字符串，如 [{\"name\":\"查询得到的文件名\",\"strength\":0.8}]。覆盖配方映射节点原列表，要保留的 LoRA 也需列入；省略则沿用配方。用户要求关闭时传 \"[]\" 或 \"none\"，Power 加载器的清空操作也会关闭独立加速 LoRA",
                 },
                 "size": {
                     "type": "string",
@@ -1891,7 +1948,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                 },
                 "trigger_words": {
                     "type": "string",
-                    "description": "LoRA 触发词。用户没提或 lookup 没给就不要填",
+                    "description": "所选 LoRA 的已知触发词，从 lookup/model_info 返回值或用户提供的信息中取用，保留原始格式，多个用逗号分隔。选用 LoRA 时可同步填写，无需用户另外提出；查询未提供时可省略并继续使用 LoRA",
                 },
                 "steps": {
                     "type": "number",
@@ -2010,12 +2067,44 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         lora_raw = kwargs.get("lora") if kwargs.get("lora") not in (None, "") else kwargs.get("loras")
         resolved_model = None
         resolved_loras = None
+        switched_note = ""
         if model_raw:
             resolved_model, err = await self._resolve_model(model_raw)
             if err:
                 return err
+            # 家族守卫：跨系模型的 CLIP/采样结构不通用（如 anima 配方硬塞 krea 底模只会出错）。
+            # 优先自动切到同家族配方；没有同家族配方就明确拒绝，提示先建配方。
+            new_family = model_family(resolved_model)
+            cur_family = recipe_family(recipe)
+            if new_family and cur_family and new_family != cur_family:
+                target = None
+                for row in self.store.list():
+                    if str(row.get("id")) == str(recipe.get("id")):
+                        continue
+                    if recipe_family(row) != new_family:
+                        continue
+                    full = self.store.get(str(row.get("id") or ""))
+                    if full and (full.get("slots") or {}).get("prompt"):
+                        target = full
+                        break
+                if target is None:
+                    return (
+                        f"「{model_raw}」是 {new_family} 系模型，和当前配方「{recipe.get('name')}」"
+                        f"（{cur_family} 系）不通用，没法直接换。"
+                        f"请主人先在配方工作台给 {new_family} 模型建一套配方，"
+                        f"或换回 {cur_family} 系底模。"
+                    )
+                recipe = target
+                slots = recipe.get("slots") or {}
+                switched_note = f" 已自动切换到配方「{recipe.get('name')}」。"
+                if not slots.get("prompt"):
+                    return "新配方还没指定「用户要画的内容」写到哪，请主人在工作台里选一下。"
             if not slots.get("model"):
-                return "这套配方还没指定底模格子，换不了模型。请主人在工作台里选一下「底模」。"
+                # 当前配方（含刚切换的）没开底模格子：换不了指定模型
+                if switched_note:
+                    resolved_model = None  # 沿用新配方默认底模
+                else:
+                    return "这套配方还没指定底模格子，换不了模型。请主人在工作台里选一下「底模」。"
         if lora_raw not in (None, ""):
             resolved_loras, err = await self._resolve_loras(lora_raw)
             if err:
@@ -2027,7 +2116,6 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             if not slots.get("sampler") and not slots.get("sampler_2"):
                 return "这套配方还没指定出图采样，改不了步数。请主人在工作台里选一下「出图采样」。"
 
-        defaults = recipe.get("defaults") or {}
         # 自动填 lora 触发词已禁用（33号要求），需要时显式传 trigger_words
 
         overrides = {
@@ -2045,7 +2133,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         values = materialize_values(recipe, overrides)
         for key, val in self.config_defaults.items():
             if key not in values and val not in (None, "", 0, 0.0, []):
-                values[key] = val
+                values["negative" if key == "negative_prompt" else key] = val
 
         size_token = str(kwargs.get("size") or "").strip()
         try:
@@ -2057,6 +2145,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                     int(values["width"]) if values.get("width") else None,
                     int(values["height"]) if values.get("height") else None,
                     size_token,
+                    presets=recipe.get("size_presets"),
                 )
                 values = _validate_generation_values(values)
         except ValueError as e:
@@ -2175,7 +2264,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             lora_note = "配方原 LoRA"
         return (
             f"已发送。配方={recipe.get('name')} 底模={model_note} "
-            f"lora={lora_note} seed={seed} size={w}x{h}.{saved_note}"
+            f"lora={lora_note} seed={seed} size={w}x{h}.{switched_note}{saved_note}"
         )
 
 
@@ -2185,11 +2274,13 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
 
     name: str = "comfyui_lookup"
     description: str = (
-        "查规范词或已安装的文件名。用户点名角色/画师/底模/LoRA，你又不确定时再用。"
+        "查询角色/画师的规范词，以及已安装的底模和 LoRA。"
+        "绘图需要某种画风、角色、服饰或效果时，可主动查询匹配的 LoRA，用户无需点名 LoRA 或提供文件名。"
         "character/artist：把触发词写进 prompt 或 artist。"
-        "model/lora：把返回的文件名填进 comfyui_draw。LoRA 的 query 还支持 LoRA Manager/Civitai "
+        "model/lora：选择符合需求的结果，把实际文件名填进 comfyui_draw 的 model/lora。LoRA 的 query 支持 LoRA Manager/Civitai "
         "分类或标签，例如 style/character/concept/风格/角色；结果会带用途说明、推荐权重和触发词。"
-        "不要自己编 tag 或文件名。"
+        "选用 LoRA 时可同步传入已记录的触发词；查询未提供触发词时可省略该字段并继续使用 LoRA。"
+        "查无结果时可换类别或用途关键词搜索，也可继续使用配方默认值。文件名和规范词以查询结果为准。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -2202,7 +2293,7 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
                 },
                 "query": {
                     "type": "string",
-                    "description": "名字（中文/日文/罗马音均可）",
+                    "description": "角色/画师名、模型文件名或关键词；type=lora 还可填画风、服饰、效果等用途标签或 style/character/concept 分类。支持中文、日文、罗马音",
                 },
                 "limit": {
                     "type": "number",

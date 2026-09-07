@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**局域网直连 ComfyUI。人配一套默认画法，对机器人说话就能画；点名换模、换 LoRA、换画幅也可以。**
+**局域网直连 ComfyUI。保存一套默认画法，对机器人说话就能画；可按画面需求选用 LoRA，也可点名换模、换画幅。**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
@@ -20,7 +20,7 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 
 你先在配方工作台里导入 ComfyUI 的图，确认「用户要画的内容」和「出图采样」写到哪，再保存一套默认的底模 / LoRA / 画幅。之后对机器人说「画一个站在街上的女孩」就能出图。
 
-用户点名换配方、换底模、换 LoRA、竖图横图、画师、画质、步数时，机器人会改对应的项；**没点名的一律不动**。它不会去猜节点，也不会把整份模型清单塞进上下文。
+用户要求换配方、换底模、竖图横图、画师、画质、步数时，机器人会改对应的项。需要某种画风、角色、服饰或效果时，机器人也可主动查询并选用匹配的已安装 LoRA，**无需用户提供文件名或特意说出「LoRA」**。未覆盖的项沿用配方默认值；节点由配方映射，查询只返回短列表。
 
 本插件完全开源免费，欢迎 Issue 和 PR。
 
@@ -28,8 +28,8 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 
 | 功能 | 说明 |
 |:---|:---|
-| **对机器人说话就画** | 默认只填要画的内容，底模和 LoRA 用你保存的配方 |
-| **点名再改** | 换配方 / 底模 / LoRA / 画幅 / 画师 / 画质 / 步数，用户没说就不改 |
+| **对机器人说话就画** | 只填要画的内容即可使用保存的配方；有需要时可查询并选用 LoRA |
+| **按需调整** | LoRA 可按画面需求选择；配方 / 底模 / 画幅 / 画师 / 画质 / 步数按用户要求调整 |
 | **配方工作台** | 导入图、确认格子、保存一套默认画法，还能试一张 |
 | **查一下再画** | 角色、画师、底模、LoRA 不确定时先查短列表；LoRA 支持 style / character 等分类 |
 
@@ -57,9 +57,10 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 
 | 你说 | 机器人做什么 |
 |:---|:---|
-| 画一个站在街上的女孩 | 只用这句话，其他全用默认配方 |
+| 画一个站在街上的女孩 | 可直接使用默认配方绘图 |
 | 用立绘那套，全身竖图 | 换配方 + 竖图 |
 | 换成喵喵底模，加上 zoda | 按关键词匹配已安装的底模/LoRA，只改这一次 |
+| 画成水彩风格 | 可查询风格 LoRA，按用途和模型适用信息选用，并填写已知触发词 |
 | 画师用 xxx | 只改画师 |
 | 精细一点 | 才动步数 |
 | 把这套记住，叫日常 | 把当前底模/LoRA/画幅存成新配方 |
@@ -123,20 +124,43 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 
 ## 🤖 LLM 工具
 
+默认 `llm_tool_mode=basic` 启用以下两个工具：
+
+| 工具 | 说明 |
+|:---|:---|
+| `comfyui_draw` | 按配方生图并直接发送；可按画面需求查询、选用 LoRA，支持本次覆盖底模、画幅、画师、采样参数和另存配方 |
+| `comfyui_lookup` | 查询角色 / 画师规范词，以及底模 / LoRA 文件名；支持按 LoRA 分类、标签、用途挑选，并返回用途说明、推荐权重和触发词 |
+
+`llm_tool_mode=full` 额外启用以下工具，其中标注为需额外开关的工具还要求 `allow_llm_unsafe_tools=true`：
+
 | 工具 | 说明 |
 |:---|:---|
 | `comfyui_list_models` | 查询可用底模 / LoRA / CLIP / VAE / Embedding；支持 `kind`、`query`、`limit` 筛选，LoRA 显示分类、标签、推荐权重和触发词 |
-| `comfyui_generate` | 生成图片，可选 model / lora / steps / cfg / sampler / denoise / width / height / seed / workflow 等 |
-| `comfyui_prompt_optimize` | 把自然语言需求优化为 Danbooru tags，内置角色 tag 校正 |
+| `comfyui_generate` | 按模板或保存的配方生图；可显式覆盖 model / lora / steps / cfg / sampler / denoise / width / height / seed / workflow 等 |
 | `comfyui_interrupt` | 中断生成（`prompt_id` 可选，默认最近一次），可同时取消排队任务 |
 | `comfyui_booru` | 查画师/角色触发词与常用 tag（`source`=danbooru/gelbooru） |
 | `comfyui_civitai_search` | 搜参考图并返回生成配方（模型/prompt/负向/sampler/steps/cfg/seed） |
 | `comfyui_model_info` | 查模型/LoRA 元数据与触发词（`source`=local / civitai） |
+| `comfyui_animadex` | 从 AnimaDex 查询角色、画师、作品系列及角色详情 |
 | `comfyui_queue` | 查询队列与 GPU 显存状态 |
+| `comfyui_job` | 按任务 ID 查状态、等待完成、取消任务或查询队列 |
+| `comfyui_fetch_outputs` | 按任务 ID 下载生成结果并返回本地路径 |
+| `comfyui_system_stats` | 查询设备、显存和系统内存状态 |
+| `comfyui_nodes` | 搜索节点类或查询节点输入输出结构 |
+| `comfyui_validate_workflow` | 提交前检查工作流节点和必填输入 |
+| `comfyui_models_search` | 按目录搜索已安装的模型文件 |
+| `comfyui_recipe` | 保存、列出、加载配方；删除动作需额外开关 |
+| `comfyui_run_workflow` | 运行指定工作流 JSON 并发送结果，需额外开关 |
+| `comfyui_upload_file` | 上传本地图片至 ComfyUI 的 input 目录，需额外开关 |
+| `comfyui_free_memory` | 请求卸载模型、释放显存，需额外开关 |
 
 默认不会把 `comfyui_run_workflow`、`comfyui_upload_file`、`comfyui_free_memory` 交给 LLM，且 `comfyui_recipe` 的删除动作也要求在 Workflow Studio 手动完成。确有需要时，先开启 `allow_llm_unsafe_tools`。
 
-LoRA 查询示例：`comfyui_lookup(type="lora", query="style")`、`query="character"`、`query="风格"`。匹配范围包括 LoRA 文件名、LoRA Manager/Civitai 标签、分类和用途说明；生成时仍会使用实际安装的文件名和已记录的触发词。`comfyui_list_models(kind="lora", query="style", limit=10)` 可只返回指定分类，减少 LLM 上下文占用。
+LoRA 查询示例：`comfyui_lookup(type="lora", query="style")`、`query="character"`、`query="水彩"`。匹配范围包括 LoRA 文件名、LoRA Manager/Civitai 标签、分类和用途说明；机器人可根据画面需求主动查询并选用，文件名以实际查询结果为准。`comfyui_list_models(kind="lora", query="style", limit=10)` 可只返回指定分类，减少 LLM 上下文占用。
+
+`comfyui_draw` 的 `lora` 是字符串：可填文件名、唯一关键词，多个用逗号分隔；指定权重时传 JSON 数组字符串，例如 `"[{\"name\":\"style.safetensors\",\"strength\":0.6}]"`，其中示例文件名需替换成查询结果。`comfyui_generate` 使用同样的 JSON 数组字符串格式。传入列表会覆盖对应 LoRA，要保留的原 LoRA 也需列入；省略时沿用默认值。
+
+选用 LoRA 时，可将查询返回的已知触发词同步填入 `trigger_words`，保留原词格式，无需用户再次提出。查询未提供触发词时可省略该字段并继续使用 LoRA。插件的绘图工具仍由调用方显式填写触发词；工作台选 LoRA 后自动填充文本框的行为保持不变。
 
 ## 🖥️ WebUI：Workflow Studio
 

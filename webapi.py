@@ -97,6 +97,7 @@ class StudioApi:
         output_dir: Path,
         shared: dict,
         draw_tool: Any = None,
+        config_defaults: dict | None = None,
     ) -> None:
         self.client = client
         self.builder = builder
@@ -104,6 +105,7 @@ class StudioApi:
         self.output_dir = output_dir
         self.shared = shared
         self.draw_tool = draw_tool
+        self.config_defaults = config_defaults or {}
 
     def _refresh_draw_schema(self) -> None:
         if self.draw_tool is not None and hasattr(self.draw_tool, "refresh_schema"):
@@ -342,6 +344,12 @@ class StudioApi:
         seed = body.get("seed")
         if seed is None:
             seed = random.randint(0, 2**31 - 1)
+        try:
+            seed = int(seed)
+        except (TypeError, ValueError):
+            return _json({"ok": False, "error": "seed 必须是整数"})
+        if not 0 <= seed <= 2**63 - 1:
+            return _json({"ok": False, "error": "seed 超出允许范围（0 ~ 2^63-1）"})
         defaults = recipe.get("defaults") or {}
         loras = body.get("loras") or body.get("lora")
         trigger = body.get("trigger_words")
@@ -374,12 +382,17 @@ class StudioApi:
             "trigger_words": trigger,
         }
         values = materialize_values(recipe, overrides)
-        values["seed"] = int(seed)
+        values["seed"] = seed
+        # 与机器人路径保持一致：配方没配的项补插件配置默认值（画师/画质/负向等）
+        for key, val in self.config_defaults.items():
+            if key not in values and val not in (None, "", 0, 0.0, []):
+                values["negative" if key == "negative_prompt" else key] = val
         if body.get("size"):
             values["width"], values["height"] = resolve_size(
                 int(values["width"]) if values.get("width") else None,
                 int(values["height"]) if values.get("height") else None,
                 str(body.get("size")),
+                presets=recipe.get("size_presets"),
             )
         try:
             wf = self.builder.load_template(recipe.get("workflow") or None)
@@ -498,11 +511,20 @@ def register_web_apis(
     output_dir: Path | None = None,
     shared: dict | None = None,
     draw_tool: Any = None,
+    config_defaults: dict | None = None,
 ) -> None:
     if store is None or output_dir is None:
         logger.error("[ComfyUIDirect] WebUI 缺少 recipe store，跳过注册")
         return
-    api = StudioApi(client, builder, store, output_dir, shared if shared is not None else {}, draw_tool)
+    api = StudioApi(
+        client,
+        builder,
+        store,
+        output_dir,
+        shared if shared is not None else {},
+        draw_tool,
+        config_defaults=config_defaults,
+    )
     routes = [
         ("/status", api.status, ["GET"], "ComfyUI 状态"),
         ("/workflows", api.list_workflows, ["GET"], "列出工作流"),

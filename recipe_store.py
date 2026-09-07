@@ -53,13 +53,63 @@ def _short_file(name: str) -> str:
     return text[:-12] if text.endswith(".safetensors") else text
 
 
+# 模型家族启发式：从底模文件名猜结构系（CLIP/引导/分辨率档是否通用）。
+# 顺序即优先级——先匹配具体家族关键词，再落宽泛的 sdxl/sd15。
+_FAMILY_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("krea", "krea"),
+    ("qwen", "qwen"),
+    ("flux", "flux"),
+    ("chroma", "chroma"),
+    ("anima", "anima"),
+    ("noobai", "illustrious"),
+    ("illustrious", "illustrious"),
+    ("pony", "pony"),
+    ("hunyuan", "hunyuan"),
+    ("wan", "wan"),
+    ("ltxv", "ltxv"),
+    ("hidream", "hidream"),
+    ("sd3", "sd3"),
+    ("sd_xl", "sdxl"),
+    ("sdxl", "sdxl"),
+    ("v1-5", "sd15"),
+    ("sd15", "sd15"),
+    ("sd1", "sd15"),
+)
+
+
+def model_family(model_name: str) -> str:
+    """从底模文件名猜模型家族；猜不出返回空串（空串 = 不做家族校验）。"""
+    text = str(model_name or "").replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if not text:
+        return ""
+    for keyword, family in _FAMILY_KEYWORDS:
+        if keyword in text:
+            return family
+    return ""
+
+
+def recipe_family(recipe: dict) -> str:
+    """配方的模型家族：显式 family 字段优先，否则从默认底模名猜。
+
+    兼容完整配方（defaults.model）与 list() 摘要行（顶层 model）两种形态。
+    """
+    recipe = recipe or {}
+    explicit = str(recipe.get("family") or "").strip().casefold()
+    if explicit:
+        return explicit
+    model = ((recipe.get("defaults") or {}).get("model")) or recipe.get("model") or ""
+    return model_family(model)
+
+
 class RecipeStore:
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, preferred_default: str = "") -> None:
         self.data_dir = data_dir
+        self.preferred_default = str(preferred_default or "").strip()
         self.recipe_dir = data_dir / "recipes"
         self.history_dir = data_dir / "history"
         self.recipe_dir.mkdir(parents=True, exist_ok=True)
         self.history_dir.mkdir(parents=True, exist_ok=True)
+        self._warned_missing: set[str] = set()
 
     def path_for(self, recipe_id: str) -> Path:
         rid = slugify(recipe_id)
@@ -110,10 +160,16 @@ class RecipeStore:
         return None
 
     def default(self, preferred: str = "") -> dict | None:
+        preferred = str(preferred or self.preferred_default or "").strip()
         if preferred:
             found = self.get(preferred)
             if found:
                 return found
+            if self.list() and preferred not in self._warned_missing:
+                self._warned_missing.add(preferred)
+                logger.warning(
+                    f"[ComfyUIDirect] 配置的默认配方「{preferred}」不存在，回退到其它配方"
+                )
         rows = self.list()
         for row in rows:
             if row.get("id") == "default" or row.get("name") in ("默认", "default"):
@@ -121,6 +177,31 @@ class RecipeStore:
         if rows:
             return self.get(rows[0]["id"])
         return None
+
+    def base_slots_for(self, workflow_name: str) -> tuple[dict, str]:
+        """绑定工作流的基底槽位映射：默认配方优先，其次同工作流且已映射主提示词的配方。
+
+        配方保存时用它继承节点映射，保证新配方不缺主提示词槽位、可直接用于生成。
+        返回 (slots, source_name)，无可继承时返回 ({}, "")。
+        """
+        wanted = str(workflow_name or "").strip()
+        if not wanted:
+            return {}, ""
+        candidates: list[dict] = []
+        default_recipe = self.default()
+        if default_recipe and str(default_recipe.get("workflow") or "") == wanted:
+            candidates.append(default_recipe)
+        for row in self.list():
+            if default_recipe and row.get("id") == default_recipe.get("id"):
+                continue
+            full = self.get(str(row.get("id") or ""))
+            if full and str(full.get("workflow") or "") == wanted:
+                candidates.append(full)
+        for cand in candidates:
+            slots = cand.get("slots") or {}
+            if slots.get("prompt"):
+                return dict(slots), str(cand.get("name") or cand.get("id") or "")
+        return {}, ""
 
     def save(self, recipe: dict) -> dict:
         name = str(recipe.get("name") or "").strip()
@@ -138,6 +219,14 @@ class RecipeStore:
             "drop_nodes": list(recipe.get("drop_nodes") or []),
             "updated_at": int(time.time()),
         }
+        # 可选扩展字段：家族、画幅档位、提示词风格（换家族模型/跨系画幅用）
+        for key in ("family", "prompt_style"):
+            val = str(recipe.get(key) or "").strip()
+            if val:
+                data[key] = val.casefold()
+        presets = recipe.get("size_presets")
+        if isinstance(presets, dict) and presets:
+            data["size_presets"] = presets
         path = self.path_for(rid)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return data
@@ -264,6 +353,7 @@ class RecipeStore:
             "name": data.get("name") or stem,
             "description": data.get("description") or "",
             "workflow": data.get("workflow") or "",
+            "family": data.get("family") or "",
             "model": defaults.get("model") or "",
             "loras": [
                 str(x.get("name") or x)
@@ -309,3 +399,29 @@ def materialize_values(recipe: dict, overrides: dict[str, Any]) -> dict[str, Any
             continue
         values[key] = val
     return values
+
+
+def resolve_generation_entry(
+    recipe_param: str = "",
+    workflow_param: str = "",
+    *,
+    has_default_recipe: bool = False,
+) -> tuple[str, str]:
+    """生成工具双入口判定。
+
+    显式 recipe > 显式 workflow > 默认配方 > 模板。recipe 与 workflow 是两个
+    互不吞并的入口：传 recipe 就把参数填进该配方绑定的基底工作流；传 workflow
+    就按模板生成、不套配方——否则显式指定的 workflow 会被默认配方静默吞掉。
+
+    返回 (entry, name)：entry 为 "recipe" 时 name 是配方名（"" 表示默认配方）；
+    entry 为 "workflow" 时 name 是模板名（"" 表示配置默认模板）。
+    """
+    recipe_param = str(recipe_param or "").strip()
+    workflow_param = str(workflow_param or "").strip()
+    if recipe_param:
+        return "recipe", recipe_param
+    if workflow_param:
+        return "workflow", workflow_param
+    if has_default_recipe:
+        return "recipe", ""
+    return "workflow", ""

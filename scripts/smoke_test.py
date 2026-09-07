@@ -102,6 +102,76 @@ def test_slot_mapping_generic() -> None:
     print("  slot mapping generic OK")
 
 
+def test_power_lora_dynamic_slots() -> None:
+    """保存的 LoRA 必须能注入原本没有 lora_N 的 Power Loader。"""
+    wf = {
+        "30": {
+            "class_type": "Power Lora Loader (rgthree)",
+            "inputs": {"model": ["19", 0], "clip": ["17", 0]},
+        }
+    }
+    slots = {"loras": {"node": "30", "field": "lora"}}
+    apply_slots(
+        wf,
+        slots,
+        {
+            "loras": [
+                {"name": "Krea-2\\krea2-masterpieces-v51.safetensors", "strength": 0.8},
+                {"name": "Krea-2\\second.safetensors", "strength": 0.65},
+            ]
+        },
+    )
+    inputs = wf["30"]["inputs"]
+    assert inputs["lora_1"] == {
+        "on": True,
+        "lora": "Krea-2\\krea2-masterpieces-v51.safetensors",
+        "strength": 0.8,
+    }
+    assert inputs["lora_2"]["on"] is True
+    assert inputs["lora_2"]["strength"] == 0.65
+    apply_slots(wf, slots, {"loras": []})
+    assert inputs["lora_1"]["on"] is False
+    assert inputs["lora_2"]["on"] is False
+    print("  power lora dynamic slots OK")
+
+
+def test_power_lora_reuses_matching_slot() -> None:
+    """Krea2 预留在 lora_2 的文件名应在原槽位启用。"""
+    wf = {
+        "30": {
+            "class_type": "Power Lora Loader (rgthree)",
+            "inputs": {
+                "lora_1": {
+                    "on": False,
+                    "lora": "Krea-2\\krea2_vrchat photography style.safetensors",
+                    "strength": 1,
+                },
+                "lora_2": {
+                    "on": False,
+                    "lora": "Krea-2\\krea2-masterpieces-v51.safetensors",
+                    "strength": 1,
+                },
+            },
+        }
+    }
+    apply_slots(
+        wf,
+        {"loras": {"node": "30", "field": "lora"}},
+        {
+            "loras": [
+                {"name": "Krea-2\\krea2-masterpieces-v51.safetensors", "strength": 0.8}
+            ]
+        },
+    )
+    assert wf["30"]["inputs"]["lora_1"]["on"] is False
+    assert wf["30"]["inputs"]["lora_2"] == {
+        "on": True,
+        "lora": "Krea-2\\krea2-masterpieces-v51.safetensors",
+        "strength": 0.8,
+    }
+    print("  power lora matching slot OK")
+
+
 def test_slot_mapping_anima_like() -> None:
     wf = _load_fixture("anima_like.json")
     slots = detect_slots(wf)
@@ -151,6 +221,8 @@ def test_recipe_store_and_draw_schema() -> None:
         catalog = store.catalog()
         assert "立绘" in catalog
         assert "base" in catalog
+        preferred = RecipeStore(Path(td), preferred_default="立绘")
+        assert preferred.default()["name"] == "立绘"
         hist_id = "abc123"
         store.save_history(
             {
@@ -232,6 +304,51 @@ def test_defaults_precedence() -> None:
     values2 = materialize_values(recipe, {"prompt": "1girl", "seed": 99})
     assert values2["seed"] == 99
     print("  defaults precedence OK")
+
+
+def test_generation_entry_resolution() -> None:
+    """双入口判定：显式 recipe > 显式 workflow > 默认配方 > 模板。"""
+    from recipe_store import resolve_generation_entry
+
+    assert resolve_generation_entry("Krea", "anima-v3", has_default_recipe=True) == (
+        "recipe",
+        "Krea",
+    )
+    # 显式 workflow 强制模板入口，不被默认配方吞掉
+    assert resolve_generation_entry("", "anima-v3", has_default_recipe=True) == (
+        "workflow",
+        "anima-v3",
+    )
+    assert resolve_generation_entry("", "", has_default_recipe=True) == ("recipe", "")
+    assert resolve_generation_entry("", "", has_default_recipe=False) == ("workflow", "")
+    print("  generation entry resolution OK")
+
+
+def test_recipe_base_slots_binding() -> None:
+    """配方保存继承基底工作流的槽位映射：默认配方优先，其次同工作流配方。"""
+    with tempfile.TemporaryDirectory() as td:
+        store = RecipeStore(Path(td))
+        assert store.base_slots_for("mini") == ({}, "")
+        wf = _load_fixture("mini_workflow.json")
+        store.bootstrap(workflow_name="mini", wf=wf, config_slots={"prompt": "2", "sampler": "5"})
+        slots, src = store.base_slots_for("mini")
+        assert slots["prompt"]["node"] == "2"
+        assert src == "默认"
+        store.save(
+            {
+                "name": "立绘",
+                "workflow": "mini",
+                "slots": slots,
+                "defaults": {"model": "a.safetensors"},
+            }
+        )
+        slots2, src2 = store.base_slots_for("mini")
+        assert slots2["prompt"]["node"] == "2"
+        assert src2 == "默认"
+        # 未绑定 / 无同工作流配方时无可继承映射
+        assert store.base_slots_for("") == ({}, "")
+        assert store.base_slots_for("other-wf") == ({}, "")
+    print("  recipe base slots binding OK")
 
 
 def test_dual_sampler_external_int() -> None:
@@ -341,12 +458,16 @@ def test_cache_atomic() -> None:
 def main() -> None:
     print("[smoke] astrbot_plugin_comfyui_direct 冒烟测试")
     test_slot_mapping_generic()
+    test_power_lora_dynamic_slots()
+    test_power_lora_reuses_matching_slot()
     test_slot_mapping_anima_like()
     test_config_dropdown_and_size()
     test_recipe_store_and_draw_schema()
     test_ui_to_api()
     test_workflow_build()
     test_defaults_precedence()
+    test_generation_entry_resolution()
+    test_recipe_base_slots_binding()
     test_dual_sampler_external_int()
     test_collect_trigger_words()
     test_lora_list_input()

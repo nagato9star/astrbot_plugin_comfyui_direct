@@ -2,7 +2,7 @@ name: astrbot_plugin_comfyui_direct
 display_name: ComfyUI Direct
 desc: 局域网直连 ComfyUI API，用配方工作台映射节点后按配方生图
 short_desc: 配方驱动的 ComfyUI 生图
-version: v2.3.0
+version: v2.3.1
 author: 长门九曜
 repo: https://github.com/nagato9star/astrbot_plugin_comfyui_direct
 astrbot_version: ">=4.16,<5"

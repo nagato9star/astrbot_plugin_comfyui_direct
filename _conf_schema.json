@@ -375,6 +375,30 @@
           "509 — XB_ROCmKSamplerAdvanced — 一采",
           "510 — XB_ROCmKSamplerAdvanced — 二采"
         ]
+      },
+      "clip": {
+        "type": "string",
+        "default": "",
+        "hint": "换文本编码器（Flux/Krea/Qwen 等独立 CLIP 的模型才需要，可留空）",
+        "options": [
+          ""
+        ]
+      },
+      "vae": {
+        "type": "string",
+        "default": "",
+        "hint": "换 VAE（模型用独立 VAE 时才需要，可留空）",
+        "options": [
+          ""
+        ]
+      },
+      "guidance": {
+        "type": "string",
+        "default": "",
+        "hint": "FluxGuidance 之类的引导值节点（可留空）",
+        "options": [
+          ""
+        ]
       }
     }
   },

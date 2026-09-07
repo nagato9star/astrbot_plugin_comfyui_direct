@@ -31,6 +31,9 @@ SLOT_ROLES: tuple[tuple[str, str], ...] = (
     ("artist", "画师风格"),
     ("quality", "画质词"),
     ("trigger_words", "LoRA 触发词"),
+    ("clip", "文本编码器(CLIP)"),
+    ("vae", "VAE"),
+    ("guidance", "引导强度(Flux)"),
 )
 SLOT_BASIC = ("prompt", "model", "loras", "size", "sampler")
 SLOT_HELP: dict[str, str] = {
@@ -44,6 +47,9 @@ SLOT_HELP: dict[str, str] = {
     "artist": "用户点名画师时写到这里。没有可留空。",
     "quality": "画质词。一般不用动。",
     "trigger_words": "某些 LoRA 必须带的触发词。选 LoRA 后会自动填。",
+    "clip": "换文本编码器。Flux/Krea/Qwen 这类独立 CLIP 的模型才需要，可留空。",
+    "vae": "换 VAE。模型用独立 VAE 时才需要，可留空。",
+    "guidance": "FluxGuidance 之类的引导值节点。可留空。",
 }
 
 SLOT_CLASS_HINTS: dict[str, tuple[str, ...]] = {
@@ -65,7 +71,20 @@ SLOT_CLASS_HINTS: dict[str, tuple[str, ...]] = {
         "UNETLoaderGGUF",
         "CheckpointLoader",
         "UnetLoaderGGUF",
+        "CheckpointLoaderNF4",
+        "UnetLoaderGGUFAdvanced",
+        "DiffusersLoader",
     ),
+    "clip": (
+        "CLIPLoader",
+        "DualCLIPLoader",
+        "TripleCLIPLoader",
+        "QuadrupleCLIPLoader",
+        "CLIPLoaderGGUF",
+        "DualCLIPLoaderGGUF",
+    ),
+    "vae": ("VAELoader",),
+    "guidance": ("FluxGuidance",),
     "loras": (
         "Power Lora Loader (rgthree)",
         "LoraLoaderModelOnly",
@@ -467,6 +486,18 @@ def detect_slots(wf: dict) -> dict[str, dict]:
     if model_id:
         slots["model"] = _slot(model_id, wf, "model")
 
+    clip_id = _first_class(wf, SLOT_CLASS_HINTS["clip"])
+    if clip_id:
+        slots["clip"] = _slot(clip_id, wf, "clip")
+
+    vae_id = _first_class(wf, SLOT_CLASS_HINTS["vae"])
+    if vae_id:
+        slots["vae"] = _slot(vae_id, wf, "vae")
+
+    guidance_id = _first_class(wf, SLOT_CLASS_HINTS["guidance"])
+    if guidance_id:
+        slots["guidance"] = _slot(guidance_id, wf, "guidance")
+
     lora_id = _first_class(wf, (POWER_LORA_CLASS,)) or _first_class(
         wf, SLOT_CLASS_HINTS["loras"]
     )
@@ -519,6 +550,15 @@ def infer_field(node: dict, role: str) -> str:
         if "Checkpoint" in cls:
             return "ckpt_name"
         return "unet_name"
+    if role == "clip":
+        for key in ("clip_name", "clip_name1", "clip_name2", "clip_name3", "clip_name4"):
+            if key in ins:
+                return key
+        return "clip_name"
+    if role == "vae":
+        return "vae_name"
+    if role == "guidance":
+        return "strength"
     if role == "size":
         return "width"
     if role == "sampler":
@@ -690,6 +730,23 @@ def read_current_values(wf: dict, slots: dict[str, dict]) -> dict[str, Any]:
         if isinstance(val, str) and val:
             values["model"] = val
 
+    for role in ("clip", "vae"):
+        spec = slots.get(role)
+        if not spec:
+            continue
+        node = wf.get(str(spec["node"])) or {}
+        field = spec.get("field") or infer_field(node, role)
+        val = (node.get("inputs") or {}).get(field)
+        if isinstance(val, str) and val:
+            values[role] = val
+
+    guidance_slot = slots.get("guidance")
+    if guidance_slot:
+        node = wf.get(str(guidance_slot["node"])) or {}
+        val = (node.get("inputs") or {}).get("strength")
+        if isinstance(val, (int, float)) and not _is_link(val):
+            values["guidance"] = float(val)
+
     lora_slot = slots.get("loras")
     if lora_slot:
         values["loras"] = _read_loras(wf.get(str(lora_slot["node"])) or {})
@@ -795,9 +852,25 @@ def parse_lora(lora: Any) -> list[dict]:
     return out
 
 
-def resolve_size(width: int | None, height: int | None, size: str | None) -> tuple[int | None, int | None]:
-    w, h = width or 0, height or 0
+def resolve_size(
+    width: int | None,
+    height: int | None,
+    size: str | None,
+    presets: dict | None = None,
+) -> tuple[int | None, int | None]:
+    """画幅 token → 宽高。配方可带 size_presets（如 Flux/Qwen 家族的分辨率档），
+    命中时优先用配方档位；否则沿用内置的 SDXL 档和翻转逻辑。"""
     token = str(size or "same").strip().lower()
+    if presets and token in presets:
+        preset = presets.get(token)
+        if isinstance(preset, (list, tuple)) and len(preset) >= 2:
+            try:
+                pw, ph = int(preset[0]), int(preset[1])
+            except (TypeError, ValueError):
+                pw = ph = 0
+            if pw > 0 and ph > 0:
+                return pw, ph
+    w, h = width or 0, height or 0
     if not w or not h:
         if token == "portrait":
             return 832, 1216
@@ -854,6 +927,27 @@ def apply_slots(
         if node is not None:
             field = spec.get("field") or infer_field(node, "model")
             node.setdefault("inputs", {})[field] = str(model)
+
+    # 文本编码器 / VAE：与底模同类的字符串覆盖（换家族模型时由配方模板保证结构正确）
+    for role in ("clip", "vae"):
+        val = values.get(role)
+        if val is None or not slots.get(role):
+            continue
+        spec = slots[role]
+        node = wf.get(str(spec["node"]))
+        if node is not None:
+            field = spec.get("field") or infer_field(node, role)
+            node.setdefault("inputs", {})[field] = str(val)
+
+    guidance = values.get("guidance")
+    if guidance is not None and slots.get("guidance"):
+        spec = slots["guidance"]
+        node = wf.get(str(spec["node"]))
+        if node is not None:
+            try:
+                node.setdefault("inputs", {})["strength"] = float(guidance)
+            except (TypeError, ValueError):
+                pass
 
     if values.get("loras") is not None and slots.get("loras"):
         _apply_loras(wf, str(slots["loras"]["node"]), parse_lora(values.get("loras")))
@@ -1057,21 +1151,50 @@ def _apply_loras(wf: dict, nid: str, parsed: list[dict]) -> None:
             (k for k, v in ins.items() if k.startswith("lora_") and isinstance(v, dict)),
             key=lambda k: int(k.split("_")[1]) if k.split("_")[1].isdigit() else 0,
         )
-        for i, slot in enumerate(slots):
-            if i < len(parsed):
-                spec = parsed[i]
-                ins[slot] = {
-                    "on": True,
-                    "lora": str(spec.get("name") or "").strip(),
-                    "strength": normalize_lora_strength(spec.get("strength", 0.8)),
-                }
-            else:
-                ins[slot]["on"] = False
-        if len(parsed) > len(slots):
-            logger.warning(
-                f"[ComfyUIDirect] 传入 {len(parsed)} 个 LoRA，超过 Power Lora Loader "
-                f"的 {len(slots)} 个插槽，多余的已忽略"
+        # Power Lora Loader 的 lora_N 是动态可选输入。有些 API 工作流未序列化
+        # lora_N，不能只覆盖已有插槽；需按保存的配方主动创建它们。
+        numeric_slots = [
+            int(slot.split("_", 1)[1])
+            for slot in slots
+            if slot.split("_", 1)[1].isdigit()
+        ]
+        next_slot = max(numeric_slots, default=0) + 1
+        used_slots: list[str] = []
+        unused_slots = list(slots)
+        for spec in parsed:
+            name = str(spec.get("name") or "").strip()
+            normalized_name = name.replace("/", "\\").casefold()
+            # 工作流经常预留多个带文件名的槽位（krea2.json 的
+            # masterpieces 在 lora_2）。优先复用同名槽位，保持工作流槽位语义。
+            slot = next(
+                (
+                    candidate
+                    for candidate in unused_slots
+                    if str(ins[candidate].get("lora") or "")
+                    .replace("/", "\\")
+                    .casefold()
+                    == normalized_name
+                ),
+                None,
             )
+            if slot is None and unused_slots:
+                slot = unused_slots[0]
+            if slot is None:
+                while f"lora_{next_slot}" in ins:
+                    next_slot += 1
+                slot = f"lora_{next_slot}"
+                next_slot += 1
+            ins[slot] = {
+                "on": True,
+                "lora": name,
+                "strength": normalize_lora_strength(spec.get("strength", 0.8)),
+            }
+            used_slots.append(slot)
+            if slot in unused_slots:
+                unused_slots.remove(slot)
+        for slot in slots:
+            if slot not in used_slots:
+                ins[slot]["on"] = False
         return
 
     # 单节点 LoraLoader / 从该节点起的 LoraLoaderModelOnly 链

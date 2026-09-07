@@ -8,6 +8,9 @@ const SLOT_FALLBACK = [
   { id: "artist", label: "画师风格", help: "", basic: false },
   { id: "quality", label: "画质词", help: "", basic: false },
   { id: "trigger_words", label: "LoRA 触发词", help: "", basic: false },
+  { id: "clip", label: "文本编码器(CLIP)", help: "Flux/Krea/Qwen 等独立 CLIP 的模型才需要", basic: false },
+  { id: "vae", label: "VAE", help: "模型用独立 VAE 时才需要", basic: false },
+  { id: "guidance", label: "引导强度(Flux)", help: "FluxGuidance 之类的节点", basic: false },
 ];
 
 const state = {

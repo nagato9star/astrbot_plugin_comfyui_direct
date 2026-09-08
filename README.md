@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**局域网直连 ComfyUI。保存一套默认画法，对机器人说话就能画；可按画面需求选用 LoRA，也可点名换模、换画幅。**
+**局域网直连 ComfyUI。模型家族负责选择工作流，配方负责复用实验好的 LoRA 与采样参数。**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
@@ -18,9 +18,9 @@
 
 ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的生图插件。
 
-你先在配方工作台里导入 ComfyUI 的图，确认「用户要画的内容」和「出图采样」写到哪，再保存一套默认的底模 / LoRA / 画幅。之后对机器人说「画一个站在街上的女孩」就能出图。
+先在配方工作台导入 ComfyUI 工作流，再到插件配置添加“模型家族”并为它选择工作流。LLM 调用 `comfyui_draw` 时填写模型家族，插件便会走对应工作流自由生图。
 
-用户要求换配方、换底模、竖图横图、画师、画质、步数时，机器人会改对应的项。需要某种画风、角色、服饰或效果时，机器人也可主动查询并选用匹配的已安装 LoRA，**无需用户提供文件名或特意说出「LoRA」**。未覆盖的项沿用配方默认值；节点由配方映射，查询只返回短列表。
+调试出满意的底模、LoRA、画幅和采样参数后，可以另存为配方。`comfyui_recipe_draw` 只需配方名和本次提示词，即可快捷复用整套参数。配方引用模型家族；工作流选择和节点槽位由家族及工作流档案统一管理，因此更换家族工作流无需逐份修改配方。
 
 本插件完全开源免费，欢迎 Issue 和 PR。
 
@@ -28,9 +28,9 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 
 | 功能 | 说明 |
 |:---|:---|
-| **对机器人说话就画** | 只填要画的内容即可使用保存的配方；有需要时可查询并选用 LoRA |
-| **按需调整** | LoRA 可按画面需求选择；配方 / 底模 / 画幅 / 画师 / 画质 / 步数按用户要求调整 |
-| **配方工作台** | 导入图、确认格子、保存一套默认画法，还能试一张 |
+| **按模型家族自由生图** | LLM 填写家族名，插件自动选择工作流；底模、LoRA、画幅和采样参数可自由调整 |
+| **配方快捷生图** | 输入配方名和本次提示词，复用实验好的模型、LoRA 和采样参数 |
+| **配方工作台** | 导入工作流、保存共享槽位映射、编辑配方并试画 |
 | **查一下再画** | 角色、画师、底模、LoRA 不确定时先查短列表；LoRA 支持 style / character 等分类 |
 
 ## 🚀 快速开始
@@ -45,25 +45,36 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 
 在插件配置中确认 `comfyui_host`（默认 `127.0.0.1:8188`，本机）。
 
-### 3. 映射节点并保存配方
+### 3. 添加模型家族
+
+先在「配方工作台」导入工作流 JSON。随后打开插件配置，在“模型家族与工作流”中添加一条记录：
+
+- `name`：暴露给 LLM 的家族名，例如 `anima`、`krea2`、`flux`
+- `workflow`：这个家族使用的工作流
+- `prompt_style`：`danbooru`、`natural` 或 `auto`
+- `description`：适用画面或用途，会随家族清单提供给 LLM
+
+保存配置并重载插件。每个家族名必须唯一；多个家族可以选择同一张工作流。
+
+### 4. 确认槽位并保存配方
 
 打开插件页面「配方工作台」：
 
-1. 在 ComfyUI 里 **Save (API Format)**，把 JSON 导进来（或点「刚画过的」）。
-2. 确认两个必选格子：**用户要画的内容**、**出图采样**。底模 / LoRA / 画幅有就选。双采样工作流会多出一个「第二段采样」，步数若接到外联整数节点也会跟着改。
-3. 填这套默认用的底模、LoRA、竖图还是横图，起个好叫的名字，保存。选 LoRA 时触发词会自动填进文本框。每次出图都会换新种子，除非你明确指定。
+1. 选择模型家族，确认该家族工作流的 **用户要画的内容**、**出图采样** 等槽位。槽位属于工作流，同一工作流的所有配方共用。
+2. 填写实验好的底模、LoRA、画幅和采样参数，起一个配方名并保存。配方文件只记录家族与参数。
+3. 在右侧输入本次提示词试画。每次生成会使用新种子，除非明确指定。
 
 然后就可以对机器人说：
 
 | 你说 | 机器人做什么 |
 |:---|:---|
-| 画一个站在街上的女孩 | 可直接使用默认配方绘图 |
-| 用立绘那套，全身竖图 | 换配方 + 竖图 |
-| 换成喵喵底模，加上 zoda | 按关键词匹配已安装的底模/LoRA，只改这一次 |
+| 用 anima 家族画一个站在街上的女孩 | 自由生图，使用 anima 对应工作流 |
+| 用立绘配方画一个全身女孩 | 快捷复用立绘配方，只写入新提示词 |
+| 用 anima 家族，换成喵喵底模并加上 zoda | 在家族工作流中按本次参数自由生成 |
 | 画成水彩风格 | 可查询风格 LoRA，按用途和模型适用信息选用，并填写已知触发词 |
 | 画师用 xxx | 只改画师 |
 | 精细一点 | 才动步数 |
-| 把这套记住，叫日常 | 把当前底模/LoRA/画幅存成新配方 |
+| 把这次参数记住，叫日常 | 将自由生图的实际底模、LoRA、画幅与采样参数存成新配方 |
 
 配置项 `llm_tool_mode=full` 才会把旧的调试工具暴露给模型。
 
@@ -76,37 +87,18 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 | `comfyui_timeout` | `300` | 生成等待超时（秒） |
 | `model_cache_ttl` | `600` | 模型清单缓存刷新间隔（秒），0 表示每次强制同步 |
 | `lora_manager_enabled` | `true` | 复用 ComfyUI LoRA Manager 的分类、标签、用途说明、推荐权重和触发词；未安装时自动跳过 |
-| `default_workflow` | `anima-v3` | 默认工作流模板名（生成未选配方时的模板入口基底） |
-| `default_recipe` | `默认` | LLM 不指定 recipe 时的默认配方；recipe 与 workflow 是两个独立生成入口 |
-| `llm_tool_mode` | `basic` | `basic` 只暴露 draw/lookup；`full` 打开诊断工具 |
+| `model_families` | `anima → anima-v3` | 可重复添加的家族配置；包含家族名、工作流、提示词风格和说明 |
+| `default_recipe` | `默认` | 用户只说「画一张」时用的配方；在工作台配方列表点「设为默认」自动写入，也可直接填配方名 |
+| `llm_tool_mode` | `basic` | `basic` 暴露自由生图、配方生图和查询；`full` 打开诊断工具 |
 | `allow_llm_unsafe_tools` | `false` | 是否允许 LLM 执行任意工作流、读取本地图片上传、释放显存和删除配方；默认关闭 |
-| `node_slots` | 空 | 下拉框：哪个节点是提示词 / KSampler / 底模 / LoRA / 尺寸。导入工作流后自动刷新，重载插件生效 |
+| `default_workflow` / `node_slots` | 旧版兼容 | `model_families` 为空时使用；新版槽位在配方工作台按工作流保存 |
 | `danbooru_base_url` | `https://danbooru.donmai.us` | danbooru 接口地址（国内可换镜像） |
 | `gelbooru_base_url` | `https://gelbooru.com` | gelbooru DAPI 地址（镜像可换） |
 | `civitai_api_key` | 空 | civitai API Key（可选，以你的身份调用） |
-| `default_artist` / `default_quality` / `default_trigger_words` / `default_negative_prompt` | 空 | 默认画师串/质量词/lora触发词/负向提示词，留空用模板原值 |
-| `default_model` | 空 | 默认底模文件名（可用 `comfyui_list_models` 查看），留空用模板原值 |
-| `default_lora` | `[]` | 默认 LoRA 列表，按顺序映射 Power Lora Loader 插槽 |
-| `default_steps` / `default_cfg` / `default_denoise` | `0` | 默认采样参数，0=用模板原值 |
-| `default_sampler_name` / `default_scheduler` | 空 | 默认采样器/调度器，留空=用模板原值 |
-| `default_width` / `default_height` | `0` | 默认图片尺寸，0=用模板原值 |
-| `prompt_optimize_enabled` | `true` | 启用自然语言优化：中文描述扩展成 Danbooru tags |
-| `prompt_builder_max_tokens` | `1000` | 优化模型输出上限 |
-| `prompt_builder_provider_id` | 空 | 指定优化用模型 provider id；留空使用当前会话主模型 |
-| `prompt_builder_max_content_tags` | `65` | 内容段 tag 数量上限，0 不裁剪 |
-| `prompt_builder_web_search_enabled` | `true` | 指令含"联网/搜索"等词时触发 Tavily 联网搜索 |
-| `prompt_builder_search_max_results` / `prompt_builder_search_depth` | `5` / `advanced` | 搜索结果数量与深度 |
-| `prompt_builder_search_query_template` | `{prompt} 角色 外观 …` | 搜索词模板 |
-| `prompt_builder_deep_thinking_enabled` | `true` | 指令含"深度思考"时启用推理 |
-| `prompt_builder_reasoning_effort` | `high` | 深度思考强度（high / max） |
-| `prompt_builder_template` | 空 | 自定义优化模板，支持多个占位符；留空用内置模板 |
-| `danbooru_core_tag_lookup_enabled` | `true` | 角色 tag 联网校正（Donmai 不可用时回退 Safebooru） |
-| `danbooru_tag_base_urls` | `https://safebooru.donmai.us,https://danbooru.donmai.us` | Donmai 查询地址，逗号分隔 |
-| `danbooru_tag_user_agent` | `AstrBotComfyUIDirect/2.1` | Donmai 访问 UA |
-| `danbooru_tag_lookup_timeout` | `6` | 单次角色 tag 查询超时（秒） |
-| `danbooru_tag_max_candidates` | `6` | 候选 tag 上限 |
+| `animadex_mcp_url` / `animadex_timeout` | `http://127.0.0.1:11451/mcp` / `8.0` | AnimaDex 角色库 MCP 端点与查询超时；不用可忽略 |
+| `default_*` 生成参数 | 旧版兼容 | 新版配置页隐藏；已有值仅用于首次生成默认配方和高级兼容入口，日常参数请保存在配方中 |
 
-**参数优先级**：LLM 传参 > 插件配置默认值 > 模板原值。
+自由生图的参数优先级为本次 LLM 参数 > 工作流原值。配方生图的优先级为本次提示词/种子/画幅方向 > 配方参数 > 工作流原值。
 
 ## 🖼️ 工作流模板
 
@@ -120,15 +112,18 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 
 - `comfyui_models.json`：模型清单缓存
 - `workflows/`：自定义工作流模板
+- `workflow_profiles.json`：按工作流保存的共享节点槽位
+- `recipes/`：只保存模型家族与生成参数的快捷配方
 - `output/`：生成的图片文件
 
 ## 🤖 LLM 工具
 
-默认 `llm_tool_mode=basic` 启用以下两个工具：
+默认 `llm_tool_mode=basic` 启用以下三个工具：
 
 | 工具 | 说明 |
 |:---|:---|
-| `comfyui_draw` | 按配方生图并直接发送；可按画面需求查询、选用 LoRA，支持本次覆盖底模、画幅、画师、采样参数和另存配方 |
+| `comfyui_draw` | 自由生图；必填 `model_family` 和 `prompt`，按家族选择工作流，可自由填写底模、LoRA、尺寸与采样参数，并可另存配方 |
+| `comfyui_recipe_draw` | 快捷配方生图；填写本次 `prompt`，可选 `recipe`、`size` 和 `seed`，其余参数来自配方 |
 | `comfyui_lookup` | 查询角色 / 画师规范词，以及底模 / LoRA 文件名；支持按 LoRA 分类、标签、用途挑选，并返回用途说明、推荐权重和触发词 |
 
 `llm_tool_mode=full` 额外启用以下工具，其中标注为需额外开关的工具还要求 `allow_llm_unsafe_tools=true`：
@@ -136,7 +131,7 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 | 工具 | 说明 |
 |:---|:---|
 | `comfyui_list_models` | 查询可用底模 / LoRA / CLIP / VAE / Embedding；支持 `kind`、`query`、`limit` 筛选，LoRA 显示分类、标签、推荐权重和触发词 |
-| `comfyui_generate` | 按配方或工作流模板生图（两个独立入口：显式 `recipe` 把参数填进配方绑定的基底工作流，显式 `workflow` 按模板生成不套配方，都省略时优先默认配方）；可显式覆盖 model / lora / steps / cfg / sampler / denoise / width / height / seed 等 |
+| `comfyui_generate` | 旧版高级生成入口；保留配方和工作流参数兼容，日常调用优先使用上面的两个明确入口 |
 | `comfyui_interrupt` | 中断生成（`prompt_id` 可选，默认最近一次），可同时取消排队任务 |
 | `comfyui_booru` | 查画师/角色触发词与常用 tag（`source`=danbooru/gelbooru） |
 | `comfyui_civitai_search` | 搜参考图并返回生成配方（模型/prompt/负向/sampler/steps/cfg/seed） |
@@ -149,7 +144,7 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 | `comfyui_nodes` | 搜索节点类或查询节点输入输出结构 |
 | `comfyui_validate_workflow` | 提交前检查工作流节点和必填输入 |
 | `comfyui_models_search` | 按目录搜索已安装的模型文件 |
-| `comfyui_recipe` | 保存、列出、加载配方；保存时绑定基底工作流并继承同工作流的节点映射；删除动作需额外开关 |
+| `comfyui_recipe` | 保存、列出、加载配方；保存时引用模型家族并记录生成参数；删除动作需额外开关 |
 | `comfyui_run_workflow` | 运行指定工作流 JSON 并发送结果，需额外开关 |
 | `comfyui_upload_file` | 上传本地图片至 ComfyUI 的 input 目录，需额外开关 |
 | `comfyui_free_memory` | 请求卸载模型、释放显存，需额外开关 |
@@ -158,7 +153,7 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 
 LoRA 查询示例：`comfyui_lookup(type="lora", query="style")`、`query="character"`、`query="水彩"`。匹配范围包括 LoRA 文件名、LoRA Manager/Civitai 标签、分类和用途说明；机器人可根据画面需求主动查询并选用，文件名以实际查询结果为准。`comfyui_list_models(kind="lora", query="style", limit=10)` 可只返回指定分类，减少 LLM 上下文占用。
 
-`comfyui_draw` 的 `lora` 是字符串：可填文件名、唯一关键词，多个用逗号分隔；指定权重时传 JSON 数组字符串，例如 `"[{\"name\":\"style.safetensors\",\"strength\":0.6}]"`，其中示例文件名需替换成查询结果。`comfyui_generate` 使用同样的 JSON 数组字符串格式。传入列表会覆盖对应 LoRA，要保留的原 LoRA 也需列入；省略时沿用默认值。
+`comfyui_draw` 的 `lora` 是字符串：可填文件名、唯一关键词，多个用逗号分隔；指定权重时传 JSON 数组字符串，例如 `"[{\"name\":\"style.safetensors\",\"strength\":0.6}]"`，其中示例文件名需替换成查询结果。传入列表会覆盖工作流中的 LoRA，要保留的原 LoRA 也需列入；省略时沿用工作流原值。
 
 选用 LoRA 时，可将查询返回的已知触发词同步填入 `trigger_words`，保留原词格式，无需用户再次提出。查询未提供触发词时可省略该字段并继续使用 LoRA。插件的绘图工具仍由调用方显式填写触发词；工作台选 LoRA 后自动填充文本框的行为保持不变。
 
@@ -166,13 +161,14 @@ LoRA 查询示例：`comfyui_lookup(type="lora", query="style")`、`query="chara
 
 AstrBot Dashboard → 插件页 → **Workflow Studio**，复刻 ComfyUI 风格的节点画布：
 
-- 可视化编辑/管理工作流模板：加载、保存、另存为、删除
-- 节点画布：拖拽节点、滚轮缩放、空白平移、拖端口连线、双击标题改名、右键复制/删除
-- 节点库：一键添加 CR Prompt Text / JoinStringMulti / KSampler / Power LoRA 等节点
+- 导入和管理工作流模板，并按工作流保存共享槽位映射
+- 从已配置的模型家族中选择配方适用范围
+- 编辑底模、LoRA、画幅与采样参数，直接试跑并从历史另存配方
+- 配方列表一键「设为默认」，机器人只说「画一张」时即用这套
 - 模型选择：UNET / LoRA / CLIP / VAE 下拉来自自动同步清单
 - 连接状态灯 + 模型清单侧栏 + 「▶ 试跑」：直接提交画布生成，结果内联预览，可一键中断
 
-后端接口（`webapi.py`，Quart）：`workflows` / `workflow` / `workflow/save` / `workflow/delete` / `status` / `generate`。
+后端接口（`webapi.py`）：`workflows` / `workflow` / `workflow/profile` / `workflow/delete` / `recipes` / `recipe/save` / `status` / `generate`。
 
 ## ⚠️ 注意事项
 

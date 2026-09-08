@@ -12,6 +12,7 @@ from typing import Any
 from astrbot.api import logger
 
 from comfy_client import ComfyUIClient, safe_output_path
+from model_families import ModelFamilyRegistry, WorkflowProfileStore
 from recipe_store import RecipeStore, materialize_values, recipe_template
 from slot_mapping import (
     SLOT_BASIC,
@@ -97,7 +98,11 @@ class StudioApi:
         output_dir: Path,
         shared: dict,
         draw_tool: Any = None,
+        recipe_draw_tool: Any = None,
+        families: ModelFamilyRegistry | None = None,
+        profiles: WorkflowProfileStore | None = None,
         config_defaults: dict | None = None,
+        plugin_config: Any = None,
     ) -> None:
         self.client = client
         self.builder = builder
@@ -105,11 +110,18 @@ class StudioApi:
         self.output_dir = output_dir
         self.shared = shared
         self.draw_tool = draw_tool
+        self.recipe_draw_tool = recipe_draw_tool
+        self.families = families
+        self.profiles = profiles
         self.config_defaults = config_defaults or {}
+        # AstrBotConfig（或测试用的 dict）：供「设为默认配方」直接写配置
+        self.plugin_config = plugin_config if isinstance(plugin_config, dict) else {}
 
     def _refresh_draw_schema(self) -> None:
         if self.draw_tool is not None and hasattr(self.draw_tool, "refresh_schema"):
             self.draw_tool.refresh_schema()
+        if self.recipe_draw_tool is not None and hasattr(self.recipe_draw_tool, "refresh_schema"):
+            self.recipe_draw_tool.refresh_schema()
 
     async def status(self) -> Any:
         connected = await self.client.ping(timeout=5.0)
@@ -133,6 +145,7 @@ class StudioApi:
                 "sampler_names": SAMPLER_NAMES,
                 "schedulers": SCHEDULERS,
                 "default_workflow": self.builder.default_workflow,
+                "model_families": self.families.list() if self.families else [],
                 "slot_roles": [
                     {
                         "id": r,
@@ -150,6 +163,12 @@ class StudioApi:
 
     def _workflow_payload(self, name: str, wf: dict) -> dict:
         detected = detect_slots(wf)
+        profile = (
+            self.profiles.effective(name, wf)
+            if self.profiles is not None
+            else {"slots": detected, "drop_nodes": []}
+        )
+        selected = profile.get("slots") or detected
         return {
             "ok": True,
             "name": name,
@@ -157,8 +176,10 @@ class StudioApi:
             "workflow": wf,
             "nodes": list_nodes(wf),
             "detected_slots": detected,
+            "profile_slots": selected,
+            "drop_nodes": profile.get("drop_nodes") or [],
             "slot_options": {
-                role: node_options_for_slot(wf, role, str((detected.get(role) or {}).get("node") or ""))
+                role: node_options_for_slot(wf, role, str((selected.get(role) or {}).get("node") or ""))
                 for role, _ in SLOT_ROLES
             },
         }
@@ -205,8 +226,11 @@ class StudioApi:
         except ValueError as e:
             return _json({"ok": False, "error": str(e)})
         payload = self._workflow_payload(name, wf)
-        if not self.store.list():
-            self.store.bootstrap(workflow_name=name, wf=wf)
+        family = self.families.by_workflow(name) if self.families else None
+        if self.profiles is not None:
+            self.profiles.ensure(name, wf)
+        if not self.store.list() and family is not None:
+            self.store.bootstrap(workflow_name=name, wf=wf, family=family.name)
             self._refresh_draw_schema()
         return _json(payload)
 
@@ -224,6 +248,8 @@ class StudioApi:
             self.builder.save_template(name, wf)
         except ValueError as e:
             return _json({"ok": False, "error": str(e)})
+        if self.profiles is not None:
+            self.profiles.ensure(name, wf)
         return _json(self._workflow_payload(name, wf))
 
     async def comfy_history(self) -> Any:
@@ -244,8 +270,14 @@ class StudioApi:
         name = str(body.get("name") or "").strip()
         if not name:
             return _json({"ok": False, "error": "缺少 name"})
-        # 引用完整性：还有配方绑在这套模板上就不许删，避免留下悬空引用
+        # 引用完整性：家族配置或旧配方仍引用时拒绝删除。
         refs = self.store.used_templates().get(name) or []
+        family_refs = (
+            self.families.workflow_references().get(name) or []
+            if self.families is not None
+            else []
+        )
+        refs.extend(f"模型家族:{family}" for family in family_refs)
         if refs:
             return _json(
                 {
@@ -258,6 +290,8 @@ class StudioApi:
             self.builder.delete_template(name)
         except ValueError as e:
             return _json({"ok": False, "error": str(e)})
+        if self.profiles is not None:
+            self.profiles.delete(name)
         return _json({"ok": True, "name": name})
 
     async def detect(self) -> Any:
@@ -283,17 +317,68 @@ class StudioApi:
             }
         )
 
+    async def save_workflow_profile(self) -> Any:
+        body = await _body()
+        name = str(body.get("workflow") or body.get("name") or "").strip()
+        if not name:
+            return _json({"ok": False, "error": "缺少 workflow"})
+        if self.profiles is None:
+            return _json({"ok": False, "error": "工作流档案未初始化"})
+        try:
+            wf = self.builder.load_template(name)
+        except FileNotFoundError as e:
+            return _json({"ok": False, "error": str(e)})
+        slots = body.get("slots")
+        if not isinstance(slots, dict):
+            return _json({"ok": False, "error": "slots 必须是对象"})
+        try:
+            saved = self.profiles.save(
+                name,
+                slots,
+                body.get("drop_nodes")
+                or (ANIMA_DROP_NODES if looks_like_anima(wf) else []),
+            )
+        except ValueError as e:
+            return _json({"ok": False, "error": str(e)})
+        return _json({"ok": True, "profile": saved})
+
     async def list_recipes(self) -> Any:
-        return _json({"ok": True, "recipes": self.store.list()})
+        return _json(
+            {
+                "ok": True,
+                "recipes": self.store.list(),
+                "default_recipe": self._configured_default_recipe(),
+            }
+        )
+
+    def _configured_default_recipe(self) -> str:
+        return str(self.plugin_config.get("default_recipe") or "").strip()
+
+    async def set_default_recipe(self) -> Any:
+        body = await _body()
+        name = str(body.get("name") or "").strip()
+        if not name:
+            return _json({"ok": False, "error": "缺少 name"})
+        if self.store.get(name) is None:
+            return _json({"ok": False, "error": f"配方不存在: {name}"})
+        self.plugin_config["default_recipe"] = name
+        save = getattr(self.plugin_config, "save_config", None)
+        if callable(save):
+            save()
+        # 运行中的 store 立即生效，不等插件重载
+        self.store.preferred_default = name
+        self._refresh_draw_schema()
+        return _json({"ok": True, "default_recipe": name})
 
     async def get_recipe(self) -> Any:
         name = _query("name").strip()
         recipe = self.store.get(name) if name else self.store.default()
         if recipe is None:
             return _json({"ok": False, "error": "配方不存在"})
+        family = self.families.resolve_recipe(recipe) if self.families else None
         wf = None
         slot_options = {}
-        tname = recipe_template(recipe)
+        tname = family.workflow if family is not None else recipe_template(recipe)
         missing = ""
         if tname:
             try:
@@ -302,16 +387,33 @@ class StudioApi:
                 # 模板被删了不再装没事：明确告诉前端配方引用悬空
                 missing = tname
         if wf is not None:
+            if family is not None and self.profiles is not None:
+                profile = self.profiles.effective(tname, wf)
+                slots = profile.get("slots") or {}
+                drop_nodes = profile.get("drop_nodes") or []
+            else:
+                slots = recipe.get("slots") or detect_slots(wf)
+                drop_nodes = recipe.get("drop_nodes") or []
             slot_options = {
                 role: node_options_for_slot(
-                    wf, role, str((recipe.get("slots") or {}).get(role, {}).get("node") or "")
+                    wf, role, str((slots.get(role) or {}).get("node") or "")
                 )
                 for role, _ in SLOT_ROLES
             }
+        else:
+            slots = recipe.get("slots") or {}
+            drop_nodes = recipe.get("drop_nodes") or []
+        payload = dict(recipe)
+        if family is not None:
+            payload["family"] = family.name
         return _json(
             {
                 "ok": True,
-                "recipe": recipe,
+                "recipe": payload,
+                "resolved_family": family.public() if family is not None else None,
+                "resolved_workflow": tname,
+                "profile_slots": slots,
+                "drop_nodes": drop_nodes,
                 "slot_options": slot_options,
                 "nodes": list_nodes(wf) if wf else [],
                 "template_missing": missing,
@@ -320,6 +422,17 @@ class StudioApi:
 
     async def save_recipe(self) -> Any:
         body = await _body()
+        family_name = str(body.get("family") or body.get("model_family") or "").strip()
+        family = self.families.get(family_name) if self.families is not None else None
+        if family is None:
+            available = "、".join(self.families.names()) if self.families else "无"
+            return _json(
+                {
+                    "ok": False,
+                    "error": f"请选择已配置的模型家族。当前可用：{available}",
+                }
+            )
+        body["family"] = family.name
         slots = body.get("slots")
         if isinstance(slots, dict):
             normalized = {}
@@ -335,6 +448,17 @@ class StudioApi:
             body["slots"] = normalized
         if body.get("from_config"):
             body["slots"] = merge_slots(body.get("slots") or {}, slots_from_config(body.get("node_slots")))
+        profile_slots = body.get("profile_slots") or body.get("slots")
+        if isinstance(profile_slots, dict) and self.profiles is not None:
+            try:
+                self.builder.load_template(family.workflow)
+                self.profiles.save(
+                    family.workflow,
+                    profile_slots,
+                    body.get("drop_nodes") or [],
+                )
+            except (FileNotFoundError, ValueError) as e:
+                return _json({"ok": False, "error": str(e)})
         try:
             saved = self.store.save(body)
         except ValueError as e:
@@ -361,9 +485,39 @@ class StudioApi:
         recipe = self.store.get(recipe_name) if recipe_name else self.store.default()
         if recipe is None:
             return _json({"ok": False, "error": "还没有配方，请先导入工作流并保存配方"})
-        slots = recipe.get("slots") or {}
+        family = self.families.resolve_recipe(recipe) if self.families else None
+        explicit_family = str(recipe.get("family") or "").strip()
+        has_legacy_route = bool(
+            recipe_template(recipe) and (recipe.get("slots") or {}).get("prompt")
+        )
+        if explicit_family and family is None and not has_legacy_route:
+            return _json(
+                {
+                    "ok": False,
+                    "error": f"配方引用的模型家族「{explicit_family}」未配置",
+                }
+            )
+        tname = family.workflow if family is not None else recipe_template(recipe)
+        if not tname:
+            return _json({"ok": False, "error": "配方没有模型家族，请重新保存配方"})
+        try:
+            wf = self.builder.load_template(tname)
+        except FileNotFoundError:
+            return _json(
+                {
+                    "ok": False,
+                    "error": f"模型家族使用的工作流「{tname}」不存在，请检查配置",
+                }
+            )
+        if family is not None and self.profiles is not None:
+            profile = self.profiles.effective(tname, wf)
+            slots = profile.get("slots") or {}
+            drop_nodes = list(profile.get("drop_nodes") or [])
+        else:
+            slots = recipe.get("slots") or detect_slots(wf)
+            drop_nodes = list(recipe.get("drop_nodes") or [])
         if not slots.get("prompt"):
-            return _json({"ok": False, "error": "配方未指定主提示词节点"})
+            return _json({"ok": False, "error": f"工作流「{tname}」未指定主提示词节点"})
 
         seed = body.get("seed")
         if seed is None:
@@ -375,7 +529,7 @@ class StudioApi:
         if not 0 <= seed <= 2**63 - 1:
             return _json({"ok": False, "error": "seed 超出允许范围（0 ~ 2^63-1）"})
         defaults = recipe.get("defaults") or {}
-        loras = body.get("loras") or body.get("lora")
+        loras = body.get("loras") if "loras" in body else body.get("lora")
         trigger = body.get("trigger_words")
         if not trigger:
             if loras:
@@ -407,7 +561,7 @@ class StudioApi:
         }
         values = materialize_values(recipe, overrides)
         values["seed"] = seed
-        # 与机器人路径保持一致：配方没配的项补插件配置默认值（画师/画质/负向等）
+        # 与机器人 comfyui_generate 保持一致：配方没配的项补插件配置默认值（画师/画质/负向等）
         for key, val in self.config_defaults.items():
             if key not in values and val not in (None, "", 0, 0.0, []):
                 values["negative" if key == "negative_prompt" else key] = val
@@ -418,24 +572,12 @@ class StudioApi:
                 str(body.get("size")),
                 presets=recipe.get("size_presets"),
             )
-        tname = recipe_template(recipe)
-        if not tname:
-            return _json({"ok": False, "error": "配方没有绑定工作流模板，请先在编辑页选择模板并保存"})
-        try:
-            wf = self.builder.load_template(tname)
-        except FileNotFoundError as e:
-            return _json(
-                {
-                    "ok": False,
-                    "error": f"配方绑定的模板「{tname}」不存在（可能已被删除）。请换绑模板或删除该配方。",
-                }
-            )
         apply_slots(
             wf,
             slots,
             values,
             prefix=f"astrbot_{uuid.uuid4().hex[:8]}",
-            drop_nodes=list(recipe.get("drop_nodes") or (ANIMA_DROP_NODES if looks_like_anima(wf) else [])),
+            drop_nodes=drop_nodes,
         )
         pid, err = await self.client.submit_prompt_detail(wf)
         if err:
@@ -447,6 +589,10 @@ class StudioApi:
                 for k in ("model", "loras", "width", "height", "steps", "cfg", "sampler_name", "scheduler", "denoise", "trigger_words", "seed")
             },
             "recipe": recipe,
+            "family": family.name if family is not None else explicit_family,
+            "workflow": tname,
+            "slots": slots,
+            "drop_nodes": drop_nodes,
             "prompt": prompt,
         }
         # 防止浏览器一直提交试跑导致内存中的任务元数据无限增长。
@@ -491,14 +637,19 @@ class StudioApi:
         self.store.save_history(
             {
                 "prompt_id": pid,
+                "entry": "recipe",
+                "family": pending.get("family") or recipe.get("family") or "",
                 "recipe": recipe.get("name"),
                 "recipe_id": recipe.get("id"),
-                "template": recipe_template(recipe),
-                "workflow": recipe_template(recipe),
-                "slots": recipe.get("slots") or {},
-                "drop_nodes": recipe.get("drop_nodes") or [],
+                "workflow": pending.get("workflow") or recipe_template(recipe),
+                "slots": pending.get("slots") or recipe.get("slots") or {},
+                "drop_nodes": pending.get("drop_nodes") or recipe.get("drop_nodes") or [],
                 "prompt": pending.get("prompt") or "",
-                "values": {k: v for k, v in values.items() if v not in (None, "", [])},
+                "values": {
+                    k: v
+                    for k, v in values.items()
+                    if v not in (None, "") and (v != [] or k == "loras")
+                },
                 "filename": img["filename"],
                 "local_path": str(local_path),
             }
@@ -544,7 +695,11 @@ def register_web_apis(
     output_dir: Path | None = None,
     shared: dict | None = None,
     draw_tool: Any = None,
+    recipe_draw_tool: Any = None,
+    families: ModelFamilyRegistry | None = None,
+    profiles: WorkflowProfileStore | None = None,
     config_defaults: dict | None = None,
+    plugin_config: Any = None,
 ) -> None:
     if store is None or output_dir is None:
         logger.error("[ComfyUIDirect] WebUI 缺少 recipe store，跳过注册")
@@ -556,7 +711,11 @@ def register_web_apis(
         output_dir,
         shared if shared is not None else {},
         draw_tool,
+        recipe_draw_tool,
+        families,
+        profiles,
         config_defaults=config_defaults,
+        plugin_config=plugin_config,
     )
     routes = [
         ("/status", api.status, ["GET"], "ComfyUI 状态"),
@@ -566,11 +725,13 @@ def register_web_apis(
         ("/workflow/import-history", api.import_from_history, ["POST"], "从 ComfyUI 历史导入"),
         ("/workflow/delete", api.delete_workflow, ["POST"], "删除工作流"),
         ("/workflow/detect", api.detect, ["POST"], "检测槽位"),
+        ("/workflow/profile", api.save_workflow_profile, ["POST"], "保存工作流槽位档案"),
         ("/comfy-history", api.comfy_history, ["GET"], "ComfyUI 历史"),
         ("/recipes", api.list_recipes, ["GET"], "列出配方"),
         ("/recipe", api.get_recipe, ["GET"], "获取配方"),
         ("/recipe/save", api.save_recipe, ["POST"], "保存配方"),
         ("/recipe/delete", api.delete_recipe, ["POST"], "删除配方"),
+        ("/recipe/default", api.set_default_recipe, ["POST"], "设为默认配方"),
         ("/recipe/from-history", api.recipe_from_history, ["POST"], "历史存成配方"),
         ("/generate", api.generate, ["POST"], "按配方试跑"),
         ("/generate", api.generate_poll, ["GET"], "轮询试跑结果"),

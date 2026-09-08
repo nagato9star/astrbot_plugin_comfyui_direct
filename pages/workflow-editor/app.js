@@ -16,13 +16,18 @@ const SLOT_FALLBACK = [
 const state = {
   connected: false,
   templates: [],
+  families: [],
   recipes: [],
+  defaultRecipe: "",
   slotRoles: SLOT_FALLBACK,
   slotOptions: {},
   resources: { unet_name: [], lora_name: [] },
   samplers: ["er_sde", "euler", "dpmpp_2m"],
   schedulers: ["normal", "karras", "simple"],
   recipe: emptyRecipe(),
+  activeWorkflow: "",
+  profileSlots: {},
+  profileDropNodes: [],
   history: [],
   runningPid: "",
 };
@@ -32,10 +37,8 @@ function emptyRecipe() {
     id: "",
     name: "",
     description: "",
-    workflow: "",
-    slots: {},
+    family: "",
     defaults: { loras: [] },
-    drop_nodes: [],
   };
 }
 
@@ -97,8 +100,13 @@ function escapeAttr(s) {
   return escapeHtml(s).replace(/"/g, "&quot;");
 }
 
+function familyByName(name) {
+  const wanted = String(name || "").toLocaleLowerCase();
+  return state.families.find((item) => String(item.name || "").toLocaleLowerCase() === wanted) || null;
+}
+
 function slotNode(role) {
-  const spec = state.recipe.slots?.[role];
+  const spec = state.profileSlots?.[role];
   if (!spec) return "";
   if (typeof spec === "string") return spec;
   return spec.node || "";
@@ -133,10 +141,10 @@ function renderSlotSelect(role, parent) {
     }
   }
   sel.addEventListener("change", () => {
-    state.recipe.slots = state.recipe.slots || {};
+    state.profileSlots = state.profileSlots || {};
     const v = sel.value;
-    if (!v) delete state.recipe.slots[role.id];
-    else state.recipe.slots[role.id] = { node: v };
+    if (!v) delete state.profileSlots[role.id];
+    else state.profileSlots[role.id] = { node: v };
   });
   label.append(span, sel);
   parent.appendChild(label);
@@ -151,7 +159,7 @@ function renderSlots() {
     renderSlotSelect(role, role.basic === false ? extra || basic : basic);
   }
   const guide = $("#empty-guide");
-  if (guide) guide.classList.toggle("hidden", !!(state.recipe.workflow || state.templates.length));
+  if (guide) guide.classList.toggle("hidden", !!(state.activeWorkflow || state.templates.length));
 }
 
 function loraTriggerWords(name) {
@@ -228,14 +236,14 @@ function renderLists() {
   wfBox.innerHTML = "";
   for (const t of state.templates) {
     const li = document.createElement("li");
-    li.className = t.name === state.recipe.workflow ? "active" : "";
+    li.className = t.name === state.activeWorkflow ? "active" : "";
     const src = t.source === "custom" ? "已导入" : (t.source || "");
     li.innerHTML = `<strong>${escapeHtml(t.name)}</strong><span class="meta">${escapeHtml(src)} · ${t.node_count || "?"} 个格子</span>`;
     li.addEventListener("click", () => bindWorkflow(t.name));
     const del = document.createElement("button");
     del.className = "wf-del";
     del.textContent = "×";
-    del.title = "删除这张模板（还有配方绑着它时会被拒绝）";
+    del.title = "删除这张模板（模型家族或旧配方仍引用时会被拒绝）";
     del.addEventListener("click", (e) => {
       e.stopPropagation();
       deleteTemplate(t.name);
@@ -247,14 +255,33 @@ function renderLists() {
   rBox.innerHTML = "";
   for (const r of state.recipes) {
     const li = document.createElement("li");
+    const isDefault = !!state.defaultRecipe && r.name === state.defaultRecipe;
     li.className = r.id === state.recipe.id ? "active" : "";
     const size = r.width && r.height ? `${r.width}×${r.height}` : "";
-    li.innerHTML = `<strong>${escapeHtml(r.name)}</strong><span class="meta">模板 ${escapeHtml(r.template || r.workflow || "未绑定")} ${size}</span>`;
+    li.innerHTML = `<strong>${escapeHtml(r.name)}${isDefault ? ' <span class="default-tag">默认</span>' : ""}</strong><span class="meta">家族 ${escapeHtml(r.family || "待迁移")} ${size}</span>`;
+    if (!isDefault) {
+      const def = document.createElement("button");
+      def.className = "wf-del recipe-default";
+      def.textContent = "设为默认";
+      def.title = "用户只说「画一张」时使用这套配方";
+      def.addEventListener("click", (e) => {
+        e.stopPropagation();
+        setDefaultRecipe(r.name);
+      });
+      li.appendChild(def);
+    }
     li.addEventListener("click", () => loadRecipe(r.id || r.name));
     rBox.appendChild(li);
   }
-  const wfSel = $("#recipe-workflow");
-  fillSelect(wfSel, state.templates.map((t) => t.name), state.recipe.workflow, [""]);
+  const familySel = $("#recipe-family");
+  fillSelect(familySel, state.families.map((item) => item.name), state.recipe.family, [""]);
+  const family = familyByName(state.recipe.family);
+  const hint = $("#family-workflow-hint");
+  if (hint) {
+    hint.textContent = family
+      ? `工作流：${family.workflow} · 提示词：${family.prompt_style || "auto"}`
+      : "请先在插件配置中添加模型家族并选择工作流";
+  }
 }
 
 function renderDefaults() {
@@ -282,7 +309,7 @@ function renderHistory() {
   for (const item of state.history) {
     const li = document.createElement("li");
     const vals = item.values || {};
-    li.innerHTML = `<div>${escapeHtml(item.recipe || "未命名")} · ${vals.width || "?"}×${vals.height || "?"}</div>
+    li.innerHTML = `<div>${escapeHtml(item.recipe || item.family || "未命名")} · ${vals.width || "?"}×${vals.height || "?"}</div>
       <div class="meta">${escapeHtml((item.prompt || "").slice(0, 80))}</div>`;
     const btn = document.createElement("button");
     btn.type = "button";
@@ -308,7 +335,7 @@ function readFormIntoRecipe() {
   state.recipe.defaults = d;
   state.recipe.name = $("#recipe-name").value.trim();
   state.recipe.description = $("#recipe-desc").value.trim();
-  state.recipe.workflow = $("#recipe-workflow").value;
+  state.recipe.family = $("#recipe-family").value;
 }
 
 function numOrEmpty(v) {
@@ -317,13 +344,15 @@ function numOrEmpty(v) {
   return Number.isFinite(n) ? n : undefined;
 }
 
-function applyRecipeToForm(recipe) {
+function applyRecipeToForm(recipe, resolved = {}) {
   state.recipe = {
     ...emptyRecipe(),
     ...recipe,
-    slots: recipe.slots || {},
     defaults: { loras: [], ...(recipe.defaults || {}) },
   };
+  if (resolved.workflow !== undefined) state.activeWorkflow = resolved.workflow || "";
+  if (resolved.slots !== undefined) state.profileSlots = resolved.slots || {};
+  if (resolved.dropNodes !== undefined) state.profileDropNodes = resolved.dropNodes || [];
   $("#recipe-name").value = state.recipe.name || "";
   $("#recipe-desc").value = state.recipe.description || "";
   renderLists();
@@ -340,6 +369,7 @@ async function refreshStatus() {
   }
   state.connected = !!res.connected;
   state.resources = res.resources || state.resources;
+  state.families = res.model_families || state.families;
   if (res.sampler_names) state.samplers = res.sampler_names;
   if (res.schedulers) state.schedulers = res.schedulers;
   if (res.slot_roles) state.slotRoles = res.slot_roles;
@@ -362,9 +392,25 @@ async function loadLists() {
   ]);
   state.templates = (wfs && wfs.templates) || [];
   state.recipes = (recs && recs.recipes) || [];
+  state.defaultRecipe = String((recs && recs.default_recipe) || "").trim();
   state.history = (hist && hist.items) || [];
   renderLists();
   renderHistory();
+}
+
+async function setDefaultRecipe(name) {
+  try {
+    const res = await apiPost("recipe/default", { name });
+    if (!res || !res.ok) {
+      toast(res?.error || "设置默认配方失败", true);
+      return;
+    }
+    state.defaultRecipe = String(res.default_recipe || name).trim();
+    toast(`已把「${state.defaultRecipe}」设为默认配方`);
+    renderLists();
+  } catch (e) {
+    toast(`设置默认配方失败: ${e}`, true);
+  }
 }
 
 async function bindWorkflow(name) {
@@ -374,16 +420,13 @@ async function bindWorkflow(name) {
     return;
   }
   state.slotOptions = res.slot_options || {};
-  // 换了工作流就重置映射和默认值：旧模板的节点号对新模板毫无意义，
-  // 残留下来会拼出"新模板+旧节点号"的杂交配方（LoRA 写不进去还不报错）。
-  const switched = state.recipe.workflow !== name;
-  state.recipe.workflow = name;
-  if (switched) {
-    toast(`已切换到模板「${name}」，槽位映射按它重新检测`);
-    state.recipe.slots = res.detected_slots || {};
-  } else if (res.detected_slots) {
-    state.recipe.slots = { ...res.detected_slots, ...state.recipe.slots };
-  }
+  const switched = state.activeWorkflow !== name;
+  state.activeWorkflow = name;
+  state.profileSlots = res.profile_slots || res.detected_slots || {};
+  state.profileDropNodes = res.drop_nodes || [];
+  const matchedFamily = state.families.find((item) => item.workflow === name);
+  if (!state.recipe.family && matchedFamily) state.recipe.family = matchedFamily.name;
+  if (switched) toast(`已打开工作流「${name}」的共享槽位`);
   if (switched) {
     const detect = await apiPost("workflow/detect", { name });
     if (detect && detect.ok && detect.values) {
@@ -396,7 +439,6 @@ async function bindWorkflow(name) {
       state.recipe.defaults = { loras: [], ...detect.values, ...state.recipe.defaults };
     }
   }
-  $("#recipe-workflow").value = name;
   renderLists();
   renderSlots();
   renderDefaults();
@@ -409,23 +451,27 @@ async function loadRecipe(name) {
     return;
   }
   if (res.template_missing) {
-    toast(`配方绑定的模板「${res.template_missing}」不存在了，请在左边重新选一张模板并保存`, true);
+    toast(`模型家族配置的工作流「${res.template_missing}」不存在，请检查配置`, true);
   }
   state.slotOptions = res.slot_options || {};
-  applyRecipeToForm(res.recipe);
+  applyRecipeToForm(res.recipe, {
+    workflow: res.resolved_workflow || "",
+    slots: res.profile_slots || {},
+    dropNodes: res.drop_nodes || [],
+  });
 }
 
 async function deleteTemplate(name) {
-  if (!confirm(`删除模板「${name}」？有配方绑着它时会删不掉。`)) return;
+  if (!confirm(`删除模板「${name}」？模型家族或旧配方仍引用时会被拒绝。`)) return;
   const res = await apiPost("workflow/delete", { name });
   if (!res || !res.ok) {
     toast(res?.error || "删除失败", true);
     return;
   }
   toast(`模板「${name}」已删除`);
-  if (state.recipe.workflow === name) {
-    state.recipe.workflow = "";
-    state.recipe.slots = {};
+  if (state.activeWorkflow === name) {
+    state.activeWorkflow = "";
+    state.profileSlots = {};
     state.slotOptions = {};
     renderSlots();
   }
@@ -438,22 +484,40 @@ async function saveRecipe() {
     toast("先给这套起个名字，比如「立绘」", true);
     return false;
   }
-  if (!state.recipe.workflow) {
-    toast("先在左边导入或点选一张工作流图", true);
+  if (!state.recipe.family) {
+    toast("先选择模型家族；家族在插件配置中添加", true);
+    return false;
+  }
+  const family = familyByName(state.recipe.family);
+  if (!family) {
+    toast("当前家族没有配置，请重载插件配置", true);
+    return false;
+  }
+  if (!state.activeWorkflow || state.activeWorkflow !== family.workflow) {
+    toast(`当前家族应使用工作流「${family.workflow}」，请先确认该工作流`, true);
     return false;
   }
   if (!slotNode("prompt") || !slotNode("sampler")) {
     toast("请确认「用户要画的内容」和「出图采样」两个格子", true);
     return false;
   }
-  const res = await apiPost("recipe/save", state.recipe);
+  const res = await apiPost("recipe/save", {
+    ...state.recipe,
+    family: family.name,
+    profile_slots: state.profileSlots,
+    drop_nodes: state.profileDropNodes,
+  });
   if (!res || !res.ok) {
     toast(res?.error || "保存失败", true);
     return false;
   }
   toast("这套已经记住了");
   await loadLists();
-  applyRecipeToForm(res.recipe);
+  applyRecipeToForm(res.recipe, {
+    workflow: state.activeWorkflow,
+    slots: state.profileSlots,
+    dropNodes: state.profileDropNodes,
+  });
   return true;
 }
 
@@ -463,7 +527,7 @@ async function importFile(file) {
   try {
     data = JSON.parse(text);
   } catch (e) {
-    toast("不是有效 JSON", true);
+    toast("JSON 格式无效", true);
     return;
   }
   const name = file.name.replace(/\.json$/i, "").replace(/[^A-Za-z0-9_\u4e00-\u9fff-]/g, "_") || "imported";
@@ -474,15 +538,25 @@ async function importFile(file) {
   }
   toast(`已导入 ${name}`);
   state.slotOptions = res.slot_options || {};
-  state.recipe.workflow = name;
-  state.recipe.slots = res.detected_slots || {};
+  state.activeWorkflow = name;
+  state.profileSlots = res.profile_slots || res.detected_slots || {};
+  state.profileDropNodes = res.drop_nodes || [];
   await loadLists();
   const detect = await apiPost("workflow/detect", { name });
   if (detect && detect.ok) {
     state.recipe.defaults = { loras: [], ...(detect.values || {}) };
   }
   if (!state.recipe.name) state.recipe.name = name;
-  applyRecipeToForm(state.recipe);
+  const matchedFamily = state.families.find((item) => item.workflow === name);
+  if (matchedFamily) state.recipe.family = matchedFamily.name;
+  applyRecipeToForm(state.recipe, {
+    workflow: name,
+    slots: state.profileSlots,
+    dropNodes: state.profileDropNodes,
+  });
+  if (!matchedFamily) {
+    toast(`工作流已导入；请到插件配置添加模型家族并选择「${name}」，随后重载插件`, true);
+  }
 }
 
 async function importFromComfy() {
@@ -501,9 +575,9 @@ async function importFromComfy() {
   toast("已从 ComfyUI 历史导入");
   await loadLists();
   state.slotOptions = res.slot_options || {};
-  state.recipe.workflow = res.name;
-  state.recipe.slots = res.detected_slots || {};
-  applyRecipeToForm(state.recipe);
+  state.activeWorkflow = res.name;
+  state.profileSlots = res.profile_slots || res.detected_slots || {};
+  state.profileDropNodes = res.drop_nodes || [];
   await bindWorkflow(res.name);
 }
 
@@ -569,19 +643,30 @@ async function saveHistoryAsRecipe(item) {
   }
   toast("已经存成一套新配方");
   await loadLists();
-  applyRecipeToForm(res.recipe);
+  await loadRecipe(res.recipe.id || res.recipe.name);
+}
+
+async function newRecipe() {
+  const recipe = emptyRecipe();
+  const family = state.families[0] || null;
+  if (family) recipe.family = family.name;
+  state.activeWorkflow = "";
+  state.profileSlots = {};
+  state.profileDropNodes = [];
+  applyRecipeToForm(recipe);
+  if (family) await bindWorkflow(family.workflow);
 }
 
 function bindUi() {
   $("#btn-refresh").addEventListener("click", () => refreshStatus().catch((e) => toast(String(e), true)));
   $("#btn-save").addEventListener("click", () => saveRecipe().catch((e) => toast(String(e), true)));
-  $("#btn-new-recipe").addEventListener("click", () => applyRecipeToForm(emptyRecipe()));
+  $("#btn-new-recipe").addEventListener("click", () => newRecipe().catch((e) => toast(String(e), true)));
   $("#btn-delete-recipe").addEventListener("click", async () => {
     if (!state.recipe.name) return;
     if (!confirm(`删掉「${state.recipe.name}」这套？`)) return;
     const res = await apiPost("recipe/delete", { id: state.recipe.id || "", name: state.recipe.name });
     if (!res || !res.ok) return toast(res?.error || "删除失败", true);
-    applyRecipeToForm(emptyRecipe());
+    await newRecipe();
     await loadLists();
   });
   $("#file-import").addEventListener("change", (e) => {
@@ -607,8 +692,11 @@ function bindUi() {
     await apiPost("generate/interrupt", { prompt_id: state.runningPid });
     toast("已请求中断");
   });
-  $("#recipe-workflow").addEventListener("change", () => {
-    if ($("#recipe-workflow").value) bindWorkflow($("#recipe-workflow").value);
+  $("#recipe-family").addEventListener("change", () => {
+    state.recipe.family = $("#recipe-family").value;
+    const family = familyByName(state.recipe.family);
+    if (family) bindWorkflow(family.workflow).catch((e) => toast(String(e), true));
+    else renderLists();
   });
   document.querySelectorAll(".size-presets button").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -637,6 +725,7 @@ async function main() {
     await refreshStatus();
     await loadLists();
     if (state.recipes.length) await loadRecipe(state.recipes[0].id || state.recipes[0].name);
+    else if (state.families.length) await newRecipe();
     else if (state.templates.length) await bindWorkflow(state.templates[0].name);
   } catch (e) {
     toast(String(e), true);

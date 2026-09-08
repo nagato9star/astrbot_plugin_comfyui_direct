@@ -25,14 +25,14 @@ _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
-from astrbot.api import AstrBotConfig, logger
-from astrbot.api.star import Context, Star, register
-from astrbot.core.star.star_tools import StarTools
+from astrbot.api import AstrBotConfig, logger  # noqa: E402
+from astrbot.api.star import Context, Star, register  # noqa: E402
+from astrbot.core.star.star_tools import StarTools  # noqa: E402
 
 # 热重载兼容：AstrBot 重载插件时只清 data.plugins.<root>.* 前缀的模块，
 # 顶层导入的兄弟模块（external_search/tools 等）会残留旧缓存，
 # 导致改代码后热重载仍在跑旧逻辑。这里在导入前主动踢掉它们。
-import sys as _sys
+import sys as _sys  # noqa: E402
 
 for _m in (
     "external_search",
@@ -42,6 +42,7 @@ for _m in (
     "webapi",
     "slot_mapping",
     "recipe_store",
+    "model_families",
 ):
     _sys.modules.pop(_m, None)
 
@@ -68,6 +69,7 @@ try:
         ComfyuiNodesTool,
         ComfyuiQueueTool,
         ComfyuiRecipeTool,
+        ComfyuiRecipeDrawTool,
         ComfyuiRunWorkflowTool,
         ComfyuiSystemStatsTool,
         ComfyuiUploadFileTool,
@@ -76,13 +78,11 @@ try:
         ComfyuiLookupTool,
     )
     from astrbot_plugin_comfyui_direct.workflow_builder import WorkflowBuilder
-    from astrbot_plugin_comfyui_direct.recipe_store import RecipeStore, recipe_template
-    from astrbot_plugin_comfyui_direct.slot_mapping import (
-        SLOT_ROLES,
-        merge_slots,
-        node_options_for_slot,
-        slots_from_config,
+    from astrbot_plugin_comfyui_direct.model_families import (
+        ModelFamilyRegistry,
+        WorkflowProfileStore,
     )
+    from astrbot_plugin_comfyui_direct.recipe_store import RecipeStore
 except ImportError:
     from animadex import AnimaDexClient
     from comfy_client import ComfyUIClient
@@ -102,6 +102,7 @@ except ImportError:
         ComfyuiNodesTool,
         ComfyuiQueueTool,
         ComfyuiRecipeTool,
+        ComfyuiRecipeDrawTool,
         ComfyuiRunWorkflowTool,
         ComfyuiSystemStatsTool,
         ComfyuiUploadFileTool,
@@ -110,13 +111,8 @@ except ImportError:
         ComfyuiLookupTool,
     )
     from workflow_builder import WorkflowBuilder
-    from recipe_store import RecipeStore, recipe_template
-    from slot_mapping import (
-        SLOT_ROLES,
-        merge_slots,
-        node_options_for_slot,
-        slots_from_config,
-    )
+    from model_families import ModelFamilyRegistry, WorkflowProfileStore
+    from recipe_store import RecipeStore
 
 # 与 _conf_schema.json 一致的默认值（配置缺失时的兜底）
 DEFAULT_HOST = "127.0.0.1"
@@ -126,7 +122,7 @@ DEFAULT_CACHE_TTL = 600
 DEFAULT_WORKFLOW = "anima-v3"
 
 
-BASIC_LLM_TOOLS = {"comfyui_draw", "comfyui_lookup"}
+BASIC_LLM_TOOLS = {"comfyui_draw", "comfyui_recipe_draw", "comfyui_lookup"}
 # 这些工具可能读取任意本地文件、执行未经映射的自定义节点或影响其他任务，
 # 默认不交给模型；需要时由管理员显式打开配置。
 LLM_UNSAFE_TOOLS = {
@@ -145,107 +141,6 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
-
-
-def _options_target(schema: dict, key: str) -> dict | None:
-    """定位配置项里写 options 的目标：template_list 写到 templates.lora.items.name。"""
-    item = schema.get(key)
-    if not isinstance(item, dict):
-        return None
-    if item.get("type") == "template_list":
-        try:
-            return item["templates"]["lora"]["items"]["name"]
-        except (KeyError, TypeError):
-            return None
-    return item
-
-
-def _stored_lora_names(stored: Any) -> list[str]:
-    """提取已保存的 LoRA 名（template_list 数组或旧字符串）。"""
-    if isinstance(stored, list):
-        out = []
-        for it in stored:
-            if isinstance(it, dict):
-                n = str(it.get("name") or "").strip()
-                if n:
-                    out.append(n)
-        return out
-    n = str(stored or "").strip()
-    return [n] if n else []
-
-
-def sync_schema_options(
-    schema_path: Path,
-    resources: dict,
-    stored: dict,
-    node_options: dict[str, list[str]] | None = None,
-    recipe_names: list[str] | None = None,
-) -> bool:
-    """把模型/LoRA/节点清单写进 _conf_schema.json 的 options（配置面板变下拉）。
-
-    AstrBot 在插件加载时缓存 schema，因此改动在重载插件后生效。
-    """
-    try:
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning(f"[ComfyUIDirect] 读取 _conf_schema.json 失败，跳过下拉同步: {e}")
-        return False
-    changed = False
-    for key, field, stored_key in (
-        ("default_model", "unet_name", "model"),
-        ("default_lora", "lora_name", "lora"),
-    ):
-        target = _options_target(schema, key)
-        if target is None:
-            continue
-        names = [""] + [n for n in (resources.get(field) or []) if n]
-        if stored_key == "lora":
-            cur_names = _stored_lora_names(stored.get(stored_key))
-        else:
-            cur = str(stored.get(stored_key) or "").strip()
-            cur_names = [cur] if cur else []
-        for n in cur_names:
-            if n and n not in names:
-                names.append(n)
-        target["options"] = names
-        changed = True
-
-    if node_options:
-        items = (schema.get("node_slots") or {}).get("items") or {}
-        stored_slots = stored.get("node_slots") or {}
-        for role, _label in SLOT_ROLES:
-            target = items.get(role)
-            if not isinstance(target, dict):
-                continue
-            options = list(node_options.get(role) or [""])
-            current = str(stored_slots.get(role) or "").strip()
-            if current and current not in options:
-                options.insert(1, current)
-            target["options"] = options
-            changed = True
-
-    if recipe_names is not None:
-        target = schema.get("default_recipe")
-        if isinstance(target, dict):
-            names = [n for n in recipe_names if n]
-            current = str(stored.get("default_recipe") or "").strip()
-            if current and current not in names:
-                names.insert(0, current)
-            if "默认" not in names:
-                names.insert(0, "默认")
-            target["options"] = names
-            changed = True
-
-    if not changed:
-        return False
-    try:
-        schema_path.write_text(
-            json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        return True
-    except OSError as e:
-        logger.warning(f"[ComfyUIDirect] 写入 _conf_schema.json 失败: {e}")
-        return False
 
 
 def parse_default_lora(raw: Any) -> str:
@@ -285,8 +180,8 @@ def parse_default_lora(raw: Any) -> str:
 @register(
     "astrbot_plugin_comfyui_direct",
     "长门九曜",
-    "局域网直连ComfyUI API，按配方生图",
-    "2.3.1",
+    "局域网直连ComfyUI API，按模型家族路由工作流并支持快捷配方",
+    "2.4.0",
 )
 class ComfyUIDirectPlugin(Star):
     """通过局域网直连ComfyUI API生成图片和查询模型。"""
@@ -327,7 +222,6 @@ class ComfyUIDirectPlugin(Star):
                 "width": int(cfg.get("default_width") or 0),
                 "height": int(cfg.get("default_height") or 0),
             }
-            self._stored_defaults = dict(defaults)  # 供下拉同步保留已存值
         except (TypeError, ValueError) as e:
             logger.error(f"[ComfyUIDirect] 配置解析失败，使用默认值: {e}")
             host, port = DEFAULT_HOST, DEFAULT_PORT
@@ -337,18 +231,18 @@ class ComfyUIDirectPlugin(Star):
             gelbooru_url = "https://gelbooru.com"
             civitai_key = ""
             defaults = {}
-            self._stored_defaults = {}
 
         data_dir = StarTools.get_data_dir("astrbot_plugin_comfyui_direct")
         self._output_dir = data_dir / "output"
         self._output_dir.mkdir(parents=True, exist_ok=True)
-        self._schema_path = Path(__file__).resolve().parent / "_conf_schema.json"
         llm_tool_mode = str(cfg.get("llm_tool_mode") or "basic").strip().lower()
         allow_llm_unsafe_tools = _as_bool(cfg.get("allow_llm_unsafe_tools", False))
         lora_manager_enabled = _as_bool(cfg.get("lora_manager_enabled", True))
         default_recipe_name = str(cfg.get("default_recipe") or "默认").strip() or "默认"
         node_slots_cfg = cfg.get("node_slots") if isinstance(cfg.get("node_slots"), dict) else {}
         self._node_slots_cfg = node_slots_cfg
+        self._model_families_cfg = cfg.get("model_families") or []
+        self._families = ModelFamilyRegistry(self._model_families_cfg, default_workflow)
 
         self._client = ComfyUIClient(
             host=host,
@@ -363,12 +257,14 @@ class ComfyUIDirectPlugin(Star):
         self._client.civitai_client = self._civitai
         self._builder = WorkflowBuilder(
             plugin_dir=Path(__file__).resolve().parent,
-            default_workflow=default_workflow,
+            default_workflow=self._families.first().workflow,
             custom_dir=data_dir / "workflows",
         )
         self._store = RecipeStore(data_dir, preferred_default=default_recipe_name)
-        self._apply_config_to_default_recipe(
-            default_workflow, node_slots_cfg, defaults, default_recipe_name
+        self._profiles = WorkflowProfileStore(data_dir)
+        self._initialize_family_data(
+            node_slots_cfg,
+            defaults,
         )
 
         shared: dict = {}
@@ -385,9 +281,17 @@ class ComfyUIDirectPlugin(Star):
             store=self._store,
             output_dir=self._output_dir,
             shared=shared,
-            config_defaults=defaults,
+            families=self._families,
+            profiles=self._profiles,
         )
         self._draw_tool.refresh_schema()
+        self._recipe_draw_tool = ComfyuiRecipeDrawTool(
+            draw_tool=self._draw_tool,
+            store=self._store,
+            families=self._families,
+        )
+        self._recipe_draw_tool.refresh_schema()
+        self._draw_tool.on_schema_change = self._recipe_draw_tool.refresh_schema
         self._lookup_tool = ComfyuiLookupTool(
             danbooru=self._danbooru,
             gelbooru=self._gelbooru,
@@ -397,6 +301,7 @@ class ComfyUIDirectPlugin(Star):
 
         tools = [
             self._draw_tool,
+            self._recipe_draw_tool,
             self._lookup_tool,
             ComfyuiListModelsTool(client=self._client),
             ComfyuiGenerateTool(
@@ -406,6 +311,8 @@ class ComfyUIDirectPlugin(Star):
                 shared=shared,
                 defaults=defaults,
                 store=self._store,
+                families=self._families,
+                profiles=self._profiles,
             ),
             ComfyuiInterruptTool(client=self._client, shared=shared),
             ComfyuiQueueTool(client=self._client),
@@ -428,7 +335,8 @@ class ComfyUIDirectPlugin(Star):
                 store=self._store,
                 allow_delete=allow_llm_unsafe_tools,
                 builder=self._builder,
-                default_workflow=default_workflow,
+                default_workflow=self._builder.default_workflow,
+                families=self._families,
             ),
         ]
         for t in tools:
@@ -451,7 +359,11 @@ class ComfyUIDirectPlugin(Star):
                 self._output_dir,
                 shared,
                 self._draw_tool,
+                self._recipe_draw_tool,
+                self._families,
+                self._profiles,
                 config_defaults=defaults,
+                plugin_config=config,
             )
         except Exception as e:
             logger.error(f"[ComfyUIDirect] WebUI 接口注册失败: {e}")
@@ -461,32 +373,42 @@ class ComfyUIDirectPlugin(Star):
         except Exception as e:
             logger.warning(f"[ComfyUIDirect] 启动预热失败: {e}")
 
-        self._schema_synced = False
-        try:
-            asyncio.create_task(self._sync_schema_task())
-        except Exception as e:
-            logger.warning(f"[ComfyUIDirect] 下拉选项同步任务启动失败: {e}")
-
         logger.info(
-            f"[ComfyUIDirect] 已加载 v2.3.1 | ComfyUI: {self._client.base_url} "
-            f"| 默认模板: {default_workflow} | 工具模式: {llm_tool_mode} | 数据目录: {data_dir}"
+            f"[ComfyUIDirect] 已加载 v2.4.0 | ComfyUI: {self._client.base_url} "
+            f"| 模型家族: {self._families.catalog()} | 工具模式: {llm_tool_mode} | 数据目录: {data_dir}"
         )
 
-    def _apply_config_to_default_recipe(
+    def _initialize_family_data(
         self,
-        default_workflow: str,
         node_slots_cfg: dict,
         defaults: dict,
-        default_recipe_name: str,
     ) -> None:
-        """用配置下拉框的节点映射和默认底模/LoRA/采样参数更新默认配方。"""
-        wf = None
-        try:
-            wf = self._builder.load_template(default_workflow)
-        except FileNotFoundError:
-            logger.info("[ComfyUIDirect] 默认工作流尚未导入，打开配方工作台后即可创建配方")
-        except Exception as e:
-            logger.warning(f"[ComfyUIDirect] 读取默认工作流失败: {e}")
+        """初始化共享工作流档案，并为旧配方补上可确定的家族标签。"""
+        for row in self._store.list():
+            recipe = self._store.get(str(row.get("id") or ""))
+            if not recipe:
+                continue
+            self._profiles.import_legacy_recipe(recipe)
+            family = self._families.resolve_recipe(recipe)
+            if family is not None:
+                self._store.attach_legacy_family(str(recipe.get("id") or ""), family.name)
+
+        loaded: dict[str, dict] = {}
+        for family_row in self._families.list():
+            workflow = family_row["workflow"]
+            try:
+                wf = self._builder.load_template(workflow)
+            except FileNotFoundError:
+                logger.info(
+                    f"[ComfyUIDirect] 模型家族「{family_row['name']}」的工作流尚未导入: {workflow}"
+                )
+                continue
+            except Exception as e:
+                logger.warning(f"[ComfyUIDirect] 读取模型家族工作流失败 {workflow}: {e}")
+                continue
+            loaded[workflow] = wf
+            configured = node_slots_cfg if workflow == self._builder.default_workflow else None
+            self._profiles.ensure(workflow, wf, configured)
 
         recipe_defaults = dict(defaults)
         raw_lora = defaults.get("lora")
@@ -498,70 +420,16 @@ class ComfyUIDirectPlugin(Star):
             except ValueError:
                 pass
 
+        first_family = self._families.first()
+        wf = loaded.get(first_family.workflow)
         if wf is not None:
             self._store.bootstrap(
-                workflow_name=default_workflow,
+                workflow_name=first_family.workflow,
                 wf=wf,
                 config_slots=node_slots_cfg,
                 config_defaults=recipe_defaults,
+                family=first_family.name,
             )
-
-        configured = slots_from_config(node_slots_cfg)
-        if not configured:
-            return
-        # 只作用于配置点名的默认配方本身；绝不能 fallback 到 store.default() 的任意
-        # 配方——否则每次重载都会把配置面板的节点映射强写进用户自己的配方（比如 krea2）。
-        recipe = self._store.get(default_recipe_name)
-        if recipe is None:
-            return
-        # 配方里已配置的槽位优先，配置面板的映射只负责补缺
-        recipe["slots"] = merge_slots(configured, recipe.get("slots") or {})
-        if not recipe_template(recipe):
-            recipe["template"] = default_workflow
-            recipe["workflow"] = default_workflow
-        try:
-            self._store.save(recipe)
-        except ValueError as e:
-            logger.warning(f"[ComfyUIDirect] 更新默认配方节点映射失败: {e}")
-
-    def node_dropdowns(self, wf: dict | None = None) -> dict[str, list[str]]:
-        if wf is None:
-            try:
-                wf = self._builder.load_template()
-            except FileNotFoundError:
-                return {role: [""] for role, _ in SLOT_ROLES}
-        recipe = self._store.default()
-        selected = (recipe or {}).get("slots") or {}
-        return {
-            role: node_options_for_slot(
-                wf, role, str((selected.get(role) or {}).get("node") or "")
-            )
-            for role, _ in SLOT_ROLES
-        }
-
-    async def _sync_schema_task(self) -> None:
-        """拉取模型/LoRA/节点清单并写入 schema options，重载后生效。"""
-        try:
-            resources, _ = await self._client.list_resources()
-            node_options = self.node_dropdowns()
-            ok = sync_schema_options(
-                self._schema_path,
-                resources,
-                {
-                    **self._stored_defaults,
-                    "node_slots": self._node_slots_cfg or {},
-                    "default_recipe": (self._store.default() or {}).get("name") or "默认",
-                },
-                node_options=node_options,
-                recipe_names=self._store.names(),
-            )
-            if ok:
-                self._schema_synced = True
-                logger.info(
-                    "[ComfyUIDirect] 已同步模型/节点下拉选项到 _conf_schema.json（重载插件后生效）"
-                )
-        except Exception as e:
-            logger.warning(f"[ComfyUIDirect] 同步下拉选项失败: {e}")
 
     async def terminate(self) -> None:
         """插件重载/卸载时关闭异步连接。"""

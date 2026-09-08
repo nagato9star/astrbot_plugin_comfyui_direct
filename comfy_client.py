@@ -279,7 +279,7 @@ class ComfyUIClient:
                     f"[ComfyUIDirect] POST /prompt 响应超时，任务可能已提交，"
                     f"请查队列确认: {e}"
                 )
-                return None, f"提交请求超时，任务可能已在排队（请用 comfyui_queue 确认是否重复）"
+                return None, "提交请求超时，任务可能已在排队（请用 comfyui_queue 确认是否重复）"
             except httpx.HTTPError as e:
                 last_err = e
                 break

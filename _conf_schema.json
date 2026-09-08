@@ -1,43 +1,111 @@
 {
+  "_conn_section": {
+    "description": "=== 连接 ===",
+    "type": "text",
+    "invisible": true
+  },
   "comfyui_host": {
     "type": "string",
     "default": "127.0.0.1",
-    "hint": "ComfyUI 主机 IP（默认本机）",
+    "hint": "ComfyUI 主机 IP（默认本机 127.0.0.1；局域网/ZeroTier 填对应地址）",
     "description": "ComfyUI 服务地址 IP，可按实际环境自填"
   },
   "comfyui_port": {
     "type": "int",
     "default": 8188,
-    "hint": "ComfyUI 端口"
+    "hint": "ComfyUI 服务端口，默认 8188"
   },
   "comfyui_timeout": {
     "type": "int",
     "default": 300,
-    "hint": "生成等待超时（秒）"
+    "slider": {
+      "min": 60,
+      "max": 1800,
+      "step": 30
+    },
+    "hint": "单次生成等待上限（秒）。大分辨率/多 LoRA 建议不低于 300；链路经 ZeroTier 等中转时适当调大。超时后任务仍在 ComfyUI 队列里，可用 comfyui_job 查询。"
   },
   "model_cache_ttl": {
     "type": "int",
     "default": 600,
-    "hint": "模型清单缓存刷新间隔（秒），0 表示每次查询都强制同步"
+    "slider": {
+      "min": 0,
+      "max": 3600,
+      "step": 60
+    },
+    "hint": "模型/LoRA 清单缓存刷新间隔（秒）。0 表示每次查询都强制同步（ComfyUI 端会多一次请求）；装了 LoRA Manager 时分类标签随缓存一并刷新。"
   },
   "lora_manager_enabled": {
     "type": "bool",
     "default": true,
     "hint": "复用 ComfyUI LoRA Manager 的分类、标签、用途说明、推荐权重和触发词；未安装时自动跳过"
   },
-  "default_workflow": {
-    "type": "string",
-    "default": "anima-v3",
-    "hint": "默认用哪张工作流图（在配方工作台导入后的名字）"
+  "_family_section": {
+    "description": "=== 模型家族与配方 ===",
+    "type": "text",
+    "invisible": true
+  },
+  "model_families": {
+    "type": "template_list",
+    "description": "模型家族与工作流",
+    "hint": "可添加任意家族，家族名是暴露给 LLM 的稳定路由名。先在配方工作台导入工作流，再在这里为每个家族选择工作流；修改后重载插件生效。",
+    "obvious_hint": true,
+    "templates": {
+      "family": {
+        "name": "模型家族",
+        "items": {
+          "name": {
+            "type": "string",
+            "default": "anima",
+            "hint": "暴露给 LLM 的稳定名称，例如 anima、krea2、flux；须唯一，重复时保留第一条"
+          },
+          "workflow": {
+            "type": "string",
+            "default": "anima-v3",
+            "hint": "这个家族使用的工作流：填配方工作台里导入的模板名。多个家族可以共用同一张工作流"
+          },
+          "prompt_style": {
+            "type": "string",
+            "default": "auto",
+            "options": [
+              "auto",
+              "danbooru",
+              "natural"
+            ],
+            "labels": [
+              "自动判断",
+              "Danbooru 标签串",
+              "自然语言"
+            ],
+            "hint": "提示 LLM 用哪种提示词风格：anima/illustrious 系选标签串，krea/flux/qwen 系选自然语言，不确定选自动判断"
+          },
+          "description": {
+            "type": "string",
+            "default": "",
+            "hint": "简短说明适合的画面或用途，会随家族名一起暴露给 LLM，帮它选对家族"
+          }
+        }
+      }
+    },
+    "default": [
+      {
+        "__template_key": "family",
+        "name": "anima",
+        "workflow": "anima-v3",
+        "prompt_style": "danbooru",
+        "description": "动漫标签提示词"
+      }
+    ]
   },
   "default_recipe": {
     "type": "string",
     "default": "默认",
-    "hint": "用户只说「画一张」时，机器人用哪套配方",
-    "options": [
-      "默认",
-      "krea2"
-    ]
+    "hint": "用户只说「画一张」时 comfyui_recipe_draw / comfyui_generate 用的配方名；在配方工作台点「设为默认」自动写入，也可直接填配方名"
+  },
+  "_tool_section": {
+    "description": "=== LLM 工具 ===",
+    "type": "text",
+    "invisible": true
   },
   "llm_tool_mode": {
     "type": "string",
@@ -46,433 +114,93 @@
       "basic",
       "full"
     ],
-    "hint": "basic=机器人只会画图和查词；full=开放诊断工具，但高风险工具仍需 allow_llm_unsafe_tools"
+    "labels": [
+      "基础（画图 + 查词）",
+      "完整（开放诊断工具）"
+    ],
+    "hint": "basic 只暴露 comfyui_draw / comfyui_recipe_draw / comfyui_lookup；full 额外开放队列、任务、模型信息等诊断工具，其中高风险工具仍需打开下方开关"
   },
   "allow_llm_unsafe_tools": {
     "type": "bool",
     "default": false,
-    "hint": "允许 LLM 执行任意工作流、读取本地图片上传、释放显存和删除配方。存在误操作风险，默认关闭"
+    "hint": "允许 LLM 执行任意工作流 JSON、上传本地文件到 ComfyUI、释放显存和删除配方。存在误操作与数据丢失风险，默认关闭；确有需要再开"
   },
   "node_slots": {
     "type": "object",
+    "invisible": true,
     "description": "告诉插件：工作流里哪个格子写用户的话、哪个出图、哪个换底模。选好后机器人就不会填错。导入工作流后选项会刷新，重载插件生效。不会用的格子留空即可。",
     "items": {
       "prompt": {
         "type": "string",
         "default": "",
-        "hint": "用户要画的内容写到哪（必选）",
-        "options": [
-          "",
-          "353 — CR Prompt Text — 简单描述提示词",
-          "357 — CLIPTextEncode — CLIP Text Encode (Positive Prompt)",
-          "358 — CLIPTextEncode — CLIP Text Encode (Negative Prompt)",
-          "353 — CR Prompt Text — 简单描述提示词",
-          "368 — CR Prompt Text — 画师串",
-          "385 — CR Prompt Text — 质量(不动)",
-          "461 — CR Prompt Text — 触发词",
-          "349 — CLIPLoader — 加载CLIP",
-          "361 — EmptyLatentImage — 尺寸",
-          "521 — ImageUpscaleWithModel — 使用模型放大图像",
-          "514 — Int — 一采步数(切分点)",
-          "515 — Int — 总步数",
-          "387 — JoinStringMulti — 合并字符串（多重）",
-          "428 — LoraLoaderModelOnly — 加速",
-          "356 — ModelSamplingAuraFlow — 采样算法（AuraFlow）",
-          "478 — Power Lora Loader (rgthree) — 权重Lora加载器",
-          "503 — PromptCleaningMaid — 提示词清洁女仆 (Prompt Cleaning Maid)",
-          "523 — SaveImage — 保存图像",
-          "458 — UNETLoader — UNet加载器",
-          "522 — UpscaleModelLoader — 加载放大模型",
-          "364 — VAEDecode — VAE解码",
-          "359 — VAELoader — 加载VAE",
-          "509 — XB_ROCmKSamplerAdvanced — 一采",
-          "510 — XB_ROCmKSamplerAdvanced — 二采"
-        ]
+        "hint": "用户要画的内容写到哪（必选）"
       },
       "model": {
         "type": "string",
         "default": "",
-        "hint": "底模写到哪（想让机器人换模型就选）",
-        "options": [
-          "",
-          "458 — UNETLoader — UNet加载器",
-          "458 — UNETLoader — UNet加载器",
-          "349 — CLIPLoader — 加载CLIP",
-          "357 — CLIPTextEncode — CLIP Text Encode (Positive Prompt)",
-          "358 — CLIPTextEncode — CLIP Text Encode (Negative Prompt)",
-          "353 — CR Prompt Text — 简单描述提示词",
-          "368 — CR Prompt Text — 画师串",
-          "385 — CR Prompt Text — 质量(不动)",
-          "461 — CR Prompt Text — 触发词",
-          "361 — EmptyLatentImage — 尺寸",
-          "521 — ImageUpscaleWithModel — 使用模型放大图像",
-          "514 — Int — 一采步数(切分点)",
-          "515 — Int — 总步数",
-          "387 — JoinStringMulti — 合并字符串（多重）",
-          "428 — LoraLoaderModelOnly — 加速",
-          "356 — ModelSamplingAuraFlow — 采样算法（AuraFlow）",
-          "478 — Power Lora Loader (rgthree) — 权重Lora加载器",
-          "503 — PromptCleaningMaid — 提示词清洁女仆 (Prompt Cleaning Maid)",
-          "523 — SaveImage — 保存图像",
-          "522 — UpscaleModelLoader — 加载放大模型",
-          "364 — VAEDecode — VAE解码",
-          "359 — VAELoader — 加载VAE",
-          "509 — XB_ROCmKSamplerAdvanced — 一采",
-          "510 — XB_ROCmKSamplerAdvanced — 二采"
-        ]
+        "hint": "底模写到哪（想让机器人换模型就选）"
       },
       "loras": {
         "type": "string",
         "default": "",
-        "hint": "LoRA 写到哪",
-        "options": [
-          "",
-          "478 — Power Lora Loader (rgthree) — 权重Lora加载器",
-          "428 — LoraLoaderModelOnly — 加速",
-          "478 — Power Lora Loader (rgthree) — 权重Lora加载器",
-          "349 — CLIPLoader — 加载CLIP",
-          "357 — CLIPTextEncode — CLIP Text Encode (Positive Prompt)",
-          "358 — CLIPTextEncode — CLIP Text Encode (Negative Prompt)",
-          "353 — CR Prompt Text — 简单描述提示词",
-          "368 — CR Prompt Text — 画师串",
-          "385 — CR Prompt Text — 质量(不动)",
-          "461 — CR Prompt Text — 触发词",
-          "361 — EmptyLatentImage — 尺寸",
-          "521 — ImageUpscaleWithModel — 使用模型放大图像",
-          "514 — Int — 一采步数(切分点)",
-          "515 — Int — 总步数",
-          "387 — JoinStringMulti — 合并字符串（多重）",
-          "356 — ModelSamplingAuraFlow — 采样算法（AuraFlow）",
-          "503 — PromptCleaningMaid — 提示词清洁女仆 (Prompt Cleaning Maid)",
-          "523 — SaveImage — 保存图像",
-          "458 — UNETLoader — UNet加载器",
-          "522 — UpscaleModelLoader — 加载放大模型",
-          "364 — VAEDecode — VAE解码",
-          "359 — VAELoader — 加载VAE",
-          "509 — XB_ROCmKSamplerAdvanced — 一采",
-          "510 — XB_ROCmKSamplerAdvanced — 二采"
-        ]
+        "hint": "LoRA 写到哪"
       },
       "size": {
         "type": "string",
         "default": "",
-        "hint": "画面宽高写到哪",
-        "options": [
-          "",
-          "361 — EmptyLatentImage — 尺寸",
-          "361 — EmptyLatentImage — 尺寸",
-          "349 — CLIPLoader — 加载CLIP",
-          "357 — CLIPTextEncode — CLIP Text Encode (Positive Prompt)",
-          "358 — CLIPTextEncode — CLIP Text Encode (Negative Prompt)",
-          "353 — CR Prompt Text — 简单描述提示词",
-          "368 — CR Prompt Text — 画师串",
-          "385 — CR Prompt Text — 质量(不动)",
-          "461 — CR Prompt Text — 触发词",
-          "521 — ImageUpscaleWithModel — 使用模型放大图像",
-          "514 — Int — 一采步数(切分点)",
-          "515 — Int — 总步数",
-          "387 — JoinStringMulti — 合并字符串（多重）",
-          "428 — LoraLoaderModelOnly — 加速",
-          "356 — ModelSamplingAuraFlow — 采样算法（AuraFlow）",
-          "478 — Power Lora Loader (rgthree) — 权重Lora加载器",
-          "503 — PromptCleaningMaid — 提示词清洁女仆 (Prompt Cleaning Maid)",
-          "523 — SaveImage — 保存图像",
-          "458 — UNETLoader — UNet加载器",
-          "522 — UpscaleModelLoader — 加载放大模型",
-          "364 — VAEDecode — VAE解码",
-          "359 — VAELoader — 加载VAE",
-          "509 — XB_ROCmKSamplerAdvanced — 一采",
-          "510 — XB_ROCmKSamplerAdvanced — 二采"
-        ]
+        "hint": "画面宽高写到哪"
       },
       "sampler": {
         "type": "string",
         "default": "",
-        "hint": "出图采样写到哪（步数/精细程度，必选）。双采样时选第一段",
-        "options": [
-          "",
-          "509 — XB_ROCmKSamplerAdvanced — 一采",
-          "509 — XB_ROCmKSamplerAdvanced — 一采",
-          "510 — XB_ROCmKSamplerAdvanced — 二采",
-          "349 — CLIPLoader — 加载CLIP",
-          "357 — CLIPTextEncode — CLIP Text Encode (Positive Prompt)",
-          "358 — CLIPTextEncode — CLIP Text Encode (Negative Prompt)",
-          "353 — CR Prompt Text — 简单描述提示词",
-          "368 — CR Prompt Text — 画师串",
-          "385 — CR Prompt Text — 质量(不动)",
-          "461 — CR Prompt Text — 触发词",
-          "361 — EmptyLatentImage — 尺寸",
-          "521 — ImageUpscaleWithModel — 使用模型放大图像",
-          "514 — Int — 一采步数(切分点)",
-          "515 — Int — 总步数",
-          "387 — JoinStringMulti — 合并字符串（多重）",
-          "428 — LoraLoaderModelOnly — 加速",
-          "356 — ModelSamplingAuraFlow — 采样算法（AuraFlow）",
-          "478 — Power Lora Loader (rgthree) — 权重Lora加载器",
-          "503 — PromptCleaningMaid — 提示词清洁女仆 (Prompt Cleaning Maid)",
-          "523 — SaveImage — 保存图像",
-          "458 — UNETLoader — UNet加载器",
-          "522 — UpscaleModelLoader — 加载放大模型",
-          "364 — VAEDecode — VAE解码",
-          "359 — VAELoader — 加载VAE"
-        ]
+        "hint": "出图采样写到哪（步数/精细程度，必选）。双采样时选第一段"
       },
       "sampler_2": {
         "type": "string",
         "default": "",
-        "hint": "双采样第二段写到哪（可留空）",
-        "options": [
-          "",
-          "510 — XB_ROCmKSamplerAdvanced — 二采",
-          "509 — XB_ROCmKSamplerAdvanced — 一采",
-          "510 — XB_ROCmKSamplerAdvanced — 二采",
-          "349 — CLIPLoader — 加载CLIP",
-          "357 — CLIPTextEncode — CLIP Text Encode (Positive Prompt)",
-          "358 — CLIPTextEncode — CLIP Text Encode (Negative Prompt)",
-          "353 — CR Prompt Text — 简单描述提示词",
-          "368 — CR Prompt Text — 画师串",
-          "385 — CR Prompt Text — 质量(不动)",
-          "461 — CR Prompt Text — 触发词",
-          "361 — EmptyLatentImage — 尺寸",
-          "521 — ImageUpscaleWithModel — 使用模型放大图像",
-          "514 — Int — 一采步数(切分点)",
-          "515 — Int — 总步数",
-          "387 — JoinStringMulti — 合并字符串（多重）",
-          "428 — LoraLoaderModelOnly — 加速",
-          "356 — ModelSamplingAuraFlow — 采样算法（AuraFlow）",
-          "478 — Power Lora Loader (rgthree) — 权重Lora加载器",
-          "503 — PromptCleaningMaid — 提示词清洁女仆 (Prompt Cleaning Maid)",
-          "523 — SaveImage — 保存图像",
-          "458 — UNETLoader — UNet加载器",
-          "522 — UpscaleModelLoader — 加载放大模型",
-          "364 — VAEDecode — VAE解码",
-          "359 — VAELoader — 加载VAE"
-        ]
+        "hint": "双采样第二段写到哪（可留空）"
       },
       "negative": {
         "type": "string",
         "default": "",
-        "hint": "不要出现的东西写到哪（可留空）",
-        "options": [
-          "",
-          "358 — CLIPTextEncode — CLIP Text Encode (Negative Prompt)",
-          "357 — CLIPTextEncode — CLIP Text Encode (Positive Prompt)",
-          "358 — CLIPTextEncode — CLIP Text Encode (Negative Prompt)",
-          "353 — CR Prompt Text — 简单描述提示词",
-          "368 — CR Prompt Text — 画师串",
-          "385 — CR Prompt Text — 质量(不动)",
-          "461 — CR Prompt Text — 触发词",
-          "349 — CLIPLoader — 加载CLIP",
-          "361 — EmptyLatentImage — 尺寸",
-          "521 — ImageUpscaleWithModel — 使用模型放大图像",
-          "514 — Int — 一采步数(切分点)",
-          "515 — Int — 总步数",
-          "387 — JoinStringMulti — 合并字符串（多重）",
-          "428 — LoraLoaderModelOnly — 加速",
-          "356 — ModelSamplingAuraFlow — 采样算法（AuraFlow）",
-          "478 — Power Lora Loader (rgthree) — 权重Lora加载器",
-          "503 — PromptCleaningMaid — 提示词清洁女仆 (Prompt Cleaning Maid)",
-          "523 — SaveImage — 保存图像",
-          "458 — UNETLoader — UNet加载器",
-          "522 — UpscaleModelLoader — 加载放大模型",
-          "364 — VAEDecode — VAE解码",
-          "359 — VAELoader — 加载VAE",
-          "509 — XB_ROCmKSamplerAdvanced — 一采",
-          "510 — XB_ROCmKSamplerAdvanced — 二采"
-        ]
+        "hint": "不要出现的东西写到哪（可留空）"
       },
       "artist": {
         "type": "string",
         "default": "",
-        "hint": "画师风格写到哪（可留空）",
-        "options": [
-          "",
-          "368 — CR Prompt Text — 画师串",
-          "357 — CLIPTextEncode — CLIP Text Encode (Positive Prompt)",
-          "358 — CLIPTextEncode — CLIP Text Encode (Negative Prompt)",
-          "353 — CR Prompt Text — 简单描述提示词",
-          "368 — CR Prompt Text — 画师串",
-          "385 — CR Prompt Text — 质量(不动)",
-          "461 — CR Prompt Text — 触发词",
-          "349 — CLIPLoader — 加载CLIP",
-          "361 — EmptyLatentImage — 尺寸",
-          "521 — ImageUpscaleWithModel — 使用模型放大图像",
-          "514 — Int — 一采步数(切分点)",
-          "515 — Int — 总步数",
-          "387 — JoinStringMulti — 合并字符串（多重）",
-          "428 — LoraLoaderModelOnly — 加速",
-          "356 — ModelSamplingAuraFlow — 采样算法（AuraFlow）",
-          "478 — Power Lora Loader (rgthree) — 权重Lora加载器",
-          "503 — PromptCleaningMaid — 提示词清洁女仆 (Prompt Cleaning Maid)",
-          "523 — SaveImage — 保存图像",
-          "458 — UNETLoader — UNet加载器",
-          "522 — UpscaleModelLoader — 加载放大模型",
-          "364 — VAEDecode — VAE解码",
-          "359 — VAELoader — 加载VAE",
-          "509 — XB_ROCmKSamplerAdvanced — 一采",
-          "510 — XB_ROCmKSamplerAdvanced — 二采"
-        ]
+        "hint": "画师风格写到哪（可留空）"
       },
       "quality": {
         "type": "string",
         "default": "",
-        "hint": "画质词写到哪（可留空）",
-        "options": [
-          "",
-          "385 — CR Prompt Text — 质量(不动)",
-          "357 — CLIPTextEncode — CLIP Text Encode (Positive Prompt)",
-          "358 — CLIPTextEncode — CLIP Text Encode (Negative Prompt)",
-          "353 — CR Prompt Text — 简单描述提示词",
-          "368 — CR Prompt Text — 画师串",
-          "385 — CR Prompt Text — 质量(不动)",
-          "461 — CR Prompt Text — 触发词",
-          "349 — CLIPLoader — 加载CLIP",
-          "361 — EmptyLatentImage — 尺寸",
-          "521 — ImageUpscaleWithModel — 使用模型放大图像",
-          "514 — Int — 一采步数(切分点)",
-          "515 — Int — 总步数",
-          "387 — JoinStringMulti — 合并字符串（多重）",
-          "428 — LoraLoaderModelOnly — 加速",
-          "356 — ModelSamplingAuraFlow — 采样算法（AuraFlow）",
-          "478 — Power Lora Loader (rgthree) — 权重Lora加载器",
-          "503 — PromptCleaningMaid — 提示词清洁女仆 (Prompt Cleaning Maid)",
-          "523 — SaveImage — 保存图像",
-          "458 — UNETLoader — UNet加载器",
-          "522 — UpscaleModelLoader — 加载放大模型",
-          "364 — VAEDecode — VAE解码",
-          "359 — VAELoader — 加载VAE",
-          "509 — XB_ROCmKSamplerAdvanced — 一采",
-          "510 — XB_ROCmKSamplerAdvanced — 二采"
-        ]
+        "hint": "画质词写到哪（可留空）"
       },
       "trigger_words": {
         "type": "string",
         "default": "",
-        "hint": "LoRA 触发词写到哪（可留空）",
-        "options": [
-          "",
-          "461 — CR Prompt Text — 触发词",
-          "357 — CLIPTextEncode — CLIP Text Encode (Positive Prompt)",
-          "358 — CLIPTextEncode — CLIP Text Encode (Negative Prompt)",
-          "353 — CR Prompt Text — 简单描述提示词",
-          "368 — CR Prompt Text — 画师串",
-          "385 — CR Prompt Text — 质量(不动)",
-          "461 — CR Prompt Text — 触发词",
-          "349 — CLIPLoader — 加载CLIP",
-          "361 — EmptyLatentImage — 尺寸",
-          "521 — ImageUpscaleWithModel — 使用模型放大图像",
-          "514 — Int — 一采步数(切分点)",
-          "515 — Int — 总步数",
-          "387 — JoinStringMulti — 合并字符串（多重）",
-          "428 — LoraLoaderModelOnly — 加速",
-          "356 — ModelSamplingAuraFlow — 采样算法（AuraFlow）",
-          "478 — Power Lora Loader (rgthree) — 权重Lora加载器",
-          "503 — PromptCleaningMaid — 提示词清洁女仆 (Prompt Cleaning Maid)",
-          "523 — SaveImage — 保存图像",
-          "458 — UNETLoader — UNet加载器",
-          "522 — UpscaleModelLoader — 加载放大模型",
-          "364 — VAEDecode — VAE解码",
-          "359 — VAELoader — 加载VAE",
-          "509 — XB_ROCmKSamplerAdvanced — 一采",
-          "510 — XB_ROCmKSamplerAdvanced — 二采"
-        ]
+        "hint": "LoRA 触发词写到哪（可留空）"
       },
       "clip": {
         "type": "string",
         "default": "",
-        "hint": "换文本编码器（Flux/Krea/Qwen 等独立 CLIP 的模型才需要，可留空）",
-        "options": [
-          "",
-          "349 — CLIPLoader — 加载CLIP",
-          "349 — CLIPLoader — 加载CLIP",
-          "357 — CLIPTextEncode — CLIP Text Encode (Positive Prompt)",
-          "358 — CLIPTextEncode — CLIP Text Encode (Negative Prompt)",
-          "353 — CR Prompt Text — 简单描述提示词",
-          "368 — CR Prompt Text — 画师串",
-          "385 — CR Prompt Text — 质量(不动)",
-          "461 — CR Prompt Text — 触发词",
-          "361 — EmptyLatentImage — 尺寸",
-          "521 — ImageUpscaleWithModel — 使用模型放大图像",
-          "514 — Int — 一采步数(切分点)",
-          "515 — Int — 总步数",
-          "387 — JoinStringMulti — 合并字符串（多重）",
-          "428 — LoraLoaderModelOnly — 加速",
-          "356 — ModelSamplingAuraFlow — 采样算法（AuraFlow）",
-          "478 — Power Lora Loader (rgthree) — 权重Lora加载器",
-          "503 — PromptCleaningMaid — 提示词清洁女仆 (Prompt Cleaning Maid)",
-          "523 — SaveImage — 保存图像",
-          "458 — UNETLoader — UNet加载器",
-          "522 — UpscaleModelLoader — 加载放大模型",
-          "364 — VAEDecode — VAE解码",
-          "359 — VAELoader — 加载VAE",
-          "509 — XB_ROCmKSamplerAdvanced — 一采",
-          "510 — XB_ROCmKSamplerAdvanced — 二采"
-        ]
+        "hint": "换文本编码器（Flux/Krea/Qwen 等独立 CLIP 的模型才需要，可留空）"
       },
       "vae": {
         "type": "string",
         "default": "",
-        "hint": "换 VAE（模型用独立 VAE 时才需要，可留空）",
-        "options": [
-          "",
-          "359 — VAELoader — 加载VAE",
-          "359 — VAELoader — 加载VAE",
-          "349 — CLIPLoader — 加载CLIP",
-          "357 — CLIPTextEncode — CLIP Text Encode (Positive Prompt)",
-          "358 — CLIPTextEncode — CLIP Text Encode (Negative Prompt)",
-          "353 — CR Prompt Text — 简单描述提示词",
-          "368 — CR Prompt Text — 画师串",
-          "385 — CR Prompt Text — 质量(不动)",
-          "461 — CR Prompt Text — 触发词",
-          "361 — EmptyLatentImage — 尺寸",
-          "521 — ImageUpscaleWithModel — 使用模型放大图像",
-          "514 — Int — 一采步数(切分点)",
-          "515 — Int — 总步数",
-          "387 — JoinStringMulti — 合并字符串（多重）",
-          "428 — LoraLoaderModelOnly — 加速",
-          "356 — ModelSamplingAuraFlow — 采样算法（AuraFlow）",
-          "478 — Power Lora Loader (rgthree) — 权重Lora加载器",
-          "503 — PromptCleaningMaid — 提示词清洁女仆 (Prompt Cleaning Maid)",
-          "523 — SaveImage — 保存图像",
-          "458 — UNETLoader — UNet加载器",
-          "522 — UpscaleModelLoader — 加载放大模型",
-          "364 — VAEDecode — VAE解码",
-          "509 — XB_ROCmKSamplerAdvanced — 一采",
-          "510 — XB_ROCmKSamplerAdvanced — 二采"
-        ]
+        "hint": "换 VAE（模型用独立 VAE 时才需要，可留空）"
       },
       "guidance": {
         "type": "string",
         "default": "",
-        "hint": "FluxGuidance 之类的引导值节点（可留空）",
-        "options": [
-          "",
-          "349 — CLIPLoader — 加载CLIP",
-          "357 — CLIPTextEncode — CLIP Text Encode (Positive Prompt)",
-          "358 — CLIPTextEncode — CLIP Text Encode (Negative Prompt)",
-          "353 — CR Prompt Text — 简单描述提示词",
-          "368 — CR Prompt Text — 画师串",
-          "385 — CR Prompt Text — 质量(不动)",
-          "461 — CR Prompt Text — 触发词",
-          "361 — EmptyLatentImage — 尺寸",
-          "521 — ImageUpscaleWithModel — 使用模型放大图像",
-          "514 — Int — 一采步数(切分点)",
-          "515 — Int — 总步数",
-          "387 — JoinStringMulti — 合并字符串（多重）",
-          "428 — LoraLoaderModelOnly — 加速",
-          "356 — ModelSamplingAuraFlow — 采样算法（AuraFlow）",
-          "478 — Power Lora Loader (rgthree) — 权重Lora加载器",
-          "503 — PromptCleaningMaid — 提示词清洁女仆 (Prompt Cleaning Maid)",
-          "523 — SaveImage — 保存图像",
-          "458 — UNETLoader — UNet加载器",
-          "522 — UpscaleModelLoader — 加载放大模型",
-          "364 — VAEDecode — VAE解码",
-          "359 — VAELoader — 加载VAE",
-          "509 — XB_ROCmKSamplerAdvanced — 一采",
-          "510 — XB_ROCmKSamplerAdvanced — 二采"
-        ]
+        "hint": "FluxGuidance 之类的引导值节点（可留空）"
       }
     }
+  },
+  "_lookup_section": {
+    "description": "=== 查询源 ===",
+    "type": "text",
+    "invisible": true
   },
   "danbooru_base_url": {
     "type": "string",
@@ -495,94 +223,44 @@
     "description": "API Key 获取：https://civitai.com/user/account（镜像站路径相同）",
     "hint": "civitai API Key（可选，以你的身份调用）：获取 https://civitai.com/user/account，镜像站路径相同；API 参考 https://github.com/civitai/civitai/wiki/REST-API-Reference（可点击链接见 Workflow Studio 侧栏）"
   },
+  "_legacy_defaults_section": {
+    "description": "=== 旧版兼容默认值（有配方后以配方为准） ===",
+    "type": "text",
+    "invisible": true
+  },
   "default_artist": {
     "type": "string",
+    "invisible": true,
     "default": "",
-    "hint": "默认画师串（如 (@名字:1.2)），留空用模板原值；生成时若 LLM 未传 artist 则用此项"
+    "hint": "默认画师串（如 (@名字:1.2)），留空用模板原值；仅 comfyui_generate 未传 artist 时生效"
   },
   "default_quality": {
     "type": "string",
+    "invisible": true,
     "default": "",
     "hint": "默认质量词（如 masterpiece, best quality, score_9），留空用模板原值"
   },
   "default_trigger_words": {
     "type": "string",
+    "invisible": true,
     "default": "",
     "hint": "默认 lora 触发词（如 @f1f,@deadpuritystyle），留空用模板原值"
   },
   "default_negative_prompt": {
     "type": "string",
+    "invisible": true,
     "default": "",
     "hint": "默认负向提示词，留空用模板原值"
   },
   "default_model": {
     "type": "string",
+    "invisible": true,
     "default": "",
-    "hint": "没有配方时的兜底底模。有配方后以配方为准",
-    "options": [
-      "",
-      "SDXL\\AnythingXL_xl.safetensors",
-      "SDXL\\waiIllustriousSDXL_v170.safetensors",
-      "Anima\\anima29B_v10.safetensors",
-      "Anima\\anima_baseV10.safetensors",
-      "Anima\\fnMixAnimaTurbo_baseNoTurbo.safetensors",
-      "Anima\\miaomiao3DHarem_animaLH3D10.safetensors",
-      "Anima\\miaomiaoHarem_anima14.safetensors",
-      "Anima\\miaomiaoHarem_anima16.safetensors",
-      "Anima\\miaomiaoRealskin_anima11.safetensors",
-      "Anima\\novaAnimeAM_v30A.safetensors",
-      "Anima\\oneObsessionAnima_v30.safetensors",
-      "Anima\\pornmasterAnima_baseV1.safetensors",
-      "Anima\\rinFlanimeAnima_v14.safetensors",
-      "Flux.2-Klein\\Flux2-Klein-9B-True-v2-fp8mixed.safetensors",
-      "Flux2-Klein-9B-True-v2-fp8mixed.safetensors",
-      "Krea-2\\krea2_turbo_fp8_scaled.safetensors",
-      "Krea-2\\krea2_turbo_int8_convrot.safetensors",
-      "Krea-2\\redcraftHybridH3A2A_30Krea2.safetensors",
-      "None",
-      "GMFSS_fortuna_union",
-      "GMFSS_fortuna",
-      "IFRNet_S_Vimeo90K.pth",
-      "IFRNet_L_Vimeo90K.pth",
-      "IFRNet_S_GoPro.pth",
-      "IFRNet_L_GoPro.pth",
-      "IFUNet.pth",
-      "M2M.pth",
-      "sudo_rife4_269.662_testV1_scale1.pth",
-      "rife47.pth",
-      "rife49.pth",
-      "rife417.pth",
-      "rife426.pth",
-      "sepconv.pth",
-      "amt-s.pth",
-      "amt-l.pth",
-      "amt-g.pth",
-      "gopro_amt-s.pth",
-      "film_net_fp32.pt",
-      "stmfnet.pth",
-      "FLAVR_2x.pth",
-      "FLAVR_4x.pth",
-      "FLAVR_8x.pth",
-      "pretrained_cain.pth",
-      "atm-vfi-base.pt",
-      "atm-vfi-lite.pt",
-      "atm-vfi-base-pct.pt",
-      "momo-base.pth",
-      "momo-lite.pth",
-      "depth_anything_vitl14.pth",
-      "depth_anything_vitb14.pth",
-      "depth_anything_vits14.pth",
-      "depth_anything_v2_vitg.pth",
-      "depth_anything_v2_vitl.pth",
-      "depth_anything_v2_vitb.pth",
-      "depth_anything_v2_vits.pth",
-      "gmflow-scale1-mixdata.pth",
-      "gmflow-scale2-mixdata.pth",
-      "gmflow-scale2-regrefine6-mixdata.pth"
-    ]
+    "hint": "没有配方时的兜底底模。有配方后以配方为准"
   },
   "default_lora": {
     "type": "template_list",
+    "invisible": true,
     "description": "默认 LoRA 列表：可添加多条，按顺序映射 Power Lora Loader 插槽 lora_1..lora_N；每条含文件名与权重",
     "templates": {
       "lora": {
@@ -591,66 +269,17 @@
           "name": {
             "type": "string",
             "default": "",
-            "hint": "LoRA 文件名（下拉选择；插件启动时自动同步清单，重载插件后更新）",
-            "options": [
-              "",
-              "Anima\\NSFW_全彩漫画生成.safetensors",
-              "Anima\\NSFW_细节增强Zoda.safetensors",
-              "Anima\\style\\风格_kanzarin.safetensors",
-              "Anima\\人物_DeepSeek鲸鱼娘.safetensors",
-              "Anima\\人物_绝区零角色包.safetensors",
-              "Anima\\修复_baka皮肤质感.safetensors",
-              "Anima\\修复_脚部.safetensors",
-              "Anima\\加速_Turbo_v2.9.safetensors",
-              "Anima\\加速_Turbo官方v0.2.safetensors",
-              "Anima\\辅助_光效氛围.safetensors",
-              "Anima\\辅助_大师级画质.safetensors",
-              "Anima\\辅助_照片级背景合成.safetensors",
-              "Anima\\辅助_细节增强ZodaPlus.safetensors",
-              "Anima\\辅助_细节滑块.safetensors",
-              "Anima\\风格_AI风格合集.safetensors",
-              "Anima\\风格_BetaBeet双底模.safetensors",
-              "Anima\\风格_Futurabbit速写.safetensors",
-              "Anima\\风格_akipeko.safetensors",
-              "Anima\\风格_bakalight光影.safetensors",
-              "Anima\\风格_deadpurity.safetensors",
-              "Anima\\风格_firedotinc.safetensors",
-              "Anima\\风格_gpt-image-2质感.safetensors",
-              "Anima\\风格_johnkafka.safetensors",
-              "Anima\\风格_misaka12003御坂.safetensors",
-              "Anima\\风格_nekoya.safetensors",
-              "Anima\\风格_nffastyle.safetensors",
-              "Anima\\风格_syurikenmaru_Q版.safetensors",
-              "Anima\\风格_二次元进写实背景.safetensors",
-              "Anima\\风格_天凉多喝防冻液.safetensors",
-              "Anima\\风格_少把盐.safetensors",
-              "Anima\\风格_蔚蓝档案.safetensors",
-              "Flux.2-Klein\\修复_Klein动漫高清放大.safetensors",
-              "Flux.2-Klein\\加速_Klein4B_r128.safetensors",
-              "Flux.2-Klein\\加速_Klein一致性V2.safetensors",
-              "Flux.2-Klein\\加速_Klein一致性whitebuild.safetensors",
-              "Krea-2\\NSFW_Krea2写实V4.safetensors",
-              "Krea-2\\NSFW_PornMaster去审查.safetensors",
-              "Krea-2\\krea2-masterpieces-v51.safetensors",
-              "Krea-2\\krea2_darkbrush.safetensors",
-              "Krea-2\\krea2_kidsdrawing.safetensors",
-              "Krea-2\\krea2_neondrip.safetensors",
-              "Krea-2\\krea2_rainywindow.safetensors",
-              "Krea-2\\krea2_softwatercolor.safetensors",
-              "Krea-2\\krea2_sunsetblur.safetensors",
-              "Krea-2\\krea2_vintagetarot.safetensors",
-              "Krea-2\\krea2_vrchat photography style.safetensors",
-              "Krea-2\\辅助_写实引擎.safetensors",
-              "Krea-2\\辅助_可爱脸cuteface.safetensors",
-              "SDXL-Illustrious\\Anime_artistic_2.safetensors",
-              "SDXL-Illustrious\\cunnyfunky.safetensors",
-              "None"
-            ]
+            "hint": "LoRA 文件名，需与 ComfyUI models/loras 下的相对路径一致"
           },
           "strength": {
             "type": "float",
             "default": 0.8,
-            "hint": "权重（0~1.5，常用 0.5~1.0）"
+            "slider": {
+              "min": 0,
+              "max": 1.5,
+              "step": 0.05
+            },
+            "hint": "权重，常用 0.5~1.0"
           }
         }
       }
@@ -659,16 +288,29 @@
   },
   "default_steps": {
     "type": "int",
+    "invisible": true,
     "default": 0,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 1
+    },
     "hint": "默认采样步数，0=用模板原值"
   },
   "default_cfg": {
     "type": "float",
+    "invisible": true,
     "default": 0,
+    "slider": {
+      "min": 0,
+      "max": 20,
+      "step": 0.5
+    },
     "hint": "默认 CFG，0=用模板原值"
   },
   "default_sampler_name": {
     "type": "string",
+    "invisible": true,
     "default": "",
     "options": [
       "",
@@ -687,6 +329,7 @@
   },
   "default_scheduler": {
     "type": "string",
+    "invisible": true,
     "default": "",
     "options": [
       "",
@@ -701,29 +344,53 @@
   },
   "default_denoise": {
     "type": "float",
+    "invisible": true,
     "default": 0,
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.05
+    },
     "hint": "默认降噪强度 0~1，0=用模板原值"
   },
   "default_width": {
     "type": "int",
+    "invisible": true,
     "default": 0,
     "hint": "默认图片宽度，0=用模板原值"
   },
   "default_height": {
     "type": "int",
+    "invisible": true,
     "default": 0,
     "hint": "默认图片高度，0=用模板原值"
+  },
+  "default_workflow": {
+    "type": "string",
+    "default": "anima-v3",
+    "hint": "旧版兼容项；model_families 为空时作为兜底工作流",
+    "invisible": true
+  },
+  "_animadex_section": {
+    "description": "=== AnimaDex 角色库 ===",
+    "type": "text",
+    "invisible": true
   },
   "animadex_mcp_url": {
     "description": "AnimaDex MCP 服务地址",
     "type": "string",
     "default": "http://127.0.0.1:11451/mcp",
-    "hint": "本地角色库 MCP 服务端点，默认 127.0.0.1:11451/mcp"
+    "hint": "本地角色库 MCP 服务端点；不使用 AnimaDex 查询可忽略"
   },
   "animadex_timeout": {
     "description": "AnimaDex 查询超时（秒）",
     "type": "float",
     "default": 8.0,
-    "hint": "示例：8.0"
+    "slider": {
+      "min": 1,
+      "max": 60,
+      "step": 1
+    },
+    "hint": "单次角色库查询的等待上限，超时自动放弃并回退其他查询源"
   }
 }

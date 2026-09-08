@@ -451,12 +451,15 @@ def node_options_for_slot(wf: dict, slot: str, selected: str = "") -> list[str]:
         if hints and row["class_type"] not in hints and row["id"] != selected_id:
             rest.append(label)
             continue
-        options.append(label)
+        if label not in options:
+            options.append(label)
     options.extend(rest)
+    # selected 可能是裸节点 id（配置存 label、调用方传 node），去重须按 label 比较
     if selected and selected not in options and selected_id:
         for row in list_nodes(wf):
             if row["id"] == selected_id:
-                options.insert(1, row["label"])
+                if row["label"] not in options:
+                    options.insert(1, row["label"])
                 break
         else:
             options.insert(1, selected)

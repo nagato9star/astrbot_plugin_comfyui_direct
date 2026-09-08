@@ -416,11 +416,6 @@ class WorkflowBuilder:
     def _apply_lora_chain(self, wf: dict, parsed: list[dict]) -> None:
         """旧模板的 LoraLoaderModelOnly 链覆盖：数组顺序映射链节点。"""
         chain = self._collect_lora_chain(wf)
-        base_id = None
-        for nid, node in wf.items():
-            if node.get("class_type") == "UNETLoader":
-                base_id = nid
-                break
         if len(parsed) > len(chain) and chain:
             # 动态扩容：在链尾追加新 LoraLoaderModelOnly 节点
             prev = chain[-1]

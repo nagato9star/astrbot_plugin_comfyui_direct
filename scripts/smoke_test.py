@@ -18,6 +18,7 @@ sys.path.insert(0, str(_PLUGIN_DIR))
 
 if "astrbot" not in sys.modules:
     import types
+    from typing import Generic, TypeVar
 
     _astrbot = types.ModuleType("astrbot")
     _api = types.ModuleType("astrbot.api")
@@ -33,15 +34,44 @@ if "astrbot" not in sys.modules:
             pass
 
     _api.logger = _Logger()
+    _T = TypeVar("_T")
+
+    class _FunctionTool(Generic[_T]):
+        active = True
+
+    class _MessageChain:
+        def file_image(self, path):
+            return self
+
+    class _ContextWrapper(Generic[_T]):
+        pass
+
+    _api.FunctionTool = _FunctionTool
+    _event = types.ModuleType("astrbot.api.event")
+    _event.AstrMessageEvent = object
+    _event.MessageChain = _MessageChain
+    _core = types.ModuleType("astrbot.core")
+    _agent = types.ModuleType("astrbot.core.agent")
+    _run_context = types.ModuleType("astrbot.core.agent.run_context")
+    _run_context.ContextWrapper = _ContextWrapper
+    _astr_context = types.ModuleType("astrbot.core.astr_agent_context")
+    _astr_context.AstrAgentContext = object
     sys.modules["astrbot"] = _astrbot
     sys.modules["astrbot.api"] = _api
+    sys.modules["astrbot.api.event"] = _event
+    sys.modules["astrbot.core"] = _core
+    sys.modules["astrbot.core.agent"] = _agent
+    sys.modules["astrbot.core.agent.run_context"] = _run_context
+    sys.modules["astrbot.core.astr_agent_context"] = _astr_context
 
 from comfy_client import ComfyUIClient  # noqa: E402
+from model_families import ModelFamilyRegistry, WorkflowProfileStore  # noqa: E402
 from recipe_store import RecipeStore  # noqa: E402
 from slot_mapping import (  # noqa: E402
     apply_slots,
     collect_trigger_words,
     detect_slots,
+    node_options_for_slot,
     parse_node_option,
     read_current_values,
     resolve_size,
@@ -49,6 +79,12 @@ from slot_mapping import (  # noqa: E402
     ui_to_api,
 )
 from workflow_builder import WorkflowBuilder  # noqa: E402
+from tools import (  # noqa: E402
+    ComfyuiDrawTool,
+    ComfyuiGenerateTool,
+    ComfyuiRecipeDrawTool,
+    ComfyuiRecipeTool,
+)
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 
@@ -196,6 +232,12 @@ def test_config_dropdown_and_size() -> None:
     assert slots["sampler"]["node"] == "5"
     assert resolve_size(832, 1216, "landscape") == (1216, 832)
     assert resolve_size(832, 1216, "portrait") == (832, 1216)
+    # 传裸节点 id 时不得重复插入同一 label（配置下拉曾因此出现双份选项）
+    wf = _load_fixture("mini_workflow.json")
+    for selected in ("2", "2 — CLIPTextEncode — 正面提示词", ""):
+        options = node_options_for_slot(wf, "prompt", selected)
+        assert len(options) == len(set(options)), options
+    assert node_options_for_slot(wf, "prompt", "2")[1].startswith("2 —")
     print("  config dropdown parse OK")
 
 
@@ -237,6 +279,268 @@ def test_recipe_store_and_draw_schema() -> None:
         assert copied["name"] == "从历史"
         assert copied["defaults"]["model"] == "base.safetensors"
     print("  recipe store / draw schema OK")
+
+
+def test_model_family_routing_and_recipe_decoupling() -> None:
+    registry = ModelFamilyRegistry(
+        [
+            {
+                "__template_key": "family",
+                "name": "anima",
+                "workflow": "anime-flow",
+                "prompt_style": "danbooru",
+            },
+            {
+                "__template_key": "family",
+                "name": "Krea2",
+                "workflow": "photo-flow",
+                "prompt_style": "natural",
+            },
+        ]
+    )
+    assert registry.names() == ["anima", "Krea2"]
+    assert registry.get("KREA2").workflow == "photo-flow"
+    assert registry.by_workflow("anime-flow").name == "anima"
+
+    with tempfile.TemporaryDirectory() as td:
+        store = RecipeStore(Path(td))
+        saved = store.save(
+            {
+                "name": "柔光立绘",
+                "family": "Krea2",
+                "workflow": "should-not-be-saved",
+                "slots": {"prompt": {"node": "2"}},
+                "defaults": {
+                    "model": "krea2-photo.safetensors",
+                    "loras": [{"name": "soft-light.safetensors", "strength": 0.7}],
+                    "steps": 18,
+                },
+            }
+        )
+        assert saved["family"] == "Krea2"
+        assert "workflow" not in saved and "template" not in saved and "slots" not in saved
+        assert registry.resolve_recipe(saved).name == "Krea2"
+        disk = json.loads(store.path_for(saved["id"]).read_text(encoding="utf-8"))
+        assert "workflow" not in disk and "slots" not in disk
+        disabled = store.save(
+            {
+                "name": "无 LoRA",
+                "family": "anima",
+                "defaults": {"loras": []},
+            }
+        )
+        assert disabled["defaults"]["loras"] == []
+    print("  model family routing / recipe decoupling OK")
+
+
+def test_workflow_profile_store() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        profiles = WorkflowProfileStore(Path(td))
+        wf = _load_fixture("mini_workflow.json")
+        effective = profiles.effective("mini", wf)
+        assert effective["slots"]["prompt"]["node"] == "2"
+        profiles.save(
+            "mini",
+            {
+                **effective["slots"],
+                "prompt": {"node": "3", "field": "text"},
+            },
+            ["99"],
+        )
+        reloaded = WorkflowProfileStore(Path(td)).effective("mini", wf)
+        assert reloaded["slots"]["prompt"]["node"] == "3"
+        assert reloaded["drop_nodes"] == ["99"]
+        profiles.save("minimal", {"prompt": {"node": "2"}}, [])
+        minimal = profiles.effective("minimal", wf)
+        assert set(minimal["slots"]) == {"prompt"}
+
+        legacy_store = RecipeStore(Path(td) / "legacy")
+        legacy = legacy_store.save(
+            {
+                "name": "旧配方",
+                "workflow": "legacy-flow",
+                "slots": {"prompt": {"node": "7"}},
+                "defaults": {"model": "base.safetensors"},
+            }
+        )
+        assert profiles.import_legacy_recipe(legacy) is True
+        assert profiles.get("legacy-flow")["slots"]["prompt"]["node"] == "7"
+    print("  workflow profile store OK")
+
+
+def test_llm_entry_schemas() -> None:
+    schema = json.loads((PLUGIN / "_conf_schema.json").read_text(encoding="utf-8"))
+    family_schema = schema["model_families"]
+    assert family_schema["type"] == "template_list"
+    assert {"name", "workflow", "prompt_style", "description"}.issubset(
+        family_schema["templates"]["family"]["items"]
+    )
+    registry = ModelFamilyRegistry(
+        [
+            {"name": "anima", "workflow": "anime-flow", "prompt_style": "danbooru"},
+            {"name": "krea2", "workflow": "photo-flow", "prompt_style": "natural"},
+        ]
+    )
+    draw = ComfyuiDrawTool(families=registry)
+    draw.refresh_schema()
+    assert draw.name == "comfyui_draw"
+    assert draw.parameters["required"] == ["model_family", "prompt"]
+    assert draw.parameters["properties"]["model_family"]["enum"] == ["anima", "krea2"]
+
+    with tempfile.TemporaryDirectory() as td:
+        store = RecipeStore(Path(td), preferred_default="柔光")
+        profiles = WorkflowProfileStore(Path(td))
+        store.save(
+            {
+                "name": "柔光",
+                "family": "krea2",
+                "defaults": {"loras": [{"name": "soft.safetensors", "strength": 0.7}]},
+            }
+        )
+        recipe_draw = ComfyuiRecipeDrawTool(store=store, families=registry)
+        recipe_draw.refresh_schema()
+        assert recipe_draw.name == "comfyui_recipe_draw"
+        assert recipe_draw.parameters["required"] == ["prompt"]
+        assert recipe_draw.parameters["properties"]["recipe"]["enum"] == ["柔光"]
+        assert ComfyuiGenerateTool(
+            store=store,
+            families=registry,
+            profiles=profiles,
+        ).name == "comfyui_generate"
+        assert ComfyuiRecipeTool(store=store, families=registry).name == "comfyui_recipe"
+    print("  llm entry schemas OK")
+
+
+def test_family_and_recipe_generation_paths() -> None:
+    import copy
+    import types
+
+    class FakeClient(ComfyUIClient):
+        timeout = 1
+
+        def __init__(self):
+            self.submitted = []
+
+        async def list_resources(self):
+            return (
+                {
+                    "unet_name": ["base.safetensors", "other.safetensors"],
+                    "lora_name": ["style.safetensors", "soft.safetensors"],
+                    "lora_meta": {},
+                },
+                False,
+            )
+
+        async def submit_prompt_detail(self, workflow):
+            self.submitted.append(copy.deepcopy(workflow))
+            return f"pid-{len(self.submitted)}", None
+
+        async def get_history_entry(self, prompt_id):
+            return {
+                "status": {"status_str": "success"},
+                "outputs": {
+                    "6": {
+                        "images": [
+                            {
+                                "filename": f"{prompt_id}.png",
+                                "subfolder": "",
+                                "type": "output",
+                            }
+                        ]
+                    }
+                },
+            }
+
+        async def download_image(self, *args, **kwargs):
+            return b"fake-image"
+
+    class FakeEvent:
+        unified_msg_origin = "test:family-routing"
+
+        def __init__(self):
+            self.sent = 0
+
+        async def send(self, chain):
+            self.sent += 1
+
+    async def run():
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            builder = WorkflowBuilder(plugin_dir=PLUGIN, default_workflow="mini", custom_dir=root / "workflows")
+            builder.save_template("mini", _load_fixture("mini_workflow.json"))
+            registry = ModelFamilyRegistry(
+                [{"name": "demo", "workflow": "mini", "prompt_style": "natural"}]
+            )
+            profiles = WorkflowProfileStore(root)
+            profiles.ensure("mini", builder.load_template("mini"))
+            store = RecipeStore(root, preferred_default="柔光")
+            client = FakeClient()
+            event = FakeEvent()
+            context = types.SimpleNamespace(context=types.SimpleNamespace(event=event))
+            draw = ComfyuiDrawTool(
+                client=client,
+                builder=builder,
+                store=store,
+                output_dir=root / "output",
+                shared={},
+                families=registry,
+                profiles=profiles,
+            )
+            (root / "output").mkdir()
+            result = await draw.call(
+                context,
+                model_family="demo",
+                prompt="a silver cat",
+                model="other",
+                lora='[{"name":"soft","strength":0.55}]',
+                steps=12,
+                save_as="柔光",
+            )
+            assert "家族=demo" in result
+            assert client.submitted[-1]["2"]["inputs"]["text"] == "a silver cat"
+            assert client.submitted[-1]["1"]["inputs"]["unet_name"] == "other.safetensors"
+            assert client.submitted[-1]["7"]["inputs"]["lora_1"]["lora"] == "soft.safetensors"
+            assert client.submitted[-1]["5"]["inputs"]["steps"] == 12
+            saved = store.get("柔光")
+            assert saved["family"] == "demo" and "workflow" not in saved
+
+            recipe_draw = ComfyuiRecipeDrawTool(
+                draw_tool=draw,
+                store=store,
+                families=registry,
+            )
+            result2 = await recipe_draw.call(context, recipe="柔光", prompt="a blue bird", seed=8)
+            assert "配方=柔光" in result2
+            assert client.submitted[-1]["2"]["inputs"]["text"] == "a blue bird"
+            assert client.submitted[-1]["1"]["inputs"]["unet_name"] == "other.safetensors"
+            assert client.submitted[-1]["5"]["inputs"]["seed"] == 8
+            assert event.sent == 2
+
+            builder.save_template("mini-v2", _load_fixture("mini_workflow.json"))
+            moved_registry = ModelFamilyRegistry(
+                [{"name": "demo", "workflow": "mini-v2", "prompt_style": "natural"}]
+            )
+            profiles.ensure("mini-v2", builder.load_template("mini-v2"))
+            moved_draw = ComfyuiDrawTool(
+                client=client,
+                builder=builder,
+                store=store,
+                output_dir=root / "output",
+                shared={},
+                families=moved_registry,
+                profiles=profiles,
+            )
+            moved_recipe_draw = ComfyuiRecipeDrawTool(
+                draw_tool=moved_draw,
+                store=store,
+                families=moved_registry,
+            )
+            result3 = await moved_recipe_draw.call(context, recipe="柔光", prompt="new workflow")
+            assert "工作流=mini-v2" in result3
+            assert event.sent == 3
+
+    asyncio.run(run())
+    print("  family / recipe generation paths OK")
 
 
 def test_ui_to_api() -> None:
@@ -463,6 +767,10 @@ def main() -> None:
     test_slot_mapping_anima_like()
     test_config_dropdown_and_size()
     test_recipe_store_and_draw_schema()
+    test_model_family_routing_and_recipe_decoupling()
+    test_workflow_profile_store()
+    test_llm_entry_schemas()
+    test_family_and_recipe_generation_paths()
     test_ui_to_api()
     test_workflow_build()
     test_defaults_precedence()

@@ -110,6 +110,14 @@ h3 { font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: 
 }
 .pick-list li:hover .wf-del { display: block; }
 .wf-del:hover { border-color: var(--danger, #c0392b); color: var(--danger, #c0392b); }
+.wf-del.recipe-default {
+  width: auto; height: 20px; padding: 0 6px; line-height: 18px; font-size: 11px;
+}
+.default-tag {
+  font-size: 10px; padding: 0 4px; margin-left: 4px;
+  border: 1px solid var(--ok, #27ae60); border-radius: 4px;
+  color: var(--ok, #27ae60);
+}
 .pick-list .meta { display: block; color: var(--dim); font-size: 11px; }
 .field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--dim); }
 .field.grow { flex: 1; min-width: 140px; }

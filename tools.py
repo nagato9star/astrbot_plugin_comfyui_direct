@@ -1,6 +1,7 @@
 """LLM 工具定义（dataclass FunctionTool 模式，v4.5.7+ 推荐）。
 
-comfyui_draw：按配方生图，可按画面需求选用已安装 LoRA（默认启用）
+comfyui_draw：按模型家族选择工作流，自由生图（默认启用）
+comfyui_recipe_draw：复用保存的配方参数快捷生图（默认启用）
 comfyui_lookup：查询角色/画师/底模/LoRA，支持按用途选择 LoRA（默认启用）
 comfyui_list_models：查询模型/LoRA/CLIP/VAE/Embedding 清单（自动同步缓存）
 comfyui_generate：生成图片（可选模型/LoRA/KSampler 参数）
@@ -32,15 +33,24 @@ from pydantic.dataclasses import dataclass
 from animadex import AnimaDexClient
 from comfy_client import ComfyUIClient, safe_output_path
 from external_search import CivitaiClient, DanbooruClient, GelbooruClient
+from model_families import ModelFamily, ModelFamilyRegistry, WorkflowProfileStore
 from recipe_store import (
     RecipeStore,
     materialize_values,
-    model_family,
     recipe_family,
     recipe_template,
     resolve_generation_entry,
 )
-from slot_mapping import apply_slots, collect_trigger_words, parse_lora, resolve_size
+from slot_mapping import (
+    ANIMA_DROP_NODES,
+    apply_slots,
+    collect_trigger_words,
+    detect_slots,
+    looks_like_anima,
+    parse_lora,
+    read_current_values,
+    resolve_size,
+)
 from workflow_builder import WorkflowBuilder
 
 MAX_LLM_LIST_ITEMS = 30
@@ -325,7 +335,8 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
 
     name: str = "comfyui_generate"
     description: str = (
-        "按当前默认配方或指定工作流生成图片，完成后直接发送到当前会话。日常按配方绘图可用 comfyui_draw。"
+        "高级兼容生成入口，按默认配方或指定工作流生成图片并发送到当前会话。"
+        "日常自由生图使用 comfyui_draw，快捷配方生图使用 comfyui_recipe_draw。"
         "prompt 必填；未覆盖的参数沿用配方、插件配置或模板默认值，width/height 可按构图需求填写。"
         "当 LoRA 有助于实现用户要求的画风、角色、服饰或效果时，可主动查询并选用，用户无需点名 LoRA 或提供文件名。"
         "先用 comfyui_lookup(type=\"lora\", query=需求关键词) 或 comfyui_list_models(kind=\"lora\")，"
@@ -334,7 +345,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
         "省略 lora 会沿用默认设置，传入列表会覆盖对应 LoRA；已有独立加速节点的模板沿用其加速设置。"
         "用户明确要求关闭 LoRA 时可传 \"[]\" 或 \"none\"，旧模板的此操作也会关闭独立加速 LoRA。"
         "角色/画师名称不确定时用 comfyui_lookup 查询；底模、采样参数等按用户要求调整，其余沿用默认值。"
-        "recipe 与 workflow 是两个独立入口：传 recipe 时把参数填进该配方绑定的基底工作流（含其保存的 LoRA）；"
+        "recipe 与 workflow 是两个独立入口：传 recipe 时按其模型家族解析当前工作流并写入保存参数；"
         "传 workflow 时按该模板生成、不套配方；两者都省略时优先默认配方，没有默认配方才用配置的默认工作流模板。"
         "生成成功后回复结果即可，图片已由插件发送。"
     )
@@ -414,7 +425,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 },
                 "recipe": {
                     "type": "string",
-                    "description": "配方入口：已保存的配方名。传入后按该配方绑定的基底工作流出图，配方默认参数兜底，本次显式传入的参数优先；不传则用当前默认配方",
+                    "description": "配方入口：已保存的配方名。传入后通过配方的模型家族选择工作流，配方参数兜底，本次显式参数优先；不传则用当前默认配方",
                 },
             },
             "required": ["prompt"],
@@ -426,6 +437,8 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
     shared: dict = Field(default_factory=dict)  # 跨工具共享状态（如 last_prompt_id）
     defaults: dict = Field(default_factory=dict)  # 插件配置里的生成默认值（LLM 不传时使用）
     store: RecipeStore | None = None  # 配方存储（统一用 RecipeStore）
+    families: ModelFamilyRegistry | None = None
+    profiles: WorkflowProfileStore | None = None
 
     @staticmethod
     def _pick(defaults: dict, key: str, value: Any) -> Any:
@@ -512,7 +525,10 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
             recipe_data = self._load_recipe_data(entry_name)
             if recipe_data is None:
                 return f"生成失败：配方不存在（{entry_name}）。可先 comfyui_recipe list 查看。"
-            if not (recipe_data.get("slots") or {}).get("prompt"):
+            recipe_family_entry = (
+                self.families.resolve_recipe(recipe_data) if self.families is not None else None
+            )
+            if recipe_family_entry is None and not (recipe_data.get("slots") or {}).get("prompt"):
                 display = str(recipe_data.get("name") or entry_name or "默认")
                 return (
                     f"生成失败：配方「{display}」还没指定主提示词节点，"
@@ -611,13 +627,28 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                     if key not in values and val not in (None, "", 0, 0.0, []):
                         values["negative" if key == "negative_prompt" else key] = val
                 values = _validate_generation_values(values)
-                wf = self.builder.load_template(recipe_template(recipe_data) or None)
+                family_entry = (
+                    self.families.resolve_recipe(recipe_data)
+                    if self.families is not None
+                    else None
+                )
+                workflow_name = (
+                    family_entry.workflow if family_entry is not None else recipe_template(recipe_data)
+                )
+                wf = self.builder.load_template(workflow_name or None)
+                if family_entry is not None and self.profiles is not None:
+                    profile = self.profiles.effective(workflow_name, wf)
+                    recipe_slots = profile.get("slots") or {}
+                    recipe_drop_nodes = list(profile.get("drop_nodes") or [])
+                else:
+                    recipe_slots = recipe_data.get("slots") or {}
+                    recipe_drop_nodes = list(recipe_data.get("drop_nodes") or [])
                 apply_slots(
                     wf,
-                    recipe_data.get("slots") or {},
+                    recipe_slots,
                     values,
                     prefix=prefix,
-                    drop_nodes=list(recipe_data.get("drop_nodes") or []),
+                    drop_nodes=recipe_drop_nodes,
                 )
             else:
                 wf = self.builder.build(
@@ -1252,7 +1283,7 @@ class ComfyuiRunWorkflowTool(FunctionTool[AstrAgentContext]):
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
-            raise ValueError(f"workflow 既不是有效路径也不是有效 JSON: {e}") from e
+            raise ValueError(f"workflow 路径与 JSON 格式均无效: {e}") from e
         if not isinstance(data, dict):
             raise ValueError("workflow JSON 必须是对象（节点 id -> 节点）")
         return data
@@ -1744,19 +1775,15 @@ class ComfyuiModelsSearchTool(FunctionTool[AstrAgentContext]):
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
 class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
-    """自研：保存/读取/列出生成配方（prompt + 全部参数），可一键复现。"""
+    """保存、读取和列出与工作流解耦的快捷配方。"""
 
     name: str = "comfyui_recipe"
     description: str = (
-        "把一次生成的全部参数（prompt/artist/quality/trigger_words/negative_prompt/model/lora/"
-        "steps/cfg/sampler/scheduler/denoise/width/height/seed/workflow）保存为命名配方，"
-        "之后可以列出、读取、删除。配方存本地 JSON 文件。"
-        "保存时会绑定一个基底工作流：显式传 workflow 用它，否则沿用默认配方绑定的工作流，"
-        "再没有就用插件配置的默认模板；节点映射也从同工作流的现有配方继承。"
-        "用户想复现某张图、保存常用风格参数时使用。"
-        "action=save（保存，需 name + 至少 prompt）/ action=list（列出）/"
+        "把实验好的底模、LoRA、画幅和采样参数保存为命名配方。配方引用 model_family，"
+        "工作流和节点映射由家族配置统一管理。"
+        "action=save（保存，需 name + model_family）/ action=list（列出）/"
         "action=load（读取一个配方，返回全部参数）/ action=delete（删除）。"
-        "load 出的参数可直接传给 comfyui_generate 复现。"
+        "实际快捷生图使用 comfyui_recipe_draw，只需传配方名和本次 prompt。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -1771,7 +1798,11 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
                     "type": "string",
                     "description": "配方名（save/load/delete 必填）",
                 },
-                "prompt": {"type": "string", "description": "主提示词（save 时必填）"},
+                "prompt": {"type": "string", "description": "可选说明文字；不会作为配方的固定主提示词"},
+                "model_family": {
+                    "type": "string",
+                    "description": "配方适用的模型家族（save 时必填）",
+                },
                 "artist": {"type": "string", "description": "画师串"},
                 "quality": {"type": "string", "description": "质量词"},
                 "trigger_words": {"type": "string", "description": "lora触发词"},
@@ -1786,10 +1817,6 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
                 "width": {"type": "number", "description": "宽度"},
                 "height": {"type": "number", "description": "高度"},
                 "seed": {"type": "number", "description": "种子"},
-                "workflow": {
-                    "type": "string",
-                    "description": "save 时绑定的基底工作流模板名；省略则沿用默认配方的工作流，再没有就用配置默认模板",
-                },
             },
         }
     )
@@ -1797,6 +1824,7 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
     allow_delete: bool = False
     builder: WorkflowBuilder | None = None
     default_workflow: str = ""
+    families: ModelFamilyRegistry | None = None
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         action = str(kwargs.get("action") or "save").strip().lower()
@@ -1832,8 +1860,7 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
             defaults = recipe.get("defaults") or {}
             info = {
                 "name": recipe.get("name") or name,
-                "workflow": recipe_template(recipe),
-                "prompt": defaults.get("prompt") or "",
+                "model_family": recipe.get("family") or recipe_family(recipe),
                 "model": defaults.get("model") or "",
                 "lora": json.dumps(defaults.get("loras") or [], ensure_ascii=False),
                 "width": defaults.get("width") or "",
@@ -1851,9 +1878,13 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
             return "配方参数:\n" + json.dumps(info, ensure_ascii=False, indent=2)
 
         # save
-        prompt = str(kwargs.get("prompt") or "").strip()
-        if not prompt:
-            return "保存失败：prompt 不能为空。"
+        family_name = str(kwargs.get("model_family") or "").strip()
+        if not family_name:
+            return "保存失败：model_family 不能为空。"
+        family = self.families.get(family_name) if self.families is not None else None
+        if family is None:
+            available = "、".join(self.families.names()) if self.families else "无"
+            return f"保存失败：模型家族「{family_name}」不存在。可用家族：{available}"
         lora_val = kwargs.get("lora")
         if lora_val:
             try:
@@ -1862,70 +1893,44 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
                 return f"保存失败：{e}"
         else:
             parsed_loras = []
-        # prompt 是配方的复现输入；不能误存为 trigger_words，否则下次会把整段
-        # 主提示词拼进 LoRA 触发词节点。
-        defaults: dict[str, Any] = {"prompt": prompt}
+        defaults: dict[str, Any] = {}
         for key in ("artist", "quality", "model", "sampler_name", "scheduler"):
             v = kwargs.get(key)
             if v is not None and v != "":
                 defaults[key] = v
         if kwargs.get("negative_prompt"):
             defaults["negative"] = kwargs["negative_prompt"]
-        if parsed_loras:
+        if lora_val not in (None, ""):
             defaults["loras"] = parsed_loras
         for key in ("steps", "cfg", "denoise", "width", "height"):
             v = kwargs.get(key)
             if v is not None:
                 defaults[key] = v
 
-        # 配方必须绑定一个基底工作流：显式指定 > 默认配方绑定的 > 配置默认模板。
-        workflow_name = str(kwargs.get("workflow") or "").strip()
-        if workflow_name and self.builder is not None:
-            try:
-                self.builder.resolve_workflow_path(workflow_name)
-            except (FileNotFoundError, ValueError):
-                workflow_name = ""
-        if not workflow_name:
-            base = self.store.default() if self.store else None
-            workflow_name = recipe_template(base) or self.default_workflow
-        # 槽位映射跟着基底工作流走：同工作流的现有配方（默认配方优先）已映射
-        # 过主提示词就直接继承，避免存出没有槽位、生成时无法填 prompt 的配方。
-        slots: dict = {}
-        slot_from = ""
-        if self.store is not None:
-            slots, slot_from = self.store.base_slots_for(workflow_name)
         try:
             assert self.store is not None
             self.store.save({
                 "name": name,
-                "description": prompt[:60],
-                "template": workflow_name,
-                "workflow": workflow_name,
-                "slots": slots,
+                "description": str(kwargs.get("prompt") or "")[:60],
+                "family": family.name,
                 "defaults": defaults,
             })
         except (ValueError, OSError) as e:
             return f"保存失败：{e}"
-        note = f"配方已保存: {name}（基底工作流 {workflow_name or '未绑定'}"
-        if slot_from:
-            note += f"，节点映射沿用「{slot_from}」"
-        return note + "）"
+        return f"配方已保存: {name}（模型家族 {family.name}）"
 
 
 _DRAW_DESC = (
-    "按配方为用户画一张图，完成后直接发送到当前会话。prompt 必填，其余参数可按需覆盖。"
-    "普通绘图可以只填 prompt，沿用默认配方。"
+    "按模型家族自由生成图片，完成后直接发送到当前会话。model_family 和 prompt 必填。"
+    "模型家族决定工作流；其余参数仅按本次需求填写，未填写的值保留该工作流自身设置。"
     "当 LoRA 有助于实现用户要求的画风、角色、服饰或效果时，可主动查询并选用，用户无需点名 LoRA 或提供文件名。"
     "先用 comfyui_lookup(type=\"lora\", query=需求关键词)，如 style、character、服饰或效果标签；"
     "根据返回的用途说明、模型适用信息和推荐权重选择，将实际文件名填入 lora。"
     "使用已记录的触发词时同步填写 trigger_words；查询未提供触发词时可省略该字段并继续使用 LoRA。"
-    "传入 lora 会覆盖配方映射节点的列表，要保留的原 LoRA 也需列入；用户要求沿用配方或已有设置足够时省略 lora。"
-    "用户选择配方或底模时填写 recipe/model；要求画幅时填写 size=portrait/landscape/square；"
-    "画师、画质、负向内容、steps、cfg 等按用户要求调整，未调整的项沿用默认值。"
-    "用户要求记住这套参数时填写 save_as。"
-    "换底模时插件会校验模型家族：跨系模型（如 anima 配方换 krea/qwen）会自动切到同系配方，"
-    "没有同系配方则报错让主人先建，此时转告用户即可，不要重试别的模型名。"
-    "不同系模型请用对应系配方的画法（krea/qwen/flux 用自然语言描述，不要 danbooru 画师串）。"
+    "传入 lora 会覆盖工作流映射节点的列表，要保留的原 LoRA 也需列入；沿用工作流设置时省略 lora。"
+    "要求画幅时填写 size=portrait/landscape/square；画师、画质、负向内容、steps、cfg 等按需求调整。"
+    "用户要求记住本次参数时填写 save_as，插件会保存成引用该模型家族的快捷配方。"
+    "提示词格式遵循模型家族清单中的 prompt_style。"
     "模型和 LoRA 文件名使用查询结果，触发词保留已知原词格式。"
 )
 
@@ -1956,7 +1961,7 @@ def _match_resource(names: list[str], query: str, limit: int = 8) -> list[str]:
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
 class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
-    """按配方生图。节点由配置下拉框指定；底模/LoRA 用配方或本次覆盖。"""
+    """按配置的模型家族选择工作流，自由覆盖本次生成参数。"""
 
     name: str = "comfyui_draw"
     description: str = _DRAW_DESC
@@ -1966,11 +1971,11 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "要画的内容，必填。按配方模型组织提示词：Anima 使用 danbooru 风格 tag，Krea/Qwen/Flux 使用自然语言描述",
+                    "description": "要画的内容，必填。根据所选模型家族的 prompt_style 组织提示词",
                 },
-                "recipe": {
+                "model_family": {
                     "type": "string",
-                    "description": "用哪套配方。用户没点名就不要填",
+                    "description": "模型家族，必填。只能填写配置中公开的家族名；插件据此选择对应工作流",
                 },
                 "model": {
                     "type": "string",
@@ -1978,7 +1983,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                 },
                 "lora": {
                     "type": "string",
-                    "description": "本次使用的 LoRA，可按画风、角色、服饰或效果需求主动查询并选用，无需用户提供名称。填写查询得到的文件名或唯一关键词，多个用逗号；指定权重时传 JSON 数组字符串，如 [{\"name\":\"查询得到的文件名\",\"strength\":0.8}]。覆盖配方映射节点原列表，要保留的 LoRA 也需列入；省略则沿用配方。用户要求关闭时传 \"[]\" 或 \"none\"，Power 加载器的清空操作也会关闭独立加速 LoRA",
+                    "description": "本次使用的 LoRA，可按画风、角色、服饰或效果需求主动查询并选用，无需用户提供名称。填写查询得到的文件名或唯一关键词，多个用逗号；指定权重时传 JSON 数组字符串，如 [{\"name\":\"查询得到的文件名\",\"strength\":0.8}]。覆盖工作流映射节点的原列表，要保留的 LoRA 也需列入；省略则沿用工作流。用户要求关闭时传 \"[]\" 或 \"none\"",
                 },
                 "size": {
                     "type": "string",
@@ -2009,6 +2014,26 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                     "type": "number",
                     "description": "CFG。用户明确说改才填",
                 },
+                "width": {
+                    "type": "number",
+                    "description": "精确宽度；用户指定像素尺寸时填写",
+                },
+                "height": {
+                    "type": "number",
+                    "description": "精确高度；用户指定像素尺寸时填写",
+                },
+                "sampler_name": {
+                    "type": "string",
+                    "description": "采样器；仅在用户指定或明确需要调整时填写",
+                },
+                "scheduler": {
+                    "type": "string",
+                    "description": "调度器；仅在用户指定或明确需要调整时填写",
+                },
+                "denoise": {
+                    "type": "number",
+                    "description": "降噪强度 0 到 1；仅在需要调整时填写",
+                },
                 "seed": {
                     "type": "number",
                     "description": "种子。用户要复现某张图才填，否则不填",
@@ -2018,7 +2043,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                     "description": "用户说记住这套/存成某某时，填新配方名",
                 },
             },
-            "required": ["prompt"],
+            "required": ["model_family", "prompt"],
         }
     )
     client: ComfyUIClient | None = None
@@ -2026,28 +2051,22 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
     store: RecipeStore | None = None
     output_dir: Path | None = None
     shared: dict = Field(default_factory=dict)
-    config_defaults: dict = Field(default_factory=dict)
+    families: ModelFamilyRegistry | None = None
+    profiles: WorkflowProfileStore | None = None
     on_schema_change: Any = None
 
     def refresh_schema(self) -> None:
-        names = _recipe_enum(self.store)
-        catalog = ""
-        if self.store is not None:
-            try:
-                catalog = self.store.catalog()
-            except Exception:
-                catalog = ""
-        self.description = _DRAW_DESC + (
-            f" 现有配方：{catalog}" if catalog else " 还没有配方，先让主人在工作台保存一套。"
-        )
+        names = self.families.names() if self.families is not None else []
+        catalog = self.families.catalog() if self.families is not None else ""
+        self.description = _DRAW_DESC + (f" 可用家族：{catalog}" if catalog else " 当前没有可用模型家族配置。")
         props = self.parameters.setdefault("properties", {})
-        recipe_prop = props.setdefault("recipe", {"type": "string"})
+        family_prop = props.setdefault("model_family", {"type": "string"})
         if names:
-            recipe_prop["enum"] = names
-            recipe_prop["description"] = "用户点名时才填。可选：" + "、".join(names[:16])
+            family_prop["enum"] = names
+            family_prop["description"] = "必填。可选模型家族：" + "、".join(names[:24])
         else:
-            recipe_prop.pop("enum", None)
-            recipe_prop["description"] = "用户点名时才填。没有配方就不要填"
+            family_prop.pop("enum", None)
+            family_prop["description"] = "必填。请先由管理员在插件配置中添加模型家族"
 
     async def _resource_lists(self) -> dict:
         if self.client is None:
@@ -2092,128 +2111,95 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             return None, f"「{query}」对上了好几份 LoRA：{preview}。请让用户选一个，或填更完整的名字。"
         return resolved, None
 
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
-        prompt = str(kwargs.get("prompt") or "").strip()
-        if not prompt:
-            return "生成失败：prompt 不能为空。"
-        if self.store is None or self.builder is None or self.client is None:
+    async def _execute(
+        self,
+        context: ContextWrapper[AstrAgentContext],
+        *,
+        prompt: str,
+        values: dict[str, Any],
+        family: ModelFamily | None,
+        recipe: dict | None = None,
+        size_token: str = "",
+        save_as: str = "",
+        legacy_workflow: str = "",
+        legacy_slots: dict | None = None,
+        legacy_drop_nodes: list[str] | None = None,
+    ) -> str:
+        """执行一条已解析的家族或旧配方生成任务。"""
+        if (
+            self.builder is None
+            or self.client is None
+            or self.store is None
+            or self.output_dir is None
+        ):
             return "生成失败：插件未初始化完成。"
 
-        recipe_name = str(kwargs.get("recipe") or "").strip()
-        recipe = self.store.get(recipe_name) if recipe_name else self.store.default()
-        if recipe is None:
-            if recipe_name:
-                return f"没有叫「{recipe_name}」的配方。先跟用户说现有配方名，或请主人在配方工作台里新建一套。"
-            return "还没有配方。请主人先在配方工作台：导入工作流 → 确认「用户要画的内容」和「出图采样」→ 保存。"
-
-        slots = recipe.get("slots") or {}
-        if not slots.get("prompt"):
-            return "这套配方还没指定「用户要画的内容」写到哪。请主人在工作台或配置下拉框里选一下。"
-
-        seed = kwargs.get("seed")
-        if seed is None:
-            seed = random.randint(0, 2**31 - 1)
-
-        model_raw = str(kwargs.get("model") or "").strip()
-        lora_raw = kwargs.get("lora") if kwargs.get("lora") not in (None, "") else kwargs.get("loras")
-        resolved_model = None
-        resolved_loras = None
-        switched_note = ""
-        if model_raw:
-            resolved_model, err = await self._resolve_model(model_raw)
-            if err:
-                return err
-            # 家族守卫：跨系模型的 CLIP/采样结构不通用（如 anima 配方硬塞 krea 底模只会出错）。
-            # 优先自动切到同家族配方；没有同家族配方就明确拒绝，提示先建配方。
-            new_family = model_family(resolved_model)
-            cur_family = recipe_family(recipe)
-            if new_family and cur_family and new_family != cur_family:
-                target = None
-                for row in self.store.list():
-                    if str(row.get("id")) == str(recipe.get("id")):
-                        continue
-                    if recipe_family(row) != new_family:
-                        continue
-                    full = self.store.get(str(row.get("id") or ""))
-                    if full and (full.get("slots") or {}).get("prompt"):
-                        target = full
-                        break
-                if target is None:
-                    return (
-                        f"「{model_raw}」是 {new_family} 系模型，和当前配方「{recipe.get('name')}」"
-                        f"（{cur_family} 系）不通用，没法直接换。"
-                        f"请主人先在配方工作台给 {new_family} 模型建一套配方，"
-                        f"或换回 {cur_family} 系底模。"
-                    )
-                recipe = target
-                slots = recipe.get("slots") or {}
-                switched_note = f" 已自动切换到配方「{recipe.get('name')}」。"
-                if not slots.get("prompt"):
-                    return "新配方还没指定「用户要画的内容」写到哪，请主人在工作台里选一下。"
-            if not slots.get("model"):
-                # 当前配方（含刚切换的）没开底模格子：换不了指定模型
-                if switched_note:
-                    resolved_model = None  # 沿用新配方默认底模
-                else:
-                    return "这套配方还没指定底模格子，换不了模型。请主人在工作台里选一下「底模」。"
-        if lora_raw not in (None, ""):
-            resolved_loras, err = await self._resolve_loras(lora_raw)
-            if err:
-                return err
-            if not slots.get("loras"):
-                return "这套配方还没指定 LoRA 格子，换不了 LoRA。请主人在工作台里选一下「LoRA」。"
-
-        if kwargs.get("steps") not in (None, "") or kwargs.get("cfg") not in (None, ""):
-            if not slots.get("sampler") and not slots.get("sampler_2"):
-                return "这套配方还没指定出图采样，改不了步数。请主人在工作台里选一下「出图采样」。"
-
-        # 自动填 lora 触发词已禁用（33号要求），需要时显式传 trigger_words
-
-        overrides = {
-            "prompt": prompt,
-            "seed": seed,
-            "artist": kwargs.get("artist"),
-            "quality": kwargs.get("quality"),
-            "trigger_words": kwargs.get("trigger_words"),
-            "negative": kwargs.get("negative_prompt") or kwargs.get("negative"),
-            "model": resolved_model,
-            "loras": resolved_loras,
-            "steps": kwargs.get("steps"),
-            "cfg": kwargs.get("cfg"),
-        }
-        values = materialize_values(recipe, overrides)
-        for key, val in self.config_defaults.items():
-            if key not in values and val not in (None, "", 0, 0.0, []):
-                values["negative" if key == "negative_prompt" else key] = val
-
-        size_token = str(kwargs.get("size") or "").strip()
+        workflow_name = family.workflow if family is not None else legacy_workflow
+        if not workflow_name:
+            return "生成失败：没有可用工作流。请先在模型家族配置中选择工作流。"
         try:
-            values["seed"] = _number(seed, "seed", integer=True, minimum=0, maximum=2**63 - 1)
-            values = _validate_generation_values(values)
-            seed = values["seed"]
-            if size_token:
-                values["width"], values["height"] = resolve_size(
-                    int(values["width"]) if values.get("width") else None,
-                    int(values["height"]) if values.get("height") else None,
-                    size_token,
-                    presets=recipe.get("size_presets"),
-                )
-                values = _validate_generation_values(values)
-        except ValueError as e:
-            return f"生成失败：参数错误（{e}）"
-
-        try:
-            wf = self.builder.load_template(recipe_template(recipe) or None)
+            wf = self.builder.load_template(workflow_name)
         except FileNotFoundError as e:
             return f"生成失败：{e}"
 
+        if family is not None and self.profiles is not None:
+            profile = self.profiles.effective(workflow_name, wf)
+            slots = profile.get("slots") or {}
+            drop_nodes = list(profile.get("drop_nodes") or [])
+        elif legacy_slots:
+            slots = legacy_slots
+            drop_nodes = list(legacy_drop_nodes or [])
+        else:
+            slots = detect_slots(wf)
+            drop_nodes = list(ANIMA_DROP_NODES) if looks_like_anima(wf) else []
+
+        if not slots.get("prompt"):
+            return (
+                f"工作流「{workflow_name}」还没指定主提示词节点。"
+                "请主人在配方工作台确认这张工作流的槽位映射。"
+            )
+        if "model" in values and values.get("model") not in (None, "") and not slots.get("model"):
+            return f"工作流「{workflow_name}」没有映射底模槽位，无法替换底模。"
+        if "loras" in values and values.get("loras") is not None and not slots.get("loras"):
+            return f"工作流「{workflow_name}」没有映射 LoRA 槽位，无法写入 LoRA。"
+        if any(values.get(k) not in (None, "") for k in ("steps", "cfg", "sampler_name", "scheduler", "denoise")):
+            if not slots.get("sampler") and not slots.get("sampler_2"):
+                return f"工作流「{workflow_name}」没有映射采样槽位，无法写入采样参数。"
+        size_token = str(size_token or "").strip().lower()
+        change_size = bool(size_token and size_token != "same")
+        if (
+            change_size
+            or values.get("width") not in (None, "")
+            or values.get("height") not in (None, "")
+        ) and not slots.get("size"):
+            return f"工作流「{workflow_name}」没有映射画面大小槽位，无法修改画幅。"
+
+        seed = values.get("seed")
+        if seed is None:
+            seed = random.randint(0, 2**31 - 1)
+        values = dict(values)
+        values["prompt"] = prompt
+        values["seed"] = seed
         try:
+            values = _validate_generation_values(values)
+            seed = values["seed"]
+            if change_size:
+                current = read_current_values(wf, slots)
+                width = values.get("width") or current.get("width")
+                height = values.get("height") or current.get("height")
+                values["width"], values["height"] = resolve_size(
+                    int(width) if width else None,
+                    int(height) if height else None,
+                    size_token,
+                    presets=(recipe or {}).get("size_presets"),
+                )
+                values = _validate_generation_values(values)
             apply_slots(
                 wf,
                 slots,
                 values,
                 prefix=f"astrbot_{uuid.uuid4().hex[:8]}",
-                drop_nodes=list(recipe.get("drop_nodes") or []),
+                drop_nodes=drop_nodes,
             )
         except (TypeError, ValueError) as e:
             return f"生成失败：参数错误（{e}）"
@@ -2231,85 +2217,83 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         if outputs is None:
             return "生成失败：未获取到执行结果。"
 
-        images = []
+        images: list[dict] = []
         for node_out in outputs.values():
             images.extend(node_out.get("images", []))
         if not images:
             return "生成完成，但没有输出图片。"
-
-        img = None
-        for item in images:
-            if item.get("type") == "output":
-                img = item
-                break
-        if not img:
-            img = images[-1] if images else None
-        if not img:
+        img = next((item for item in images if item.get("type") == "output"), images[-1])
+        filename = str(img.get("filename") or "")
+        if not filename:
             return "生成完成，但没有有效图片。"
-
-        filename = img["filename"]
-        img_type = img.get("type", "output")
         content = await self.client.download_image(
-            filename, subfolder=img.get("subfolder", ""), image_type=img_type
+            filename,
+            subfolder=img.get("subfolder", ""),
+            image_type=img.get("type", "output"),
         )
         if not content:
             return f"图片已生成但下载失败（{filename}）。"
-
         try:
             local_path = safe_output_path(self.output_dir, filename)
             local_path.write_bytes(content)
         except (OSError, ValueError) as e:
             return f"图片已生成但本地保存失败（{e}）。"
 
-        used = {
-            "prompt": prompt,
-            "model": values.get("model"),
-            "loras": values.get("loras") or values.get("lora"),
-            "width": values.get("width"),
-            "height": values.get("height"),
-            "steps": values.get("steps"),
-            "cfg": values.get("cfg"),
-            "sampler_name": values.get("sampler_name"),
-            "scheduler": values.get("scheduler"),
-            "denoise": values.get("denoise"),
-            "trigger_words": values.get("trigger_words"),
-            "seed": seed,
-        }
+        actual = read_current_values(wf, slots)
+        used = dict(actual)
+        used.update({k: v for k, v in values.items() if v is not None and v != ""})
+        used["prompt"] = prompt
+        used["seed"] = seed
+        family_name = family.name if family is not None else str((recipe or {}).get("family") or "")
         self.store.save_history(
             {
                 "prompt_id": pid,
-                "recipe": recipe.get("name"),
-                "recipe_id": recipe.get("id"),
-                "template": recipe_template(recipe),
-                "workflow": recipe_template(recipe),
+                "entry": "recipe" if recipe else "family",
+                "family": family_name,
+                "recipe": (recipe or {}).get("name"),
+                "recipe_id": (recipe or {}).get("id"),
+                "workflow": workflow_name,
                 "slots": slots,
-                "drop_nodes": recipe.get("drop_nodes") or [],
+                "drop_nodes": drop_nodes,
                 "prompt": prompt,
-                "values": {k: v for k, v in used.items() if v not in (None, "", [])},
+                "values": {
+                    k: v
+                    for k, v in used.items()
+                    if k != "prompt"
+                    and v not in (None, "")
+                    and (v != [] or k == "loras")
+                },
                 "filename": filename,
                 "local_path": str(local_path),
             }
         )
 
-        save_as = str(kwargs.get("save_as") or "").strip()
         saved_note = ""
         if save_as:
-            try:
-                self.store.save(
-                    {
-                        "name": save_as,
-                        "description": f"从 {recipe.get('name')} 另存",
-                        "template": recipe_template(recipe),
-                        "workflow": recipe_template(recipe),
-                        "slots": slots,
-                        "defaults": {k: v for k, v in used.items() if k != "seed" and v not in (None, "", [])},
-                        "drop_nodes": recipe.get("drop_nodes") or [],
-                    }
-                )
-                self.refresh_schema()
-                saved_note = f" 已另存配方 {save_as}。"
-            except ValueError as e:
-                saved_note = f" 另存配方失败：{e}"
+            if family is None:
+                saved_note = " 当前是旧配方兼容路径，未另存新配方。"
+            else:
+                recipe_defaults = {
+                    k: v
+                    for k, v in used.items()
+                    if k not in {"prompt", "seed"}
+                    and v not in (None, "")
+                    and (v != [] or k == "loras")
+                }
+                try:
+                    self.store.save(
+                        {
+                            "name": save_as,
+                            "description": f"从 {family.name} 家族自由生图保存",
+                            "family": family.name,
+                            "defaults": recipe_defaults,
+                        }
+                    )
+                    if callable(self.on_schema_change):
+                        self.on_schema_change()
+                    saved_note = f" 已保存快捷配方「{save_as}」。"
+                except (OSError, ValueError) as e:
+                    saved_note = f" 保存配方失败：{e}"
 
         try:
             event: AstrMessageEvent = context.context.event
@@ -2319,17 +2303,211 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             return f"图片已生成但发送失败（{e}）。路径: {local_path}"
 
         w, h = used.get("width") or "?", used.get("height") or "?"
-        model_note = used.get("model") or "配方原底模"
+        source = (
+            f"配方={recipe.get('name')} 家族={family_name or '旧版'}"
+            if recipe
+            else f"家族={family_name}"
+        )
+        model_note = used.get("model") or "工作流原底模"
         lora_items = used.get("loras") or []
         if isinstance(lora_items, list) and lora_items:
             lora_note = ",".join(
                 str(x.get("name") if isinstance(x, dict) else x) for x in lora_items[:4]
             )
+        elif "loras" in values:
+            lora_note = "已关闭"
         else:
-            lora_note = "配方原 LoRA"
+            lora_note = "工作流原 LoRA"
         return (
-            f"已发送。配方={recipe.get('name')} 底模={model_note} "
-            f"lora={lora_note} seed={seed} size={w}x{h}.{switched_note}{saved_note}"
+            f"已发送。{source} 工作流={workflow_name} 底模={model_note} "
+            f"lora={lora_note} seed={seed} size={w}x{h}.{saved_note}"
+        )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        prompt = str(kwargs.get("prompt") or "").strip()
+        if not prompt:
+            return "生成失败：prompt 不能为空。"
+        if self.families is None:
+            return "生成失败：模型家族配置未初始化。"
+
+        requested_family = str(kwargs.get("model_family") or "").strip()
+        if not requested_family:
+            available = "、".join(self.families.names()) or "无"
+            return f"生成失败：model_family 必填。可用家族：{available}"
+        family = self.families.get(requested_family)
+        if family is None:
+            available = "、".join(self.families.names()) or "无"
+            return f"生成失败：模型家族「{requested_family}」不存在。可用家族：{available}"
+
+        values: dict[str, Any] = {
+            "prompt": prompt,
+            "seed": kwargs.get("seed"),
+        }
+        model_raw = str(kwargs.get("model") or "").strip()
+        if model_raw:
+            resolved_model, err = await self._resolve_model(model_raw)
+            if err:
+                return err
+            values["model"] = resolved_model
+        lora_present = (
+            kwargs.get("lora") not in (None, "")
+            or kwargs.get("loras") not in (None, "")
+        )
+        if lora_present:
+            raw_loras = (
+                kwargs.get("lora")
+                if kwargs.get("lora") not in (None, "")
+                else kwargs.get("loras")
+            )
+            resolved_loras, err = await self._resolve_loras(raw_loras)
+            if err:
+                return err
+            values["loras"] = resolved_loras
+
+        for source, target in (
+            ("artist", "artist"),
+            ("quality", "quality"),
+            ("trigger_words", "trigger_words"),
+            ("negative", "negative"),
+            ("negative_prompt", "negative"),
+            ("width", "width"),
+            ("height", "height"),
+            ("steps", "steps"),
+            ("cfg", "cfg"),
+            ("sampler_name", "sampler_name"),
+            ("scheduler", "scheduler"),
+            ("denoise", "denoise"),
+        ):
+            if kwargs.get(source) not in (None, ""):
+                values[target] = kwargs[source]
+
+        return await self._execute(
+            context,
+            prompt=prompt,
+            values=values,
+            family=family,
+            size_token=str(kwargs.get("size") or "").strip(),
+            save_as=str(kwargs.get("save_as") or "").strip(),
+        )
+
+
+_RECIPE_DRAW_DESC = (
+    "使用已经实验并保存好的配方快捷生图，完成后直接发送到当前会话。"
+    "prompt 必填，recipe 在用户点名配方时填写；省略 recipe 使用配置的默认配方。"
+    "配方保存底模、LoRA、画幅和采样参数，并通过 model family 使用当前配置的工作流。"
+    "本工具用于复用固定方案；需要自由选择底模、LoRA 或采样参数时调用 comfyui_draw。"
+)
+
+
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+class ComfyuiRecipeDrawTool(FunctionTool[AstrAgentContext]):
+    """按配方参数快捷生图。"""
+
+    name: str = "comfyui_recipe_draw"
+    description: str = _RECIPE_DRAW_DESC
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "本次要画的内容，必填；会写入配方所属家族工作流的主提示词槽位",
+                },
+                "recipe": {
+                    "type": "string",
+                    "description": "已保存的配方名。用户点名时填写，省略则使用默认配方",
+                },
+                "size": {
+                    "type": "string",
+                    "enum": ["portrait", "landscape", "square", "same"],
+                    "description": "可选的临时画幅方向；省略时完整沿用配方",
+                },
+                "seed": {
+                    "type": "number",
+                    "description": "仅在复现结果时填写；省略则随机",
+                },
+            },
+            "required": ["prompt"],
+        }
+    )
+    draw_tool: ComfyuiDrawTool | None = None
+    store: RecipeStore | None = None
+    families: ModelFamilyRegistry | None = None
+
+    def refresh_schema(self) -> None:
+        names = _recipe_enum(self.store)
+        catalog = self.store.catalog() if self.store is not None else ""
+        self.description = _RECIPE_DRAW_DESC + (
+            f" 可用配方：{catalog}" if catalog else " 当前还没有配方。"
+        )
+        prop = self.parameters.setdefault("properties", {}).setdefault(
+            "recipe", {"type": "string"}
+        )
+        if names:
+            prop["enum"] = names
+            prop["description"] = "用户点名时填写；可选：" + "、".join(names[:24])
+        else:
+            prop.pop("enum", None)
+            prop["description"] = "当前没有配方，请先在配方工作台保存"
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        prompt = str(kwargs.get("prompt") or "").strip()
+        if not prompt:
+            return "生成失败：prompt 不能为空。"
+        if self.draw_tool is None or self.store is None or self.families is None:
+            return "生成失败：插件未初始化完成。"
+
+        recipe_name = str(kwargs.get("recipe") or "").strip()
+        recipe = self.store.get(recipe_name) if recipe_name else self.store.default()
+        if recipe is None:
+            if recipe_name:
+                return f"生成失败：配方「{recipe_name}」不存在。"
+            return "生成失败：还没有可用配方，请先在配方工作台保存一套。"
+
+        family = self.families.resolve_recipe(recipe)
+        explicit_family = str(recipe.get("family") or "").strip()
+        has_legacy_route = bool(
+            recipe_template(recipe) and (recipe.get("slots") or {}).get("prompt")
+        )
+        if explicit_family and family is None and not has_legacy_route:
+            available = "、".join(self.families.names())
+            return (
+                f"生成失败：配方「{recipe.get('name')}」引用的模型家族「{explicit_family}」"
+                f"未配置。当前可用：{available}"
+            )
+        legacy_workflow = ""
+        legacy_slots: dict | None = None
+        legacy_drop_nodes: list[str] | None = None
+        if family is None:
+            legacy_workflow = recipe_template(recipe)
+            legacy_slots = recipe.get("slots") or {}
+            legacy_drop_nodes = list(recipe.get("drop_nodes") or [])
+            if not legacy_workflow:
+                return (
+                    f"生成失败：配方「{recipe.get('name')}」没有模型家族。"
+                    "请在配方工作台为它选择家族后重新保存。"
+                )
+
+        seed = kwargs.get("seed")
+        if seed is None:
+            seed = random.randint(0, 2**31 - 1)
+        values = materialize_values(
+            recipe,
+            {
+                "prompt": prompt,
+                "seed": seed,
+            },
+        )
+        return await self.draw_tool._execute(
+            context,
+            prompt=prompt,
+            values=values,
+            family=family,
+            recipe=recipe,
+            size_token=str(kwargs.get("size") or "").strip(),
+            legacy_workflow=legacy_workflow,
+            legacy_slots=legacy_slots,
+            legacy_drop_nodes=legacy_drop_nodes,
         )
 
 

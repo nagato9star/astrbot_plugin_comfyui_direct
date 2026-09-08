@@ -1,7 +1,7 @@
 """配方与生成历史。
 
-配方保存的是人选定的节点映射，以及底模 / LoRA / 比例 / KSampler 参数。
-prompt 可以随历史一起保存，但配方生成时仍以本次 LLM 显式传入的 prompt 为准。
+新版配方只引用模型家族并保存底模、LoRA、画幅与采样参数。工作流及节点槽位
+由模型家族和工作流档案管理；旧配方的 workflow/slots 字段继续兼容读取。
 """
 
 from __future__ import annotations
@@ -49,11 +49,7 @@ def slugify(name: str) -> str:
 
 
 def recipe_template(recipe: dict) -> str:
-    """配方绑定的模板名。正式字段是 template；旧数据里的 workflow 作为别名兼容读取。
-
-    配方（怎么画：槽位映射+默认值）和工作流模板（画布骨架）是两回事，
-    配方只引用模板名，节点号映射仅对它绑定的那套模板有意义。
-    """
+    """读取旧配方绑定的模板名；新配方通过 family 在运行时解析工作流。"""
     r = recipe or {}
     return str(r.get("template") or r.get("workflow") or "").strip()
 
@@ -145,6 +141,8 @@ class RecipeStore:
         parts = []
         for row in self.list()[:limit]:
             bits = [row.get("name") or row["id"]]
+            if row.get("family"):
+                bits.append(f"family={row['family']}")
             if row.get("description"):
                 bits.append(str(row["description"])[:24])
             if row.get("model"):
@@ -226,23 +224,28 @@ class RecipeStore:
                 stale = self.path_for(str(row.get("id") or ""))
                 if stale.is_file():
                     stale.unlink()
+        family = str(recipe.get("family") or "").strip()
         data = {
             "id": rid,
             "name": name,
             "description": str(recipe.get("description") or "").strip(),
-            # 模板引用：template 是正式字段；workflow 为兼容期冗余副本，读端一律走 recipe_template()
-            "template": str(recipe.get("template") or recipe.get("workflow") or "").strip(),
-            "workflow": str(recipe.get("template") or recipe.get("workflow") or "").strip(),
-            "slots": recipe.get("slots") or {},
             "defaults": _clean_defaults(recipe.get("defaults") or {}),
-            "drop_nodes": list(recipe.get("drop_nodes") or []),
             "updated_at": int(time.time()),
         }
-        # 可选扩展字段：家族、画幅档位、提示词风格（换家族模型/跨系画幅用）
-        for key in ("family", "prompt_style"):
-            val = str(recipe.get(key) or "").strip()
-            if val:
-                data[key] = val.casefold()
+        if family:
+            # 新格式：配方只引用家族。工作流、槽位与节点清理规则归工作流档案所有。
+            data["family"] = family
+        else:
+            # 旧格式兼容：没有家族时仍保留原绑定，便于升级前的数据继续运行。
+            template = str(recipe.get("template") or recipe.get("workflow") or "").strip()
+            data.update(
+                {
+                    "template": template,
+                    "workflow": template,
+                    "slots": recipe.get("slots") or {},
+                    "drop_nodes": list(recipe.get("drop_nodes") or []),
+                }
+            )
         presets = recipe.get("size_presets")
         if isinstance(presets, dict) and presets:
             data["size_presets"] = presets
@@ -308,7 +311,7 @@ class RecipeStore:
         if entry is None:
             raise ValueError(f"历史不存在: {prompt_id}")
         defaults = dict(entry.get("values") or entry.get("defaults") or {})
-        if entry.get("prompt") and "prompt" not in defaults:
+        if not entry.get("family") and entry.get("prompt") and "prompt" not in defaults:
             defaults["prompt"] = entry["prompt"]
         recipe = {
             "id": slugify(name),
@@ -320,6 +323,8 @@ class RecipeStore:
             "defaults": _clean_defaults(defaults),
             "drop_nodes": list(entry.get("drop_nodes") or []),
         }
+        if entry.get("family"):
+            recipe["family"] = entry["family"]
         return self.save(recipe)
 
     def bootstrap(
@@ -329,6 +334,7 @@ class RecipeStore:
         wf: dict,
         config_slots: Any = None,
         config_defaults: dict | None = None,
+        family: str = "",
     ) -> dict | None:
         """没有配方时，用自动检测 + 配置下拉生成「默认」配方。"""
         if self.list():
@@ -358,6 +364,8 @@ class RecipeStore:
                 "defaults": _clean_defaults(defaults),
                 "drop_nodes": list(ANIMA_DROP_NODES) if looks_like_anima(wf) else [],
             }
+            if str(family or "").strip():
+                recipe["family"] = str(family).strip()
             saved = self.save(recipe)
             logger.info("[ComfyUIDirect] 已创建默认配方")
             return saved
@@ -386,7 +394,7 @@ class RecipeStore:
             "description": data.get("description") or "",
             "template": recipe_template(data),
             "workflow": recipe_template(data),
-            "family": data.get("family") or "",
+            "family": data.get("family") or recipe_family(data),
             "model": defaults.get("model") or "",
             "loras": [
                 str(x.get("name") or x)
@@ -398,10 +406,30 @@ class RecipeStore:
             "has_slots": bool(data.get("slots")),
         }
 
+    def attach_legacy_family(self, name_or_id: str, family: str) -> bool:
+        """给旧配方补家族标签，同时保留旧字段作为回退数据。"""
+        target = self.get(name_or_id)
+        family = str(family or "").strip()
+        if not target or target.get("family") or not family:
+            return False
+        path = self.path_for(str(target.get("id") or name_or_id))
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return False
+            raw["family"] = family
+            path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+            return True
+        except (OSError, json.JSONDecodeError):
+            return False
+
     def used_templates(self) -> dict[str, list[str]]:
         """模板名 -> 引用它的配方显示名列表。删模板前的引用完整性检查用。"""
         refs: dict[str, list[str]] = {}
         for row in self.list():
+            full = self.get(str(row.get("id") or ""))
+            if full and full.get("family"):
+                continue
             t = str(row.get("template") or "").strip()
             if t:
                 refs.setdefault(t, []).append(str(row.get("name") or row.get("id") or ""))
@@ -422,7 +450,9 @@ def _clean_defaults(raw: dict) -> dict:
         if key not in raw:
             continue
         val = raw[key]
-        if val in (None, "", []):
+        if val in (None, ""):
+            continue
+        if val == [] and key != "loras":
             continue
         if key in ("width", "height", "steps") and val == 0:
             continue

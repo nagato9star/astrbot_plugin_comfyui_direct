@@ -25,9 +25,9 @@
       <section class="howto">
         <h2>对机器人怎么说</h2>
         <ul class="say-list">
-          <li>画一个站在街上的女孩</li>
-          <li>用「立绘」那套，全身竖图</li>
-          <li>换成喵喵底模</li>
+          <li>用 anima 家族画一个街上的女孩</li>
+          <li>用「立绘」配方画成全身</li>
+          <li>用 krea2 家族自由画一张照片</li>
           <li>加上 zoda 的 lora</li>
           <li>画师用 xxx</li>
           <li>把这套记住，叫「日常」</li>
@@ -54,7 +54,7 @@
     </aside>
 
     <section id="editor">
-      <p id="empty-guide" class="callout">先在左边导入一张工作流图，插件会自动猜格子。你只要确认「用户要画的内容」和「出图采样」两处，再给这套起个好叫的名字。</p>
+      <p id="empty-guide" class="callout">先导入工作流，再到插件配置的「模型家族与工作流」中添加家族并选择这张图。重载插件后，在这里确认共享槽位并保存配方参数。</p>
 
       <div class="editor-head">
         <label class="field grow">
@@ -70,20 +70,21 @@
       </div>
 
       <label class="field">
-        <span>用哪张工作流图</span>
-        <select id="recipe-workflow"></select>
+        <span>适用哪个模型家族</span>
+        <select id="recipe-family"></select>
+        <small id="family-workflow-hint" class="hint"></small>
       </label>
 
-      <h3>3. 内容写到哪</h3>
-      <p class="hint">这是给机器人看的格子。选错才会画崩；人选好了，机器人就不会猜。</p>
+      <h3>3. 这张工作流的共享槽位</h3>
+      <p class="hint">槽位跟随模型家族所选的工作流，同一工作流的所有配方共用。保存任意配方时会一并保存这份映射。</p>
       <div id="slot-grid" class="slot-grid"></div>
       <details id="slot-extra" class="extra">
         <summary>更多格子（画师 / 负向 / 触发词，没有就不用管）</summary>
         <div id="slot-grid-extra" class="slot-grid"></div>
       </details>
 
-      <h3>4. 这套默认怎么画</h3>
-      <p class="hint">机器人没被点名换模、换 LoRA 时，就用下面这些。用户说「换成 xxx」时才会覆盖。</p>
+      <h3>4. 配方参数</h3>
+      <p class="hint">这里保存实验好的底模、LoRA、画幅和采样参数。快捷配方生图只替换本次提示词；自由生图入口不会套用这些值。</p>
       <div class="size-presets">
         <span>常用画幅</span>
         <button type="button" data-size="832,1216">竖图 832×1216</button>

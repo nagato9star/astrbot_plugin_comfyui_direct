@@ -232,16 +232,25 @@ function renderLists() {
     const src = t.source === "custom" ? "已导入" : (t.source || "");
     li.innerHTML = `<strong>${escapeHtml(t.name)}</strong><span class="meta">${escapeHtml(src)} · ${t.node_count || "?"} 个格子</span>`;
     li.addEventListener("click", () => bindWorkflow(t.name));
+    const del = document.createElement("button");
+    del.className = "wf-del";
+    del.textContent = "×";
+    del.title = "删除这张模板（还有配方绑着它时会被拒绝）";
+    del.addEventListener("click", (e) => {
+      e.stopPropagation();
+      deleteTemplate(t.name);
+    });
+    li.appendChild(del);
     wfBox.appendChild(li);
   }
   const rBox = $("#recipe-list");
   rBox.innerHTML = "";
   for (const r of state.recipes) {
     const li = document.createElement("li");
-    li.className = r.name === state.recipe.name ? "active" : "";
+    li.className = r.id === state.recipe.id ? "active" : "";
     const size = r.width && r.height ? `${r.width}×${r.height}` : "";
-    li.innerHTML = `<strong>${escapeHtml(r.name)}</strong><span class="meta">${escapeHtml(r.workflow || "")} ${size}</span>`;
-    li.addEventListener("click", () => loadRecipe(r.name));
+    li.innerHTML = `<strong>${escapeHtml(r.name)}</strong><span class="meta">模板 ${escapeHtml(r.template || r.workflow || "未绑定")} ${size}</span>`;
+    li.addEventListener("click", () => loadRecipe(r.id || r.name));
     rBox.appendChild(li);
   }
   const wfSel = $("#recipe-workflow");
@@ -365,11 +374,23 @@ async function bindWorkflow(name) {
     return;
   }
   state.slotOptions = res.slot_options || {};
+  // 换了工作流就重置映射和默认值：旧模板的节点号对新模板毫无意义，
+  // 残留下来会拼出"新模板+旧节点号"的杂交配方（LoRA 写不进去还不报错）。
+  const switched = state.recipe.workflow !== name;
   state.recipe.workflow = name;
-  if (res.detected_slots) {
+  if (switched) {
+    toast(`已切换到模板「${name}」，槽位映射按它重新检测`);
+    state.recipe.slots = res.detected_slots || {};
+  } else if (res.detected_slots) {
     state.recipe.slots = { ...res.detected_slots, ...state.recipe.slots };
   }
-  if (res.detected_slots) {
+  if (switched) {
+    const detect = await apiPost("workflow/detect", { name });
+    if (detect && detect.ok && detect.values) {
+      const keepLoras = state.recipe.defaults.loras || [];
+      state.recipe.defaults = { loras: keepLoras, ...detect.values };
+    }
+  } else if (res.detected_slots) {
     const detect = await apiPost("workflow/detect", { name });
     if (detect && detect.ok && detect.values) {
       state.recipe.defaults = { loras: [], ...detect.values, ...state.recipe.defaults };
@@ -387,32 +408,53 @@ async function loadRecipe(name) {
     toast(res?.error || "读取配方失败", true);
     return;
   }
+  if (res.template_missing) {
+    toast(`配方绑定的模板「${res.template_missing}」不存在了，请在左边重新选一张模板并保存`, true);
+  }
   state.slotOptions = res.slot_options || {};
   applyRecipeToForm(res.recipe);
+}
+
+async function deleteTemplate(name) {
+  if (!confirm(`删除模板「${name}」？有配方绑着它时会删不掉。`)) return;
+  const res = await apiPost("workflow/delete", { name });
+  if (!res || !res.ok) {
+    toast(res?.error || "删除失败", true);
+    return;
+  }
+  toast(`模板「${name}」已删除`);
+  if (state.recipe.workflow === name) {
+    state.recipe.workflow = "";
+    state.recipe.slots = {};
+    state.slotOptions = {};
+    renderSlots();
+  }
+  await loadLists();
 }
 
 async function saveRecipe() {
   readFormIntoRecipe();
   if (!state.recipe.name) {
     toast("先给这套起个名字，比如「立绘」", true);
-    return;
+    return false;
   }
   if (!state.recipe.workflow) {
     toast("先在左边导入或点选一张工作流图", true);
-    return;
+    return false;
   }
   if (!slotNode("prompt") || !slotNode("sampler")) {
     toast("请确认「用户要画的内容」和「出图采样」两个格子", true);
-    return;
+    return false;
   }
   const res = await apiPost("recipe/save", state.recipe);
   if (!res || !res.ok) {
     toast(res?.error || "保存失败", true);
-    return;
+    return false;
   }
   toast("这套已经记住了");
   await loadLists();
   applyRecipeToForm(res.recipe);
+  return true;
 }
 
 async function importFile(file) {
@@ -466,12 +508,17 @@ async function importFromComfy() {
 }
 
 async function runGenerate() {
+  if (state.runningPid) {
+    toast("上一张还在跑，等等或点停止", true);
+    return;
+  }
   readFormIntoRecipe();
   if (!state.recipe.name) {
     toast("先保存这套，再试画", true);
     return;
   }
-  await saveRecipe();
+  const saved = await saveRecipe();
+  if (!saved) return;
   const prompt = $("#test-prompt").value.trim();
   if (!prompt) {
     toast("先写一句要画什么", true);
@@ -496,6 +543,7 @@ async function pollResult(pid) {
   for (let i = 0; i < 150; i++) {
     const poll = await apiGet("generate", { pid });
     if (poll && poll.done) {
+      state.runningPid = "";
       if (poll.error) {
         $("#preview").textContent = poll.error;
         toast(poll.error, true);
@@ -507,6 +555,7 @@ async function pollResult(pid) {
     }
     await new Promise((r) => setTimeout(r, 2000));
   }
+  state.runningPid = "";
   $("#preview").textContent = "等待超时";
 }
 
@@ -530,7 +579,7 @@ function bindUi() {
   $("#btn-delete-recipe").addEventListener("click", async () => {
     if (!state.recipe.name) return;
     if (!confirm(`删掉「${state.recipe.name}」这套？`)) return;
-    const res = await apiPost("recipe/delete", { name: state.recipe.name });
+    const res = await apiPost("recipe/delete", { id: state.recipe.id || "", name: state.recipe.name });
     if (!res || !res.ok) return toast(res?.error || "删除失败", true);
     applyRecipeToForm(emptyRecipe());
     await loadLists();
@@ -587,7 +636,7 @@ async function main() {
   try {
     await refreshStatus();
     await loadLists();
-    if (state.recipes.length) await loadRecipe(state.recipes[0].name);
+    if (state.recipes.length) await loadRecipe(state.recipes[0].id || state.recipes[0].name);
     else if (state.templates.length) await bindWorkflow(state.templates[0].name);
   } catch (e) {
     toast(String(e), true);

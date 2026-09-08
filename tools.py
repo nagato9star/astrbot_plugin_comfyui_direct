@@ -37,6 +37,7 @@ from recipe_store import (
     materialize_values,
     model_family,
     recipe_family,
+    recipe_template,
     resolve_generation_entry,
 )
 from slot_mapping import apply_slots, collect_trigger_words, parse_lora, resolve_size
@@ -447,7 +448,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
         # 把 RecipeStore 格式转成 generate 工具期望的 flat kwargs
         defaults = dict(recipe.get("defaults") or {})
         flat: dict[str, Any] = {}
-        flat["workflow"] = recipe.get("workflow") or ""
+        flat["workflow"] = recipe_template(recipe)
         # defaults 里的 loras 要转回 lora 参数串
         loras = defaults.pop("loras", None) if isinstance(defaults, dict) else None
         for k, v in defaults.items():
@@ -610,7 +611,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                     if key not in values and val not in (None, "", 0, 0.0, []):
                         values["negative" if key == "negative_prompt" else key] = val
                 values = _validate_generation_values(values)
-                wf = self.builder.load_template(recipe_data.get("workflow") or None)
+                wf = self.builder.load_template(recipe_template(recipe_data) or None)
                 apply_slots(
                     wf,
                     recipe_data.get("slots") or {},
@@ -1831,7 +1832,7 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
             defaults = recipe.get("defaults") or {}
             info = {
                 "name": recipe.get("name") or name,
-                "workflow": recipe.get("workflow") or "",
+                "workflow": recipe_template(recipe),
                 "prompt": defaults.get("prompt") or "",
                 "model": defaults.get("model") or "",
                 "lora": json.dumps(defaults.get("loras") or [], ensure_ascii=False),
@@ -1886,9 +1887,7 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
                 workflow_name = ""
         if not workflow_name:
             base = self.store.default() if self.store else None
-            workflow_name = (
-                str((base or {}).get("workflow") or "").strip() or self.default_workflow
-            )
+            workflow_name = recipe_template(base) or self.default_workflow
         # 槽位映射跟着基底工作流走：同工作流的现有配方（默认配方优先）已映射
         # 过主提示词就直接继承，避免存出没有槽位、生成时无法填 prompt 的配方。
         slots: dict = {}
@@ -1900,6 +1899,7 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
             self.store.save({
                 "name": name,
                 "description": prompt[:60],
+                "template": workflow_name,
                 "workflow": workflow_name,
                 "slots": slots,
                 "defaults": defaults,
@@ -2203,7 +2203,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             return f"生成失败：参数错误（{e}）"
 
         try:
-            wf = self.builder.load_template(recipe.get("workflow") or None)
+            wf = self.builder.load_template(recipe_template(recipe) or None)
         except FileNotFoundError as e:
             return f"生成失败：{e}"
 
@@ -2237,9 +2237,21 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         if not images:
             return "生成完成，但没有输出图片。"
 
-        img = images[0]
+        img = None
+        for item in images:
+            if item.get("type") == "output":
+                img = item
+                break
+        if not img:
+            img = images[-1] if images else None
+        if not img:
+            return "生成完成，但没有有效图片。"
+
         filename = img["filename"]
-        content = await self.client.download_image(filename, img.get("subfolder", ""))
+        img_type = img.get("type", "output")
+        content = await self.client.download_image(
+            filename, subfolder=img.get("subfolder", ""), image_type=img_type
+        )
         if not content:
             return f"图片已生成但下载失败（{filename}）。"
 
@@ -2268,7 +2280,8 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                 "prompt_id": pid,
                 "recipe": recipe.get("name"),
                 "recipe_id": recipe.get("id"),
-                "workflow": recipe.get("workflow"),
+                "template": recipe_template(recipe),
+                "workflow": recipe_template(recipe),
                 "slots": slots,
                 "drop_nodes": recipe.get("drop_nodes") or [],
                 "prompt": prompt,
@@ -2286,7 +2299,8 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                     {
                         "name": save_as,
                         "description": f"从 {recipe.get('name')} 另存",
-                        "workflow": recipe.get("workflow"),
+                        "template": recipe_template(recipe),
+                        "workflow": recipe_template(recipe),
                         "slots": slots,
                         "defaults": {k: v for k, v in used.items() if k != "seed" and v not in (None, "", [])},
                         "drop_nodes": recipe.get("drop_nodes") or [],

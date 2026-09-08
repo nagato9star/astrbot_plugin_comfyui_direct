@@ -48,6 +48,16 @@ def slugify(name: str) -> str:
     return text[:64] or "recipe"
 
 
+def recipe_template(recipe: dict) -> str:
+    """配方绑定的模板名。正式字段是 template；旧数据里的 workflow 作为别名兼容读取。
+
+    配方（怎么画：槽位映射+默认值）和工作流模板（画布骨架）是两回事，
+    配方只引用模板名，节点号映射仅对它绑定的那套模板有意义。
+    """
+    r = recipe or {}
+    return str(r.get("template") or r.get("workflow") or "").strip()
+
+
 def _short_file(name: str) -> str:
     text = str(name or "").replace("\\", "/").split("/")[-1]
     return text[:-12] if text.endswith(".safetensors") else text
@@ -189,13 +199,13 @@ class RecipeStore:
             return {}, ""
         candidates: list[dict] = []
         default_recipe = self.default()
-        if default_recipe and str(default_recipe.get("workflow") or "") == wanted:
+        if default_recipe and recipe_template(default_recipe) == wanted:
             candidates.append(default_recipe)
         for row in self.list():
             if default_recipe and row.get("id") == default_recipe.get("id"):
                 continue
             full = self.get(str(row.get("id") or ""))
-            if full and str(full.get("workflow") or "") == wanted:
+            if full and recipe_template(full) == wanted:
                 candidates.append(full)
         for cand in candidates:
             slots = cand.get("slots") or {}
@@ -209,11 +219,20 @@ class RecipeStore:
             raise ValueError("配方名不能为空")
         rid = str(recipe.get("id") or "").strip() or slugify(name)
         rid = slugify(rid)
+        # name 是配方的唯一标识：同名不同 id 的旧文件直接清掉，
+        # 否则 get/delete 按 name 匹配会出现歧义（webui 里"删不掉"的根源）。
+        for row in self.list():
+            if row.get("name") == name and row.get("id") != rid:
+                stale = self.path_for(str(row.get("id") or ""))
+                if stale.is_file():
+                    stale.unlink()
         data = {
             "id": rid,
             "name": name,
             "description": str(recipe.get("description") or "").strip(),
-            "workflow": str(recipe.get("workflow") or "").strip(),
+            # 模板引用：template 是正式字段；workflow 为兼容期冗余副本，读端一律走 recipe_template()
+            "template": str(recipe.get("template") or recipe.get("workflow") or "").strip(),
+            "workflow": str(recipe.get("template") or recipe.get("workflow") or "").strip(),
             "slots": recipe.get("slots") or {},
             "defaults": _clean_defaults(recipe.get("defaults") or {}),
             "drop_nodes": list(recipe.get("drop_nodes") or []),
@@ -231,15 +250,26 @@ class RecipeStore:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return data
 
-    def delete(self, name_or_id: str) -> bool:
-        recipe = self.get(name_or_id)
-        if recipe is None:
-            return False
-        path = self.path_for(recipe["id"])
-        if path.is_file():
-            path.unlink()
-            return True
-        return False
+    def delete(self, name_or_id: str) -> int:
+        """按 id 精确删；按 name 匹配时清掉全部同名配方。
+
+        返回删除数量（0 = 没删到）。真值判断与旧的 bool 返回兼容。
+        """
+        wanted = str(name_or_id or "").strip()
+        if not wanted:
+            return 0
+        removed = 0
+        direct = self.path_for(wanted)
+        if direct.is_file():
+            direct.unlink()
+            removed += 1
+        for row in self.list():
+            if row.get("id") == wanted or row.get("name") == wanted:
+                path = self.path_for(str(row.get("id") or ""))
+                if path.is_file():
+                    path.unlink()
+                    removed += 1
+        return removed
 
     def save_history(self, entry: dict) -> Path:
         pid = str(entry.get("prompt_id") or int(time.time()))
@@ -284,7 +314,8 @@ class RecipeStore:
             "id": slugify(name),
             "name": name,
             "description": description or entry.get("description") or "",
-            "workflow": entry.get("workflow") or "",
+            "template": entry.get("template") or entry.get("workflow") or "",
+            "workflow": entry.get("template") or entry.get("workflow") or "",
             "slots": entry.get("slots") or {},
             "defaults": _clean_defaults(defaults),
             "drop_nodes": list(entry.get("drop_nodes") or []),
@@ -321,6 +352,7 @@ class RecipeStore:
                 "id": "default",
                 "name": "默认",
                 "description": "导入工作流后自动生成的默认配方",
+                "template": workflow_name,
                 "workflow": workflow_name,
                 "slots": slots,
                 "defaults": _clean_defaults(defaults),
@@ -352,7 +384,8 @@ class RecipeStore:
             "id": data.get("id") or stem,
             "name": data.get("name") or stem,
             "description": data.get("description") or "",
-            "workflow": data.get("workflow") or "",
+            "template": recipe_template(data),
+            "workflow": recipe_template(data),
             "family": data.get("family") or "",
             "model": defaults.get("model") or "",
             "loras": [
@@ -364,6 +397,15 @@ class RecipeStore:
             "height": defaults.get("height") or 0,
             "has_slots": bool(data.get("slots")),
         }
+
+    def used_templates(self) -> dict[str, list[str]]:
+        """模板名 -> 引用它的配方显示名列表。删模板前的引用完整性检查用。"""
+        refs: dict[str, list[str]] = {}
+        for row in self.list():
+            t = str(row.get("template") or "").strip()
+            if t:
+                refs.setdefault(t, []).append(str(row.get("name") or row.get("id") or ""))
+        return refs
 
     def _trim_history(self, keep: int) -> None:
         files = sorted(self.history_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)

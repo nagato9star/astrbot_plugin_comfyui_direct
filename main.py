@@ -76,7 +76,7 @@ try:
         ComfyuiLookupTool,
     )
     from astrbot_plugin_comfyui_direct.workflow_builder import WorkflowBuilder
-    from astrbot_plugin_comfyui_direct.recipe_store import RecipeStore
+    from astrbot_plugin_comfyui_direct.recipe_store import RecipeStore, recipe_template
     from astrbot_plugin_comfyui_direct.slot_mapping import (
         SLOT_ROLES,
         merge_slots,
@@ -110,7 +110,7 @@ except ImportError:
         ComfyuiLookupTool,
     )
     from workflow_builder import WorkflowBuilder
-    from recipe_store import RecipeStore
+    from recipe_store import RecipeStore, recipe_template
     from slot_mapping import (
         SLOT_ROLES,
         merge_slots,
@@ -509,11 +509,15 @@ class ComfyUIDirectPlugin(Star):
         configured = slots_from_config(node_slots_cfg)
         if not configured:
             return
-        recipe = self._store.get(default_recipe_name) or self._store.default()
+        # 只作用于配置点名的默认配方本身；绝不能 fallback 到 store.default() 的任意
+        # 配方——否则每次重载都会把配置面板的节点映射强写进用户自己的配方（比如 krea2）。
+        recipe = self._store.get(default_recipe_name)
         if recipe is None:
             return
-        recipe["slots"] = merge_slots(recipe.get("slots") or {}, configured)
-        if not recipe.get("workflow"):
+        # 配方里已配置的槽位优先，配置面板的映射只负责补缺
+        recipe["slots"] = merge_slots(configured, recipe.get("slots") or {})
+        if not recipe_template(recipe):
+            recipe["template"] = default_workflow
             recipe["workflow"] = default_workflow
         try:
             self._store.save(recipe)

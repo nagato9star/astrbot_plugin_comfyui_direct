@@ -12,7 +12,7 @@ from typing import Any
 from astrbot.api import logger
 
 from comfy_client import ComfyUIClient, safe_output_path
-from recipe_store import RecipeStore, materialize_values
+from recipe_store import RecipeStore, materialize_values, recipe_template
 from slot_mapping import (
     SLOT_BASIC,
     SLOT_HELP,
@@ -244,6 +244,16 @@ class StudioApi:
         name = str(body.get("name") or "").strip()
         if not name:
             return _json({"ok": False, "error": "缺少 name"})
+        # 引用完整性：还有配方绑在这套模板上就不许删，避免留下悬空引用
+        refs = self.store.used_templates().get(name) or []
+        if refs:
+            return _json(
+                {
+                    "ok": False,
+                    "error": f"模板 {name} 正被配方使用：{'、'.join(refs)}。先删掉或改绑这些配方再删模板。",
+                    "used_by": refs,
+                }
+            )
         try:
             self.builder.delete_template(name)
         except ValueError as e:
@@ -283,18 +293,30 @@ class StudioApi:
             return _json({"ok": False, "error": "配方不存在"})
         wf = None
         slot_options = {}
-        try:
-            if recipe.get("workflow"):
-                wf = self.builder.load_template(recipe["workflow"])
-                slot_options = {
-                    role: node_options_for_slot(
-                        wf, role, str((recipe.get("slots") or {}).get(role, {}).get("node") or "")
-                    )
-                    for role, _ in SLOT_ROLES
-                }
-        except FileNotFoundError:
-            pass
-        return _json({"ok": True, "recipe": recipe, "slot_options": slot_options, "nodes": list_nodes(wf) if wf else []})
+        tname = recipe_template(recipe)
+        missing = ""
+        if tname:
+            try:
+                wf = self.builder.load_template(tname)
+            except FileNotFoundError:
+                # 模板被删了不再装没事：明确告诉前端配方引用悬空
+                missing = tname
+        if wf is not None:
+            slot_options = {
+                role: node_options_for_slot(
+                    wf, role, str((recipe.get("slots") or {}).get(role, {}).get("node") or "")
+                )
+                for role, _ in SLOT_ROLES
+            }
+        return _json(
+            {
+                "ok": True,
+                "recipe": recipe,
+                "slot_options": slot_options,
+                "nodes": list_nodes(wf) if wf else [],
+                "template_missing": missing,
+            }
+        )
 
     async def save_recipe(self) -> Any:
         body = await _body()
@@ -323,10 +345,12 @@ class StudioApi:
     async def delete_recipe(self) -> Any:
         body = await _body()
         name = str(body.get("name") or "").strip()
-        if not self.store.delete(name):
+        rid = str(body.get("id") or "").strip()
+        removed = self.store.delete(rid or name)
+        if not removed:
             return _json({"ok": False, "error": "配方不存在"})
         self._refresh_draw_schema()
-        return _json({"ok": True, "name": name})
+        return _json({"ok": True, "name": name, "removed": removed})
 
     async def generate(self) -> Any:
         body = await _body()
@@ -394,10 +418,18 @@ class StudioApi:
                 str(body.get("size")),
                 presets=recipe.get("size_presets"),
             )
+        tname = recipe_template(recipe)
+        if not tname:
+            return _json({"ok": False, "error": "配方没有绑定工作流模板，请先在编辑页选择模板并保存"})
         try:
-            wf = self.builder.load_template(recipe.get("workflow") or None)
+            wf = self.builder.load_template(tname)
         except FileNotFoundError as e:
-            return _json({"ok": False, "error": str(e)})
+            return _json(
+                {
+                    "ok": False,
+                    "error": f"配方绑定的模板「{tname}」不存在（可能已被删除）。请换绑模板或删除该配方。",
+                }
+            )
         apply_slots(
             wf,
             slots,
@@ -461,7 +493,8 @@ class StudioApi:
                 "prompt_id": pid,
                 "recipe": recipe.get("name"),
                 "recipe_id": recipe.get("id"),
-                "workflow": recipe.get("workflow"),
+                "template": recipe_template(recipe),
+                "workflow": recipe_template(recipe),
                 "slots": recipe.get("slots") or {},
                 "drop_nodes": recipe.get("drop_nodes") or [],
                 "prompt": pending.get("prompt") or "",

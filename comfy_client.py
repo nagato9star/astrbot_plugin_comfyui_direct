@@ -110,6 +110,8 @@ class ComfyUIClient:
         self._civitai_lora_cache: dict[str, tuple[float, dict | None]] = {}
         self._client: httpx.AsyncClient | None = None
         self._resource_lock = asyncio.Lock()
+        # /object_info 缓存（构造 UI 快照用），进程内一次
+        self._object_info: dict | None = None
         # 可选：civitai 客户端，用于本地 metadata 无触发词时在线回退
         self.civitai_client = None
 
@@ -200,8 +202,35 @@ class ComfyUIClient:
             return False
         return False
 
+    async def _get_object_info_cached(self) -> dict | None:
+        """拉取 /object_info（进程内缓存），失败返回 None。"""
+        if self._object_info is not None:
+            return self._object_info
+        try:
+            resp = await self.client.get("/object_info")
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict) and data:
+                    self._object_info = data
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[ComfyUIDirect] /object_info 拉取失败（UI 快照将跳过）: {e}")
+        return self._object_info
+
+    def _meta_debug(self, msg: str) -> None:
+        """独立文件级日志：不依赖 astrbot logger，用于判定新代码是否真的在跑。"""
+        try:
+            p = Path(__file__).parent / "metadata_debug.log"
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(time.strftime('%m-%d %H:%M:%S') + ' ' + msg + chr(10))
+        except Exception:  # noqa: BLE001
+            pass
+
     async def submit_prompt_detail(self, workflow: dict) -> tuple[str | None, str | None]:
         """提交工作流，返回 (prompt_id, 错误信息)。成功时错误信息为 None。
+
+        提交时同步构造 UI 格式快照塞进 extra_data.extra_pnginfo，
+        ComfyUI 保存 PNG 时会内嵌 workflow 元数据，前端拖图即可完整
+        还原（含 rgthree lora 槽）。快照构造失败则裸提交兜底。
 
         400 时解析 ComfyUI 的 {"error": {...}, "node_errors": {...}} 结构，
         把真实失败原因（缺节点/模型不存在等）带回来，而不是笼统报"无法连接"。
@@ -210,10 +239,31 @@ class ComfyUIClient:
         （ConnectError/ConnectTimeout = 请求肯定没发出去，安全）；ReadTimeout
         不重试——服务端可能已收下任务，重试会重复出图，改为提示"可能已提交"。
         """
+        body: dict = {"prompt": workflow}
+        self._meta_debug("submit_called")
+        try:
+            try:
+                from api_to_ui import build_extra_pnginfo  # AstrBot: 插件目录已在 sys.path（main.py 自举）
+            except ImportError:
+                from astrbot_plugin_comfyui_direct.api_to_ui import build_extra_pnginfo  # 沙箱/包环境兜底
+
+            objinfo = await self._get_object_info_cached()
+            if objinfo:
+                extra_pnginfo = build_extra_pnginfo(workflow, objinfo)
+                if extra_pnginfo:
+                    body["extra_data"] = {"extra_pnginfo": extra_pnginfo}
+                    self._meta_debug("inject_ok")
+                else:
+                    self._meta_debug("build_returned_none")
+            else:
+                self._meta_debug("objinfo_none")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[ComfyUIDirect] 元数据注入失败，按裸提交继续: {e}")
+            self._meta_debug(f"inject_fail: {e!r}")
         last_err: Exception | None = None
         for i in range(2):
             try:
-                resp = await self.client.post("/prompt", json={"prompt": workflow})
+                resp = await self.client.post("/prompt", json=body)
             except SUBMIT_RETRYABLE_EXC as e:
                 last_err = e
                 if i == 0:
@@ -1008,13 +1058,14 @@ class ComfyUIClient:
         filename: str,
         subfolder: str = "",
         preview: str | None = None,
+        image_type: str = "output",
     ) -> bytes | None:
         """从 ComfyUI /view 下载图片（GET 幂等，ZeroTier 抽风时自动重试）。
 
         preview 形如 "webp;80" / "jpeg;80"：让服务端重编码小尺寸预览
         （WebUI 试跑面板用，省带宽）；None 返回原图。
         """
-        params: dict = {"filename": filename, "type": "output"}
+        params: dict = {"filename": filename, "type": image_type}
         if subfolder:
             params["subfolder"] = subfolder
         if preview:

@@ -844,6 +844,8 @@ def parse_lora(lora: Any) -> list[dict]:
     out: list[dict] = []
     for item in parsed:
         if isinstance(item, dict):
+            if not str(item.get("name") or "").strip():
+                continue  # 空名条目（杂交配方残留）直接忽略
             out.append(item)
         elif isinstance(item, str) and item.strip():
             out.append({"name": item})
@@ -903,6 +905,14 @@ def apply_slots(
     if drop_nodes:
         for nid in drop_nodes:
             wf.pop(str(nid), None)
+
+    # 槽位指向的节点必须存在，否则对应值会被静默丢弃；统一先告警。
+    for role, spec in (slots or {}).items():
+        nid = str((spec or {}).get("node") or "")
+        if nid and str(nid) not in wf:
+            logger.warning(
+                f"[slot_mapping] 配方槽位 {role} 指向节点 {nid}，但当前工作流里没有它，该槽位本轮不会写入"
+            )
 
     prompt = values.get("prompt")
     if prompt is not None and slots.get("prompt"):
@@ -1140,6 +1150,9 @@ def _apply_steps_dual(
 def _apply_loras(wf: dict, nid: str, parsed: list[dict]) -> None:
     node = wf.get(nid)
     if node is None:
+        logger.warning(
+            f"[slot_mapping] 配方的 loras 槽位指向节点 {nid}，但它不在当前工作流里，本轮 LoRA 全部未写入"
+        )
         return
     if node.get("class_type") == POWER_LORA_CLASS:
         if not parsed:

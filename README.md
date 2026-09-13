@@ -88,6 +88,7 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 | `model_cache_ttl` | `600` | 模型清单缓存刷新间隔（秒），0 表示每次强制同步 |
 | `lora_manager_enabled` | `true` | 复用 ComfyUI LoRA Manager 的分类、标签、用途说明、推荐权重和触发词；未安装时自动跳过 |
 | `model_families` | `anima → anima-v3` | 可重复添加的家族配置；包含家族名、工作流、提示词风格和说明 |
+| `workflow_node_mappings` | 空 | 可重复添加的工作流节点映射；填写各槽位的节点 ID，优先于 Workflow Studio 档案和自动检测 |
 | `default_recipe` | `默认` | 用户只说「画一张」时用的配方；在工作台配方列表点「设为默认」自动写入，也可直接填配方名 |
 | `llm_tool_mode` | `basic` | `basic` 暴露自由生图、配方生图和查询；`full` 打开诊断工具 |
 | `allow_llm_unsafe_tools` | `false` | 是否允许 LLM 执行任意工作流、读取本地图片上传、释放显存和删除配方；默认关闭 |
@@ -153,7 +154,7 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 
 LoRA 查询示例：`comfyui_lookup(type="lora", query="style")`、`query="character"`、`query="水彩"`。匹配范围包括 LoRA 文件名、LoRA Manager/Civitai 标签、分类和用途说明；机器人可根据画面需求主动查询并选用，文件名以实际查询结果为准。`comfyui_list_models(kind="lora", query="style", limit=10)` 可只返回指定分类，减少 LLM 上下文占用。
 
-`comfyui_draw` 的 `lora` 是字符串：可填文件名、唯一关键词，多个用逗号分隔；指定权重时传 JSON 数组字符串，例如 `"[{\"name\":\"style.safetensors\",\"strength\":0.6}]"`，其中示例文件名需替换成查询结果。传入列表会覆盖工作流中的 LoRA，要保留的原 LoRA 也需列入；省略时沿用工作流原值。
+`comfyui_draw` 的 `lora` 是字符串：可填文件名、唯一关键词，多个用逗号分隔；指定权重时传 JSON 数组字符串，例如 `"[{\"name\":\"style.safetensors\",\"strength\":0.6}]"`，其中示例文件名需替换成查询结果。传入列表会覆盖工作流映射的 Power Loader 占位槽或旧版明确映射的可选 LoRA 链；独立加速 LoRA 始终保持工作流原值。省略时沿用可选 LoRA 原值，传 `"[]"` 或 `"none"` 只关闭映射槽位。
 
 选用 LoRA 时，可将查询返回的已知触发词同步填入 `trigger_words`，保留原词格式，无需用户再次提出。查询未提供触发词时可省略该字段并继续使用 LoRA。插件的绘图工具仍由调用方显式填写触发词；工作台选 LoRA 后自动填充文本框的行为保持不变。
 

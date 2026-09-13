@@ -42,7 +42,7 @@ SLOT_HELP: dict[str, str] = {
     "loras": "这套默认挂哪些 LoRA。用户点名 LoRA 时覆盖这里。",
     "size": "宽和高写到这里。竖图/横图也靠它。",
     "sampler": "步数、精细程度写到这里。必选。双采样时选第一段。",
-    "sampler_2": "双采样的第二段。没有第二段可留空；步数仍会写到外联整数节点。",
+    "sampler_2": "双采样的第二段。可留空；映射后才会同步它的步数和种子，共享外联节点会自然联动。",
     "negative": "不想看到的东西。没有可留空。",
     "artist": "用户点名画师时写到这里。没有可留空。",
     "quality": "画质词。一般不用动。",
@@ -215,7 +215,7 @@ def _resolve_linked_value(wf: dict, val: Any) -> Any:
 
 
 def _write_numeric_input(wf: dict, node: dict, field: str, value: int | float, *, as_int: bool = True) -> bool:
-    """写采样器字段：若该口外联了整数节点，改整数节点，不断开连线。"""
+    """写采样器字段：若该口外联了数值节点，改目标节点且不断开连线。"""
     ins = node.setdefault("inputs", {})
     if field not in ins:
         return False
@@ -226,7 +226,12 @@ def _write_numeric_input(wf: dict, node: dict, field: str, value: int | float, *
         if isinstance(target, dict) and (
             _is_int_node(target) or str(target.get("class_type") or "") in SEED_NODE_CLASSES
         ):
-            return _write_int_node(target, int(value))
+            if as_int:
+                return _write_int_node(target, int(value))
+            target_field = _int_field(target)
+            if target_field:
+                target.setdefault("inputs", {})[target_field] = float(value)
+                return True
         return False
     ins[field] = written
     return True
@@ -887,8 +892,12 @@ def resolve_size(
     if token in ("", "same"):
         return w, h
     if token == "portrait":
+        if w == h:
+            return 832, 1216
         return min(w, h), max(w, h)
     if token == "landscape":
+        if w == h:
+            return 1216, 832
         return max(w, h), min(w, h)
     if token == "square":
         side = int(round((w + h) / 2 / 64) * 64) or 1024
@@ -1045,10 +1054,15 @@ def _apply_sampler(
     if node is None:
         return
 
-    sampler_ids = list(dict.fromkeys([*(extra_ids or []), *_rank_sampler_ids(wf)]))
-    if nid not in sampler_ids and str(node.get("class_type") or "") in SAMPLER_CLASSES:
-        sampler_ids.insert(0, nid)
-    primary = nid if nid in sampler_ids else (sampler_ids[0] if sampler_ids else nid)
+    # 采样参数只属于工作流档案明确映射的节点。共享的外联 Int 会自然联动，
+    # 未映射的其它采样器保持模板原值。
+    mapped_ids = list(dict.fromkeys([nid, *(extra_ids or [])]))
+    sampler_ids = [
+        sid
+        for sid in mapped_ids
+        if str((wf.get(sid) or {}).get("class_type") or "") in SAMPLER_CLASSES
+    ]
+    primary = nid if nid in sampler_ids else ""
 
     seed = values.get("seed")
     if seed is not None:
@@ -1058,10 +1072,11 @@ def _apply_sampler(
     if steps is not None:
         if _is_int_node(node):
             _write_int_node(node, int(steps))
-        _apply_steps_dual(wf, primary, sampler_ids, int(steps), extra_ids=extra_ids or [])
+        if sampler_ids:
+            _apply_steps_dual(wf, primary, sampler_ids, int(steps))
 
-    target = wf.get(primary) if primary else node
-    if target is None or _is_int_node(target):
+    target = wf.get(primary) if primary else None
+    if target is None:
         return
     ins = target.setdefault("inputs", {})
     if values.get("cfg") is not None:
@@ -1135,19 +1150,13 @@ def _apply_steps_dual(
     primary: str,
     sampler_ids: list[str],
     steps: int,
-    extra_ids: list[str] | None = None,
 ) -> None:
-    """步数写到选中采样器；双采样第二段、以及外联了整数节点的其它采样器一并改。"""
+    """步数只写入明确映射的采样器，共享外联整数节点只写一次。"""
     written: set[str] = set()
-    extra = set(extra_ids or [])
-    _apply_steps_to_node(wf, wf.get(primary), steps, written)
-    for sid in sampler_ids:
-        if sid == primary:
-            continue
-        node = wf.get(sid)
-        ins = (node or {}).get("inputs") or {}
-        if sid in extra or _is_link(ins.get("steps")) or _is_link(ins.get("sigmas")):
-            _apply_steps_to_node(wf, node, steps, written)
+    ordered = list(dict.fromkeys([primary, *sampler_ids]))
+    for sid in ordered:
+        if sid:
+            _apply_steps_to_node(wf, wf.get(sid), steps, written)
 
 
 def _apply_loras(wf: dict, nid: str, parsed: list[dict]) -> None:
@@ -1158,10 +1167,9 @@ def _apply_loras(wf: dict, nid: str, parsed: list[dict]) -> None:
         )
         return
     if node.get("class_type") == POWER_LORA_CLASS:
-        if not parsed:
-            for other in wf.values():
-                if isinstance(other, dict) and other.get("class_type") == "LoraLoaderModelOnly":
-                    other.setdefault("inputs", {})["strength_model"] = 0.0
+        # loras 槽位只拥有当前 Power Loader 的 lora_N。其它 LoRA 节点属于
+        # 工作流固定结构；例如 Anima 独立加速节点服务于第二段采样，不随
+        # 可选画风/角色 LoRA 的覆盖或清空而改变。
         ins = node.setdefault("inputs", {})
         slots = sorted(
             (k for k, v in ins.items() if k.startswith("lora_") and isinstance(v, dict)),

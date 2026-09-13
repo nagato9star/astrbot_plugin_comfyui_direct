@@ -97,6 +97,90 @@
       }
     ]
   },
+  "workflow_node_mappings": {
+    "type": "template_list",
+    "description": "工作流节点映射（配置优先）",
+    "hint": "按工作流手动指定机器人可以修改的节点。节点填写纯 ID（如 478）或“ID — 节点类型 — 标题”。只要添加了该工作流条目，留空槽位就保持未映射；配置优先于 Workflow Studio 档案和自动检测，修改后重载插件生效。",
+    "obvious_hint": true,
+    "templates": {
+      "mapping": {
+        "name": "工作流节点映射",
+        "items": {
+          "workflow": {
+            "type": "string",
+            "default": "",
+            "hint": "工作流模板名，须与模型家族中的 workflow 完全一致"
+          },
+          "prompt": {
+            "type": "string",
+            "default": "",
+            "hint": "主提示词节点 ID（必填）"
+          },
+          "model": {
+            "type": "string",
+            "default": "",
+            "hint": "底模加载节点 ID（允许机器人换底模时填写）"
+          },
+          "loras": {
+            "type": "string",
+            "default": "",
+            "hint": "可选 LoRA 节点 ID；Anima 应映射 Power Loader，不要映射独立加速节点"
+          },
+          "size": {
+            "type": "string",
+            "default": "",
+            "hint": "画面宽高节点 ID"
+          },
+          "sampler": {
+            "type": "string",
+            "default": "",
+            "hint": "主采样节点 ID（必填）"
+          },
+          "sampler_2": {
+            "type": "string",
+            "default": "",
+            "hint": "双采样第二段节点 ID；留空时保持第二段独立参数"
+          },
+          "negative": {
+            "type": "string",
+            "default": "",
+            "hint": "负向提示词节点 ID"
+          },
+          "artist": {
+            "type": "string",
+            "default": "",
+            "hint": "画师风格节点 ID"
+          },
+          "quality": {
+            "type": "string",
+            "default": "",
+            "hint": "画质词节点 ID"
+          },
+          "trigger_words": {
+            "type": "string",
+            "default": "",
+            "hint": "LoRA 触发词节点 ID"
+          },
+          "clip": {
+            "type": "string",
+            "default": "",
+            "hint": "CLIP 加载节点 ID"
+          },
+          "vae": {
+            "type": "string",
+            "default": "",
+            "hint": "VAE 加载节点 ID"
+          },
+          "guidance": {
+            "type": "string",
+            "default": "",
+            "hint": "FluxGuidance 等引导强度节点 ID"
+          }
+        }
+      }
+    },
+    "default": []
+  },
   "default_recipe": {
     "type": "string",
     "default": "默认",
@@ -158,7 +242,7 @@
       "sampler_2": {
         "type": "string",
         "default": "",
-        "hint": "双采样第二段写到哪（可留空）"
+        "hint": "双采样第二段写到哪（可留空；映射后才同步步数和种子，共享外联节点会自然联动）"
       },
       "negative": {
         "type": "string",

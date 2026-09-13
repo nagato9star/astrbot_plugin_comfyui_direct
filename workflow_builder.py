@@ -386,11 +386,8 @@ class WorkflowBuilder:
                 break
         if power_id is None:
             return False
-        if not parsed:
-            # 禁用全部：Power 插槽全关，模板里独立的 LoraLoaderModelOnly（如 anima-turbo）一并归零
-            for nid, node in wf.items():
-                if node.get("class_type") == "LoraLoaderModelOnly":
-                    node["inputs"]["strength_model"] = 0.0
+        # 这个映射只拥有 Power Loader 内的可选插槽。工作流中的其它 LoRA
+        # 节点可能是 Anima 双采样所需的固定加速分支，必须保留模板原值。
         ins = wf[power_id]["inputs"]
         slots = sorted(
             (k for k in ins if k.startswith("lora_") and isinstance(ins[k], dict)),

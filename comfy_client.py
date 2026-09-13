@@ -84,6 +84,67 @@ def safe_output_path(output_dir: Path, filename: str) -> Path:
     return target
 
 
+def image_media_type(content: bytes, filename: str = "") -> str:
+    """根据文件魔数返回 data URL 使用的图片 MIME。"""
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    mime_type, _ = mimetypes.guess_type(filename)
+    return mime_type if mime_type and mime_type.startswith("image/") else "application/octet-stream"
+
+
+def execution_error_message(status: Any, fallback: str = "执行出错") -> str:
+    """从 ComfyUI ExecutionStatus.messages 提取节点级错误或中断原因。"""
+    if not isinstance(status, dict):
+        return fallback
+
+    plain_message = ""
+    messages = status.get("messages")
+    if isinstance(messages, list):
+        for item in reversed(messages):
+            event = ""
+            data: dict = {}
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                event = str(item[0] or "")
+                data = item[1] if isinstance(item[1], dict) else {}
+            elif isinstance(item, dict):
+                event = str(item.get("type") or item.get("event") or "")
+                nested = item.get("data")
+                data = nested if isinstance(nested, dict) else item
+            elif isinstance(item, str) and item.strip() and not plain_message:
+                plain_message = item.strip()
+                continue
+
+            node_id = str(data.get("node_id") or "").strip()
+            node_type = str(data.get("node_type") or data.get("class_type") or "").strip()
+            node = f"节点 {node_id}" if node_id else ""
+            if node_type:
+                node = f"{node} ({node_type})" if node else f"节点类型 {node_type}"
+
+            if event == "execution_interrupted":
+                return f"执行已中断（{node}）" if node else "执行已中断"
+            if event == "execution_error" or data.get("exception_message"):
+                detail = str(
+                    data.get("exception_message")
+                    or data.get("message")
+                    or data.get("exception_type")
+                    or fallback
+                ).strip()
+                detail = " ".join(detail.splitlines())[:800]
+                error_type = str(data.get("exception_type") or "").strip()
+                if error_type and error_type not in detail:
+                    detail = f"{error_type}: {detail}"
+                return f"{node}：{detail}" if node else detail
+
+    legacy = str(status.get("message") or "").strip()
+    return legacy or plain_message or fallback
+
+
 class ComfyUIClient:
     """封装与 ComfyUI 的全部 HTTP 交互。"""
 
@@ -1062,8 +1123,7 @@ class ComfyUIClient:
     ) -> bytes | None:
         """从 ComfyUI /view 下载图片（GET 幂等，ZeroTier 抽风时自动重试）。
 
-        preview 形如 "webp;80" / "jpeg;80"：让服务端重编码小尺寸预览
-        （WebUI 试跑面板用，省带宽）；None 返回原图。
+        preview 形如 "webp;80" / "jpeg;80"：让服务端重编码预览；None 返回原图。
         """
         params: dict = {"filename": filename, "type": image_type}
         if subfolder:

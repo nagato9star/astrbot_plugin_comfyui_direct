@@ -31,7 +31,7 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
 from animadex import AnimaDexClient
-from comfy_client import ComfyUIClient, safe_output_path
+from comfy_client import ComfyUIClient, execution_error_message, safe_output_path
 from external_search import CivitaiClient, DanbooruClient, GelbooruClient
 from model_families import ModelFamily, ModelFamilyRegistry, WorkflowProfileStore
 from recipe_store import (
@@ -342,8 +342,8 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
         "先用 comfyui_lookup(type=\"lora\", query=需求关键词) 或 comfyui_list_models(kind=\"lora\")，"
         "依据返回的用途说明、模型适用信息和推荐权重选择，再将实际文件名写入 lora 的 JSON 数组字符串。"
         "使用已记录的触发词时同步填写 trigger_words，保留原词格式；查询未提供触发词时可省略该字段并继续使用 LoRA。"
-        "省略 lora 会沿用默认设置，传入列表会覆盖对应 LoRA；已有独立加速节点的模板沿用其加速设置。"
-        "用户明确要求关闭 LoRA 时可传 \"[]\" 或 \"none\"，旧模板的此操作也会关闭独立加速 LoRA。"
+        "省略 lora 会沿用默认设置，传入列表会覆盖映射的可选 LoRA；已有独立加速节点的模板始终沿用其加速设置。"
+        "用户明确要求关闭可选 LoRA 时可传 \"[]\" 或 \"none\"，该操作只关闭映射槽位。"
         "角色/画师名称不确定时用 comfyui_lookup 查询；底模、采样参数等按用户要求调整，其余沿用默认值。"
         "recipe 与 workflow 是两个独立入口：传 recipe 时按其模型家族解析当前工作流并写入保存参数；"
         "传 workflow 时按该模板生成、不套配方；两者都省略时优先默认配方，没有默认配方才用配置的默认工作流模板。"
@@ -383,8 +383,8 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                         "本次使用的 LoRA 列表，可按画面需求主动查询并选用已安装资源。"
                         "传 JSON 数组字符串，每项包含查询得到的 name，可附推荐 strength，例如 "
                         '[{"name":"style.safetensors","strength":0.55}]（文件名用实际查询结果替换）。'
-                        "按 Power 插槽或旧模板 LoRA 链顺序覆盖；要保留的原 LoRA 也需列入。"
-                        "省略则沿用默认设置；用户要求关闭时传 \"[]\" 或 \"none\""
+                        "按 Power 插槽或旧模板明确映射的可选 LoRA 链顺序覆盖；Power Loader 原条目仅作占位。"
+                        "独立加速 LoRA 始终保留；省略则沿用默认设置，用户要求关闭可选 LoRA 时传 \"[]\" 或 \"none\""
                     ),
                 },
                 "steps": {
@@ -492,7 +492,9 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 miss = 0
                 st = entry.get("status") or {}
                 if st.get("status_str") == "error":
-                    return None, st.get("message") or "执行出错（详见 ComfyUI 日志）"
+                    return None, execution_error_message(
+                        st, "执行出错（详见 ComfyUI 日志）"
+                    )
                 return entry.get("outputs", {}), None
             miss += 1
             if miss == 5:
@@ -1317,7 +1319,7 @@ class ComfyuiRunWorkflowTool(FunctionTool[AstrAgentContext]):
             if entry is not None:
                 st = entry.get("status") or {}
                 if st.get("status_str") == "error":
-                    return f"工作流执行出错: {st.get('message') or '详见 ComfyUI 日志'}"
+                    return f"工作流执行失败: {execution_error_message(st, '详见 ComfyUI 日志')}"
                 outputs = entry.get("outputs", {})
                 images = []
                 for node_out in outputs.values():
@@ -1406,7 +1408,7 @@ class ComfyuiJobTool(FunctionTool[AstrAgentContext]):
                 if entry is not None:
                     st = entry.get("status") or {}
                     if st.get("status_str") == "error":
-                        return f"任务 {pid} 执行出错: {st.get('message') or '详见 ComfyUI 日志'}"
+                        return f"任务 {pid}: {execution_error_message(st, '详见 ComfyUI 日志')}"
                     outputs = entry.get("outputs", {})
                     n = sum(len(o.get("images", [])) for o in outputs.values())
                     return f"任务 {pid} 已完成，输出图片 {n} 张。"
@@ -1427,7 +1429,7 @@ class ComfyuiJobTool(FunctionTool[AstrAgentContext]):
             return f"任务 {pid} 状态未知（可能已过期或不存在）。"
         st = entry.get("status") or {}
         if st.get("status_str") == "error":
-            return f"任务 {pid} 执行出错: {st.get('message') or '详见 ComfyUI 日志'}"
+            return f"任务 {pid}: {execution_error_message(st, '详见 ComfyUI 日志')}"
         outputs = entry.get("outputs", {})
         images = []
         for node_out in outputs.values():
@@ -1471,7 +1473,7 @@ class ComfyuiFetchOutputsTool(FunctionTool[AstrAgentContext]):
             return f"任务 {pid} 未找到（可能未完成或不存在）。"
         st = entry.get("status") or {}
         if st.get("status_str") == "error":
-            return f"任务 {pid} 执行出错: {st.get('message') or '详见 ComfyUI 日志'}"
+            return f"任务 {pid}: {execution_error_message(st, '详见 ComfyUI 日志')}"
         outputs = entry.get("outputs", {})
         images = []
         for node_out in outputs.values():
@@ -1927,7 +1929,8 @@ _DRAW_DESC = (
     "先用 comfyui_lookup(type=\"lora\", query=需求关键词)，如 style、character、服饰或效果标签；"
     "根据返回的用途说明、模型适用信息和推荐权重选择，将实际文件名填入 lora。"
     "使用已记录的触发词时同步填写 trigger_words；查询未提供触发词时可省略该字段并继续使用 LoRA。"
-    "传入 lora 会覆盖工作流映射节点的列表，要保留的原 LoRA 也需列入；沿用工作流设置时省略 lora。"
+    "传入 lora 会覆盖工作流映射的可选 LoRA 槽；Power Loader 原条目仅作占位，独立加速 LoRA 始终保留。"
+    "沿用工作流可选 LoRA 设置时省略 lora。"
     "要求画幅时填写 size=portrait/landscape/square；画师、画质、负向内容、steps、cfg 等按需求调整。"
     "用户要求记住本次参数时填写 save_as，插件会保存成引用该模型家族的快捷配方。"
     "提示词格式遵循模型家族清单中的 prompt_style。"
@@ -1983,7 +1986,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                 },
                 "lora": {
                     "type": "string",
-                    "description": "本次使用的 LoRA，可按画风、角色、服饰或效果需求主动查询并选用，无需用户提供名称。填写查询得到的文件名或唯一关键词，多个用逗号；指定权重时传 JSON 数组字符串，如 [{\"name\":\"查询得到的文件名\",\"strength\":0.8}]。覆盖工作流映射节点的原列表，要保留的 LoRA 也需列入；省略则沿用工作流。用户要求关闭时传 \"[]\" 或 \"none\"",
+                    "description": "本次使用的可选 LoRA，可按画风、角色、服饰或效果需求主动查询并选用，无需用户提供名称。填写查询得到的文件名或唯一关键词，多个用逗号；指定权重时传 JSON 数组字符串，如 [{\"name\":\"查询得到的文件名\",\"strength\":0.8}]。覆盖工作流映射的 Power Loader 占位槽或旧版明确映射链；独立加速 LoRA 始终保留。省略则沿用工作流，用户要求关闭可选 LoRA 时传 \"[]\" 或 \"none\"",
                 },
                 "size": {
                     "type": "string",
@@ -2315,7 +2318,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                 str(x.get("name") if isinstance(x, dict) else x) for x in lora_items[:4]
             )
         elif "loras" in values:
-            lora_note = "已关闭"
+            lora_note = "可选 LoRA 已关闭"
         else:
             lora_note = "工作流原 LoRA"
         return (
@@ -2647,7 +2650,9 @@ async def _wait_outputs(client: ComfyUIClient, prompt_id: str) -> tuple[dict | N
         if entry is not None:
             st = entry.get("status") or {}
             if st.get("status_str") == "error":
-                return None, st.get("message") or "执行出错（详见 ComfyUI 日志）"
+                return None, execution_error_message(
+                    st, "执行出错（详见 ComfyUI 日志）"
+                )
             return entry.get("outputs", {}), None
         miss += 1
         if miss == 5:

@@ -12,7 +12,8 @@ PNG 即内嵌标准 workflow 元数据，任何版本前端拖图都能完整还
 - API dict: {node_id: {class_type, inputs: {field: value}}}
 - 连线值形如 [source_id, output_slot]，转成 UI links + 端口 link 引用
 - widget 值按 object_info 定义顺序排入 widgets_values；
-  带 control_after_generate 的 INT 字段需追加 control 值（"fixed"）
+  已转成连线的 widget 仍保留 null 占位，带 control_after_generate 的
+  INT 字段还需追加 control 值（"fixed"）
 - rgthree Power Lora Loader 的动态 lora_N 字典值 → widgets_values
   = [{on, lora, strength}, ...]（与其前端 configure() 逻辑对齐）
 """
@@ -56,6 +57,15 @@ def _needs_control_after_generate(field_type) -> bool:
         cfg = field_type[1]
         return isinstance(cfg, dict) and "control_after_generate" in cfg
     return False
+
+
+def _is_widget_spec(field_type) -> bool:
+    if not isinstance(field_type, list) or not field_type:
+        return False
+    head = field_type[0]
+    if isinstance(head, list):
+        return True
+    return head in ("INT", "FLOAT", "STRING", "BOOLEAN", "COMBO")
 
 
 def api_to_ui(api: dict, object_info: dict | None = None) -> dict:
@@ -111,6 +121,11 @@ def api_to_ui(api: dict, object_info: dict | None = None) -> dict:
                 ui_inputs.append({"name": field, "type": ltype, "link": link_id})
                 links.append([link_id, src, slot, nid, slot_idx, ltype])
                 link_id += 1
+                field_type = in_defs.get(field)
+                if _is_widget_spec(field_type):
+                    widgets_values.append(None)
+                    if _needs_control_after_generate(field_type):
+                        widgets_values.append("fixed")
                 continue
             if field in in_defs and _needs_control_after_generate(in_defs[field]):
                 widgets_values.extend([value, "fixed"])

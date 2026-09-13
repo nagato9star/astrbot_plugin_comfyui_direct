@@ -11,7 +11,12 @@ from typing import Any
 
 from astrbot.api import logger
 
-from comfy_client import ComfyUIClient, safe_output_path
+from comfy_client import (
+    ComfyUIClient,
+    execution_error_message,
+    image_media_type,
+    safe_output_path,
+)
 from model_families import ModelFamilyRegistry, WorkflowProfileStore
 from recipe_store import RecipeStore, materialize_values, recipe_template
 from slot_mapping import (
@@ -168,7 +173,7 @@ class StudioApi:
             if self.profiles is not None
             else {"slots": detected, "drop_nodes": []}
         )
-        selected = profile.get("slots") or detected
+        selected = profile.get("slots", detected)
         return {
             "ok": True,
             "name": name,
@@ -610,16 +615,18 @@ class StudioApi:
             return _json({"ok": True, "done": False})
         st = entry.get("status") or {}
         if st.get("status_str") == "error":
-            return _json({"ok": True, "done": True, "error": st.get("message") or "执行出错"})
+            pending_runs = self.shared.get("web_pending_runs") or {}
+            pending_runs.pop(pid, None)
+            return _json(
+                {"ok": True, "done": True, "error": execution_error_message(st)}
+            )
         images = []
         for node_out in (entry.get("outputs") or {}).values():
             images.extend(node_out.get("images") or [])
         if not images:
             return _json({"ok": True, "done": True, "error": "执行完成但无输出图片"})
         img = images[0]
-        content = await self.client.download_image(
-            img["filename"], img.get("subfolder", ""), preview="webp;80"
-        )
+        content = await self.client.download_image(img["filename"], img.get("subfolder", ""))
         if not content:
             return _json({"ok": True, "done": True, "error": f"图片下载失败: {img['filename']}"})
         try:
@@ -628,8 +635,8 @@ class StudioApi:
             return _json({"ok": True, "done": True, "error": str(e)})
         try:
             local_path.write_bytes(content)
-        except OSError:
-            pass
+        except OSError as e:
+            return _json({"ok": True, "done": True, "error": f"图片本地保存失败: {e}"})
         pending_runs = self.shared.get("web_pending_runs") or {}
         pending = pending_runs.get(pid) or {}
         recipe = pending.get("recipe") or {}
@@ -660,15 +667,26 @@ class StudioApi:
                 "ok": True,
                 "done": True,
                 "filename": img["filename"],
-                "data_url": "data:image/webp;base64," + base64.b64encode(content).decode("ascii"),
+                "data_url": (
+                    f"data:{image_media_type(content, img['filename'])};base64,"
+                    + base64.b64encode(content).decode("ascii")
+                ),
             }
         )
 
     async def interrupt(self) -> Any:
         body = await _body()
         pid = str(body.get("prompt_id") or "").strip()
-        ok = await self.client.interrupt(prompt_id=pid or None)
-        return _json({"ok": ok, "prompt_id": pid or None})
+        if not pid:
+            return _json({"ok": False, "error": "缺少 prompt_id"}, status=400)
+        pending_runs = self.shared.get("web_pending_runs") or {}
+        if pid not in pending_runs:
+            return _json(
+                {"ok": False, "error": "该任务不属于当前 WebUI 试跑或已经结束"},
+                status=404,
+            )
+        ok = await self.client.interrupt(prompt_id=pid)
+        return _json({"ok": ok, "prompt_id": pid})
 
     async def list_history(self) -> Any:
         return _json({"ok": True, "items": self.store.list_history(20)})

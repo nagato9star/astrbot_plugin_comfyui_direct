@@ -689,7 +689,11 @@ function bindUi() {
   $("#btn-run").addEventListener("click", () => runGenerate().catch((e) => toast(String(e), true)));
   $("#btn-stop").addEventListener("click", async () => {
     if (!state.runningPid) return;
-    await apiPost("generate/interrupt", { prompt_id: state.runningPid });
+    const res = await apiPost("generate/interrupt", { prompt_id: state.runningPid });
+    if (!res || !res.ok) {
+      toast(res?.error || "中断失败", true);
+      return;
+    }
     toast("已请求中断");
   });
   $("#recipe-family").addEventListener("change", () => {

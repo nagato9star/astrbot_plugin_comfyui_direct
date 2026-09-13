@@ -64,7 +64,12 @@ if "astrbot" not in sys.modules:
     sys.modules["astrbot.core.agent.run_context"] = _run_context
     sys.modules["astrbot.core.astr_agent_context"] = _astr_context
 
-from comfy_client import ComfyUIClient  # noqa: E402
+from comfy_client import (  # noqa: E402
+    ComfyUIClient,
+    execution_error_message,
+    image_media_type,
+)
+from api_to_ui import api_to_ui  # noqa: E402
 from model_families import ModelFamilyRegistry, WorkflowProfileStore  # noqa: E402
 from recipe_store import RecipeStore  # noqa: E402
 from slot_mapping import (  # noqa: E402
@@ -208,6 +213,67 @@ def test_power_lora_reuses_matching_slot() -> None:
     print("  power lora matching slot OK")
 
 
+def test_power_lora_preserves_independent_accelerator() -> None:
+    """清空 Power 占位槽时必须保留 Anima 双采样的独立加速分支。"""
+    wf = {
+        "458": {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": "Anima\\anima_baseV10.safetensors"},
+        },
+        "428": {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "lora_name": "Anima\\加速_Turbo_v2.9.safetensors",
+                "strength_model": 0.8,
+                "model": ["458", 0],
+            },
+            "_meta": {"title": "加速"},
+        },
+        "478": {
+            "class_type": "Power Lora Loader (rgthree)",
+            "inputs": {
+                "model": ["458", 0],
+                "lora_1": {
+                    "on": False,
+                    "lora": "Anima\\风格_占位.safetensors",
+                    "strength": 1.0,
+                },
+            },
+            "_meta": {"title": "权重Lora加载器"},
+        },
+        "509": {
+            "class_type": "XB_ROCmKSamplerAdvanced",
+            "inputs": {"model": ["478", 0], "end_at_step": 12},
+            "_meta": {"title": "一采"},
+        },
+        "510": {
+            "class_type": "XB_ROCmKSamplerAdvanced",
+            "inputs": {
+                "model": ["428", 0],
+                "start_at_step": 12,
+                "latent": ["509", 0],
+            },
+            "_meta": {"title": "二采"},
+        },
+    }
+    slots = {"loras": {"node": "478", "field": "lora"}}
+    accelerator = json.loads(json.dumps(wf["428"], ensure_ascii=False))
+
+    apply_slots(
+        wf,
+        slots,
+        {"loras": [{"name": "Anima\\人物_测试.safetensors", "strength": 0.7}]},
+    )
+    assert wf["478"]["inputs"]["lora_1"]["on"] is True
+    assert wf["428"] == accelerator
+
+    apply_slots(wf, slots, {"loras": []})
+    assert wf["478"]["inputs"]["lora_1"]["on"] is False
+    assert wf["428"] == accelerator
+    assert wf["510"]["inputs"]["model"] == ["428", 0]
+    print("  power lora preserves independent accelerator OK")
+
+
 def test_slot_mapping_anima_like() -> None:
     wf = _load_fixture("anima_like.json")
     slots = detect_slots(wf)
@@ -232,6 +298,8 @@ def test_config_dropdown_and_size() -> None:
     assert slots["sampler"]["node"] == "5"
     assert resolve_size(832, 1216, "landscape") == (1216, 832)
     assert resolve_size(832, 1216, "portrait") == (832, 1216)
+    assert resolve_size(1024, 1024, "portrait") == (832, 1216)
+    assert resolve_size(1024, 1024, "landscape") == (1216, 832)
     # 传裸节点 id 时不得重复插入同一 label（配置下拉曾因此出现双份选项）
     wf = _load_fixture("mini_workflow.json")
     for selected in ("2", "2 — CLIPTextEncode — 正面提示词", ""):
@@ -354,6 +422,30 @@ def test_workflow_profile_store() -> None:
         minimal = profiles.effective("minimal", wf)
         assert set(minimal["slots"]) == {"prompt"}
 
+        configured = WorkflowProfileStore(
+            Path(td),
+            configured=[
+                {
+                    "__template_key": "mapping",
+                    "workflow": "mini",
+                    "prompt": "2 — CLIPTextEncode — 正面提示词",
+                    "sampler": "5",
+                    "sampler_2": "",
+                }
+            ],
+        )
+        assert configured.configured("MINI")["prompt"]["node"] == "2"
+        configured_effective = configured.effective("mini", wf)
+        assert configured_effective["source"] == "config"
+        assert configured_effective["slots"]["prompt"]["node"] == "2"
+        assert configured_effective["slots"]["sampler"]["node"] == "5"
+        assert set(configured_effective["slots"]) == {"prompt", "sampler"}
+        # 配置映射是运行时覆盖；磁盘中的 Workflow Studio 档案保持可回退。
+        assert configured.get("mini")["slots"]["prompt"]["node"] == "3"
+        fallback = WorkflowProfileStore(Path(td)).effective("mini", wf)
+        assert fallback["source"] == "profile"
+        assert fallback["slots"]["prompt"]["node"] == "3"
+
         legacy_store = RecipeStore(Path(td) / "legacy")
         legacy = legacy_store.save(
             {
@@ -375,6 +467,24 @@ def test_llm_entry_schemas() -> None:
     assert {"name", "workflow", "prompt_style", "description"}.issubset(
         family_schema["templates"]["family"]["items"]
     )
+    mapping_schema = schema["workflow_node_mappings"]
+    assert mapping_schema["type"] == "template_list"
+    assert {
+        "workflow",
+        "prompt",
+        "model",
+        "loras",
+        "size",
+        "sampler",
+        "sampler_2",
+        "negative",
+        "artist",
+        "quality",
+        "trigger_words",
+        "clip",
+        "vae",
+        "guidance",
+    }.issubset(mapping_schema["templates"]["mapping"]["items"])
     registry = ModelFamilyRegistry(
         [
             {"name": "anima", "workflow": "anime-flow", "prompt_style": "danbooru"},
@@ -565,6 +675,138 @@ def test_ui_to_api() -> None:
     print("  ui to api OK")
 
 
+def test_api_to_ui_linked_widget_positions() -> None:
+    """连线 widget 保留固定位置，后续值不得整体前移。"""
+    sampler_inputs = {
+        "model": ["MODEL"],
+        "add_noise": [["enable", "disable"]],
+        "noise_seed": ["INT", {"default": 0, "control_after_generate": True}],
+        "steps": ["INT", {"default": 20}],
+        "cfg": ["FLOAT", {"default": 8.0}],
+        "sampler_name": [["euler_ancestral", "er_sde"]],
+        "scheduler": [["sgm_uniform", "normal"]],
+        "start_at_step": ["INT", {"default": 0}],
+        "end_at_step": ["INT", {"default": 10000}],
+        "return_with_leftover_noise": [["enable", "disable"]],
+    }
+    object_info = {
+        "Int": {
+            "input": {"required": {"value": ["INT", {"default": 0}]}},
+            "output": ["INT"],
+            "output_name": ["INT"],
+        },
+        "EmptyLatentImage": {
+            "input": {
+                "required": {
+                    "width": ["INT", {"default": 512}],
+                    "height": ["INT", {"default": 512}],
+                    "batch_size": ["INT", {"default": 1}],
+                }
+            },
+            "output": ["LATENT"],
+            "output_name": ["LATENT"],
+        },
+        "KSamplerAdvanced": {"input": {"required": sampler_inputs}},
+        "XB_ROCmKSamplerAdvanced": {"input": {"required": sampler_inputs}},
+    }
+    api = {
+        "10": {"class_type": "Int", "inputs": {"value": 512}},
+        "11": {"class_type": "Int", "inputs": {"value": 512}},
+        "12": {"class_type": "Int", "inputs": {"value": 863754493834392}},
+        "13": {"class_type": "Int", "inputs": {"value": 24}},
+        "4": {
+            "class_type": "EmptyLatentImage",
+            "inputs": {"width": ["10", 0], "height": ["11", 0], "batch_size": 1},
+        },
+        "20": {
+            "class_type": "KSamplerAdvanced",
+            "inputs": {
+                "model": ["99", 0],
+                "add_noise": "enable",
+                "noise_seed": ["12", 0],
+                "steps": 8,
+                "cfg": 1,
+                "sampler_name": "euler_ancestral",
+                "scheduler": "sgm_uniform",
+                "start_at_step": 0,
+                "end_at_step": 7,
+                "return_with_leftover_noise": "enable",
+            },
+        },
+        "21": {
+            "class_type": "XB_ROCmKSamplerAdvanced",
+            "inputs": {
+                "model": ["99", 0],
+                "add_noise": "enable",
+                "noise_seed": 123,
+                "steps": ["13", 0],
+                "cfg": 4.6,
+                "sampler_name": "er_sde",
+                "scheduler": "sgm_uniform",
+                "start_at_step": 0,
+                "end_at_step": 12,
+                "return_with_leftover_noise": "enable",
+            },
+        },
+        "22": {
+            "class_type": "KSamplerAdvanced",
+            "inputs": {
+                "model": ["99", 0],
+                "add_noise": "disable",
+                "noise_seed": 456,
+                "steps": 16,
+                "cfg": 2.5,
+                "sampler_name": "er_sde",
+                "scheduler": "normal",
+                "start_at_step": 2,
+                "end_at_step": 15,
+                "return_with_leftover_noise": "disable",
+            },
+        },
+    }
+
+    ui = api_to_ui(api, object_info)
+    by_id = {node["id"]: node for node in ui["nodes"]}
+    assert by_id[4]["widgets_values"] == [None, None, 1]
+    assert by_id[20]["widgets_values"] == [
+        "enable",
+        None,
+        "fixed",
+        8,
+        1,
+        "euler_ancestral",
+        "sgm_uniform",
+        0,
+        7,
+        "enable",
+    ]
+    assert by_id[21]["widgets_values"] == [
+        "enable",
+        123,
+        "fixed",
+        None,
+        4.6,
+        "er_sde",
+        "sgm_uniform",
+        0,
+        12,
+        "enable",
+    ]
+    assert by_id[22]["widgets_values"] == [
+        "disable",
+        456,
+        "fixed",
+        16,
+        2.5,
+        "er_sde",
+        "normal",
+        2,
+        15,
+        "disable",
+    ]
+    print("  api to ui linked widget positions OK")
+
+
 def test_workflow_build() -> None:
     """anima-v3 五段式覆盖 + LoRA 插槽 + KSampler。模板不存在则跳过。"""
     b = _builder()
@@ -656,7 +898,7 @@ def test_recipe_base_slots_binding() -> None:
 
 
 def test_dual_sampler_external_int() -> None:
-    """双采样 + 外联 Int：步数写到两个整数节点，种子写到共享 Int，连线不断开。"""
+    """双采样只写映射节点；显式第二段与共享外联节点按槽位联动。"""
     wf = _load_fixture("dual_sampler.json")
     slots = detect_slots(wf)
     assert slots["prompt"]["node"] == "2"
@@ -674,6 +916,33 @@ def test_dual_sampler_external_int() -> None:
     assert wf["10"]["inputs"]["value"] == 20
     assert wf["11"]["inputs"]["value"] == 20
     assert wf["12"]["inputs"]["value"] == 99
+
+    # 只映射第一段时，第二段独立的步数节点保持模板值。
+    primary_only = _load_fixture("dual_sampler.json")
+    primary_only["13"] = {"class_type": "Int", "inputs": {"value": 67890}}
+    primary_only["21"]["inputs"]["noise_seed"] = ["13", 0]
+    apply_slots(primary_only, {"sampler": {"node": "20"}}, {"steps": 30, "seed": 99})
+    assert primary_only["10"]["inputs"]["value"] == 30
+    assert primary_only["11"]["inputs"]["value"] == 8
+    assert primary_only["12"]["inputs"]["value"] == 99
+    assert primary_only["13"]["inputs"]["value"] == 67890
+
+    # V6 式双采样共享同一个总步数节点时，写第一段即可让两段自然读取新值。
+    shared = _load_fixture("dual_sampler.json")
+    shared["21"]["inputs"]["steps"] = ["10", 0]
+    apply_slots(shared, {"sampler": {"node": "20"}}, {"steps": 30})
+    assert shared["10"]["inputs"]["value"] == 30
+    assert shared["20"]["inputs"]["steps"] == ["10", 0]
+    assert shared["21"]["inputs"]["steps"] == ["10", 0]
+
+    # CFG 等浮点参数沿外联数值节点写入时保留小数并维持连线。
+    linked_cfg = _load_fixture("dual_sampler.json")
+    linked_cfg["13"] = {"class_type": "Int", "inputs": {"value": 1}}
+    linked_cfg["20"]["inputs"]["cfg"] = ["13", 0]
+    apply_slots(linked_cfg, {"sampler": {"node": "20"}}, {"cfg": 4.6})
+    assert linked_cfg["13"]["inputs"]["value"] == 4.6
+    assert linked_cfg["20"]["inputs"]["cfg"] == ["13", 0]
+
     # 映射到整数节点时同样能改步数
     wf2 = _load_fixture("dual_sampler.json")
     slots2 = dict(slots)
@@ -750,6 +1019,193 @@ def test_submit_error_parse() -> None:
     print("  submit error parse OK")
 
 
+def test_execution_status_and_image_media_type() -> None:
+    error = execution_error_message(
+        {
+            "status_str": "error",
+            "completed": False,
+            "messages": [
+                ["execution_start", {"prompt_id": "p1"}],
+                [
+                    "execution_error",
+                    {
+                        "node_id": "428",
+                        "node_type": "LoraLoaderModelOnly",
+                        "exception_type": "OutOfMemoryError",
+                        "exception_message": "CUDA out of memory\nwhile allocating tensor",
+                    },
+                ],
+            ],
+        }
+    )
+    assert "428" in error
+    assert "LoraLoaderModelOnly" in error
+    assert "OutOfMemoryError" in error
+    assert "CUDA out of memory while allocating tensor" in error
+    interrupted = execution_error_message(
+        {
+            "status_str": "error",
+            "messages": [
+                [
+                    "execution_interrupted",
+                    {"node_id": "510", "node_type": "XB_ROCmKSamplerAdvanced"},
+                ]
+            ],
+        }
+    )
+    assert interrupted == "执行已中断（节点 510 (XB_ROCmKSamplerAdvanced)）"
+    assert execution_error_message({"message": "legacy error"}) == "legacy error"
+
+    assert image_media_type(b"\x89PNG\r\n\x1a\nrest", "wrong.webp") == "image/png"
+    assert image_media_type(b"RIFF\x04\x00\x00\x00WEBPrest", "wrong.png") == "image/webp"
+    assert image_media_type(b"\xff\xd8\xffrest", "x.bin") == "image/jpeg"
+    assert image_media_type(b"GIF89arest", "x.bin") == "image/gif"
+    print("  execution status / image media type OK")
+
+
+def test_webapi_original_output_and_interrupt_guard() -> None:
+    import webapi as webapi_module
+
+    png = b"\x89PNG\r\n\x1a\noriginal-png-bytes"
+
+    class FakeClient:
+        def __init__(self):
+            self.download_calls = []
+            self.interrupt_calls = []
+            self.entries = {
+                "ok-pid": {
+                    "status": {"status_str": "success", "completed": True, "messages": []},
+                    "outputs": {
+                        "9": {
+                            "images": [
+                                {
+                                    "filename": "astrbot_test_00001_.png",
+                                    "subfolder": "",
+                                    "type": "output",
+                                }
+                            ]
+                        }
+                    },
+                },
+                "error-pid": {
+                    "status": {
+                        "status_str": "error",
+                        "completed": False,
+                        "messages": [
+                            [
+                                "execution_error",
+                                {
+                                    "node_id": "509",
+                                    "node_type": "XB_ROCmKSamplerAdvanced",
+                                    "exception_type": "RuntimeError",
+                                    "exception_message": "sampler exploded",
+                                },
+                            ]
+                        ],
+                    },
+                    "outputs": {},
+                },
+            }
+
+        async def get_history_entry(self, prompt_id):
+            return self.entries.get(prompt_id)
+
+        async def download_image(
+            self,
+            filename,
+            subfolder="",
+            preview=None,
+            image_type="output",
+        ):
+            self.download_calls.append((filename, subfolder, preview, image_type))
+            return png
+
+        async def interrupt(self, prompt_id=None):
+            self.interrupt_calls.append(prompt_id)
+            return True
+
+    async def run():
+        query = {"pid": "ok-pid"}
+        body = {}
+
+        def fake_query(key, default=""):
+            return query.get(key, default)
+
+        async def fake_body():
+            return dict(body)
+
+        def fake_json(data, status=200):
+            return {**data, "_status": status}
+
+        old_query, old_body, old_json = (
+            webapi_module._query,
+            webapi_module._body,
+            webapi_module._json,
+        )
+        webapi_module._query = fake_query
+        webapi_module._body = fake_body
+        webapi_module._json = fake_json
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                output_dir = root / "output"
+                output_dir.mkdir()
+                store = RecipeStore(root)
+                shared = {
+                    "web_pending_runs": {
+                        "ok-pid": {"workflow": "mini", "prompt": "cat"},
+                        "error-pid": {"workflow": "mini", "prompt": "cat"},
+                        "interrupt-pid": {"workflow": "mini", "prompt": "cat"},
+                    }
+                }
+                client = FakeClient()
+                api = webapi_module.StudioApi(
+                    client,
+                    None,
+                    store,
+                    output_dir,
+                    shared,
+                )
+
+                success = await api.generate_poll()
+                assert success["ok"] is True and success["done"] is True
+                assert success["data_url"].startswith("data:image/png;base64,")
+                assert client.download_calls == [
+                    ("astrbot_test_00001_.png", "", None, "output")
+                ]
+                history = store.list_history(1)[0]
+                saved_path = Path(history["local_path"])
+                assert saved_path.suffix == ".png"
+                assert saved_path.read_bytes() == png
+
+                query["pid"] = "error-pid"
+                failed = await api.generate_poll()
+                assert "509" in failed["error"] and "sampler exploded" in failed["error"]
+                assert "error-pid" not in shared["web_pending_runs"]
+
+                body.clear()
+                missing = await api.interrupt()
+                assert missing["ok"] is False and missing["_status"] == 400
+                assert client.interrupt_calls == []
+
+                body["prompt_id"] = "unknown-pid"
+                unknown = await api.interrupt()
+                assert unknown["ok"] is False and unknown["_status"] == 404
+                assert client.interrupt_calls == []
+
+                body["prompt_id"] = "interrupt-pid"
+                interrupted = await api.interrupt()
+                assert interrupted["ok"] is True
+                assert client.interrupt_calls == ["interrupt-pid"]
+        finally:
+            webapi_module._query = old_query
+            webapi_module._body = old_body
+            webapi_module._json = old_json
+
+    asyncio.run(run())
+    print("  webapi original output / interrupt guard OK")
+
+
 def test_cache_atomic() -> None:
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "models.json"
@@ -764,6 +1220,7 @@ def main() -> None:
     test_slot_mapping_generic()
     test_power_lora_dynamic_slots()
     test_power_lora_reuses_matching_slot()
+    test_power_lora_preserves_independent_accelerator()
     test_slot_mapping_anima_like()
     test_config_dropdown_and_size()
     test_recipe_store_and_draw_schema()
@@ -772,6 +1229,7 @@ def main() -> None:
     test_llm_entry_schemas()
     test_family_and_recipe_generation_paths()
     test_ui_to_api()
+    test_api_to_ui_linked_widget_positions()
     test_workflow_build()
     test_defaults_precedence()
     test_generation_entry_resolution()
@@ -781,6 +1239,8 @@ def main() -> None:
     test_lora_list_input()
     test_template_management()
     test_submit_error_parse()
+    test_execution_status_and_image_media_type()
+    test_webapi_original_output_and_interrupt_guard()
     test_cache_atomic()
     print("ALL OK")
 

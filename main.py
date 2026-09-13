@@ -261,7 +261,10 @@ class ComfyUIDirectPlugin(Star):
             custom_dir=data_dir / "workflows",
         )
         self._store = RecipeStore(data_dir, preferred_default=default_recipe_name)
-        self._profiles = WorkflowProfileStore(data_dir)
+        self._profiles = WorkflowProfileStore(
+            data_dir,
+            configured=cfg.get("workflow_node_mappings") or [],
+        )
         self._initialize_family_data(
             node_slots_cfg,
             defaults,

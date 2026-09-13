@@ -21,6 +21,7 @@ from slot_mapping import (
     looks_like_anima,
     merge_slots,
     parse_node_option,
+    slots_from_config,
 )
 
 
@@ -145,8 +146,46 @@ class ModelFamilyRegistry:
 class WorkflowProfileStore:
     """持久化工作流的槽位映射，使多份配方共享同一份节点定义。"""
 
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, configured: Any = None) -> None:
         self.path = data_dir / "workflow_profiles.json"
+        self._configured = self._parse_configured(configured)
+
+    @staticmethod
+    def _parse_configured(raw: Any) -> dict[str, dict[str, dict]]:
+        """解析配置页按工作流填写的完整槽位映射。"""
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError):
+                return {}
+        if isinstance(raw, list):
+            rows = [row for row in raw if isinstance(row, dict)]
+        elif isinstance(raw, dict) and raw.get("workflow"):
+            rows = [raw]
+        elif isinstance(raw, dict):
+            rows = [
+                {"workflow": workflow, **slots}
+                for workflow, slots in raw.items()
+                if isinstance(slots, dict)
+            ]
+        else:
+            rows = []
+
+        configured: dict[str, dict[str, dict]] = {}
+        for row in rows:
+            workflow = str(row.get("workflow") or "").strip()
+            if not workflow:
+                continue
+            key = workflow.casefold()
+            if key in configured:
+                logger.warning(f"[ComfyUIDirect] 工作流节点映射重复，保留第一条: {workflow}")
+                continue
+            configured[key] = slots_from_config(row)
+        return configured
+
+    def configured(self, workflow: str) -> dict[str, dict] | None:
+        slots = self._configured.get(str(workflow or "").strip().casefold())
+        return dict(slots) if slots is not None else None
 
     @staticmethod
     def _normalize_slots(raw: Any) -> dict[str, dict]:
@@ -220,16 +259,32 @@ class WorkflowProfileStore:
         return self.get(name) or {"workflow": name, "slots": normalized, "drop_nodes": []}
 
     def effective(self, workflow: str, wf: dict) -> dict:
-        """有保存档案时完整采用人工映射；未保存时即时返回自动检测结果。"""
+        """配置页映射优先，其次工作台档案，最后采用自动检测结果。"""
         detected = detect_slots(wf)
         saved = self.get(workflow)
-        if saved:
+        configured = self.configured(workflow)
+        if configured is not None:
+            slots = configured
+            drop_nodes = (
+                list(saved.get("drop_nodes") or [])
+                if saved is not None
+                else list(ANIMA_DROP_NODES) if looks_like_anima(wf) else []
+            )
+            source = "config"
+        elif saved:
             slots = saved.get("slots") or {}
             drop_nodes = list(saved.get("drop_nodes") or [])
+            source = "profile"
         else:
             slots = detected
             drop_nodes = list(ANIMA_DROP_NODES) if looks_like_anima(wf) else []
-        return {"workflow": workflow, "slots": slots, "drop_nodes": drop_nodes}
+            source = "detected"
+        return {
+            "workflow": workflow,
+            "slots": slots,
+            "drop_nodes": drop_nodes,
+            "source": source,
+        }
 
     def ensure(
         self,
@@ -237,6 +292,8 @@ class WorkflowProfileStore:
         wf: dict,
         configured_slots: Any = None,
     ) -> dict:
+        if self.configured(workflow) is not None:
+            return self.effective(workflow, wf)
         current = self.get(workflow)
         if current:
             return current

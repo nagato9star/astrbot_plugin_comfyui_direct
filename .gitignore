@@ -8,3 +8,5 @@ venv/
 .idea/
 .vscode/
 metadata_debug.log
+# 误把 AstrBot 根目录当工作目录启动时留下的运行数据（含密钥），不要入库
+data/

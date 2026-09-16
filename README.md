@@ -33,6 +33,24 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 | **配方工作台** | 导入工作流、保存共享槽位映射、编辑配方并试画 |
 | **查一下再画** | 角色、画师、底模、LoRA 不确定时先查短列表；LoRA 支持 style / character 等分类 |
 
+## 图片缓存与清理
+
+Bot 生图、原始工作流执行、输出下载和工作台试画统一将原图缓存到 AstrBot 的 `data/plugin_data/astrbot_plugin_comfyui_direct/output/`（由 `StarTools.get_data_dir` 定位）。缓存按图片内容哈希命名，保留原始字节，同内容复用并刷新保留时间，同名不同内容分别保存。旧版 output 图片也纳入清理。
+
+管理员可发送：
+
+- `/comfyui_cache` 或 `/comfyui_cache status`：查看缓存数量、容量和目录。
+- `/comfyui_cache expired`：立即按保留期限和容量上限清理。
+- `/comfyui_cache clear`：清理图片缓存。
+
+配置项 `image_cache_auto_clean` 默认开启，启动及每小时执行清理；`image_cache_days` 默认 7 天；`image_cache_max_mb` 默认 1024 MiB。天数或容量设为 0 可关闭对应限制。清理只处理 output 直属图片，保留配方、工作流和生成历史。最近 5 分钟保存或复用的图片始终保留以供发送，所以清空后可能还有近期文件，容量也可能暂时超限。历史里的本地图片路径在清理后可能失效。
+
+## 生图上下文与工作流适配
+
+默认 `llm_tool_mode=basic` 只启用自由生图、配方生图和查询三个工具。工具描述去除重复的配方目录与枚举说明；家族目录始终提供 `prompt_style` 并限制用途说明长度。生成成功仅回传发送状态、种子和任务 ID，完整参数继续保存到生成历史。配方生图只需提示词及可选配方名，可减少重复生成模型、LoRA 和采样参数。
+
+已配置或保存的工作流映射直接使用，自动检测仅作为无映射时的回退。主提示词节点失效时会提示重新确认映射，避免消耗一次无效生成。图片返回优先选择最终 output；仅有 PreviewImage 等预览输出时使用其真实 type 与 subfolder 下载。
+
 ## 🚀 快速开始
 
 ### 1. 安装
@@ -152,7 +170,24 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 
 默认不会把 `comfyui_run_workflow`、`comfyui_upload_file`、`comfyui_free_memory` 交给 LLM，且 `comfyui_recipe` 的删除动作也要求在 Workflow Studio 手动完成。确有需要时，先开启 `allow_llm_unsafe_tools`。
 
-LoRA 查询示例：`comfyui_lookup(type="lora", query="style")`、`query="character"`、`query="水彩"`。匹配范围包括 LoRA 文件名、LoRA Manager/Civitai 标签、分类和用途说明；机器人可根据画面需求主动查询并选用，文件名以实际查询结果为准。`comfyui_list_models(kind="lora", query="style", limit=10)` 可只返回指定分类，减少 LLM 上下文占用。
+底模与 LoRA 按 `model_family` 查询，支持 `anima`、`krea2`、`sdxl`、`flux`、`illustrious`、`pony` 等家族，以及配置规则中的自定义家族。例如：
+
+```text
+comfyui_lookup(type="lora", model_family="anima", query="style")
+comfyui_lookup(type="lora", model_family="krea2", query="水彩")
+comfyui_lookup(type="model", model_family="sdxl")
+comfyui_list_models(kind="lora", model_family="anima", limit=5, offset=0)
+comfyui_list_models(kind="model", model_family="sdxl", limit=5)
+```
+
+默认每页 5 项，最多 10 项；有后续结果时返回 `next_offset`。省略家族时先给出各家族数量，`kind=all` 仅给资源数量摘要。`kind=model` 与 `kind=unet` 都表示底模。查询底模/LoRA 时可以省略 `query`，角色/画师查询仍需关键词。`comfyui_models_search` 和 `comfyui_model_info` 也支持家族参数；底模元数据用 `types="Checkpoint"`，LoRA 用 `types="LORA"`。
+
+归类优先级：插件配置中的 `resource_family_rules` → 基础模型元数据 → 目录/文件名推断。配置规则支持大小写及斜杠归一化，例如 `kind=lora, family=anima, pattern=Anima/*`；无特征的底模可用完整文件名配置。家族名应与生图路由一致，自定义路由需添加对应规则。SDXL、Pony、Illustrious 分别列出；FLUX Krea 与 Krea2 分开归类。
+
+默认结果排除未知家族，使用 `model_family="unknown"` 或 `include_unknown=true` 可查看，并明确标记兼容性未确认。未知资源不会通过模糊关键词自动选用；核实后仍可显式填写完整文件名。生图与配方提交会拦截已知家族冲突，同名文件要求明确目录。规则和文件名推断依赖标注准确性，不构成模型张量结构验证。固定在工作流中的加速 LoRA 保持原设置。
+
+LoRA 查询同时支持文件名、分类、标签和用途关键词。在线元数据回退只接受文件名匹配的版本，避免直接套用搜索结果首项。升级后资源缓存会重新同步，原有离线缓存仍可回退。
+
 
 `comfyui_draw` 的 `lora` 是字符串：可填文件名、唯一关键词，多个用逗号分隔；指定权重时传 JSON 数组字符串，例如 `"[{\"name\":\"style.safetensors\",\"strength\":0.6}]"`，其中示例文件名需替换成查询结果。传入列表会覆盖工作流映射的 Power Loader 占位槽或旧版明确映射的可选 LoRA 链；独立加速 LoRA 始终保持工作流原值。省略时沿用可选 LoRA 原值，传 `"[]"` 或 `"none"` 只关闭映射槽位。
 

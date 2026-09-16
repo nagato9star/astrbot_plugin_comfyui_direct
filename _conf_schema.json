@@ -476,5 +476,56 @@
       "step": 1
     },
     "hint": "单次角色库查询的等待上限，超时自动放弃并回退其他查询源"
+  },
+  "image_cache_auto_clean": {
+    "type": "bool",
+    "default": true,
+    "description": "自动清理图片缓存",
+    "hint": "启动及每小时按保留天数和容量清理 plugin_data 下的 output 图片；最近 5 分钟文件保留以供发送。"
+  },
+  "image_cache_days": {
+    "type": "int",
+    "default": 7,
+    "description": "图片缓存保留天数",
+    "hint": "0 关闭按时间清理。仅影响返回图片，不清理配方、工作流和历史记录。"
+  },
+  "image_cache_max_mb": {
+    "type": "int",
+    "default": 1024,
+    "description": "图片缓存容量上限（MiB）",
+    "hint": "0 不限制容量；超限时优先清理最久未使用的图片。近期保护文件可能暂时超限。手动 expired 也遵循此配置。"
+  },
+  "resource_family_rules": {
+    "type": "template_list",
+    "description": "资源模型家族归类规则",
+    "hint": "用于底模与 LoRA 查询和兼容性校验。优先级高于元数据、目录/文件名推断；多个匹配时首条生效。家族名应与生图家族一致。",
+    "templates": {
+      "rule": {
+        "name": "资源归类",
+        "items": {
+          "family": {
+            "type": "string",
+            "default": "anima",
+            "hint": "家族名，例如 anima、krea2、sdxl 或自定义家族"
+          },
+          "kind": {
+            "type": "string",
+            "default": "all",
+            "options": [
+              "all",
+              "model",
+              "lora"
+            ],
+            "hint": "all=底模和LoRA，model=底模，lora=LoRA"
+          },
+          "pattern": {
+            "type": "string",
+            "default": "Anima/*",
+            "hint": "匹配 ComfyUI 返回的完整相对文件名，支持 * 和 ?；忽略大小写与斜杠方向。例如 Anima/* 或 my_model.safetensors"
+          }
+        }
+      }
+    },
+    "default": []
   }
 }

@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import sys
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
 from astrbot.api import AstrBotConfig, logger  # noqa: E402
+from astrbot.api.event import AstrMessageEvent, filter  # noqa: E402
 from astrbot.api.star import Context, Star, register  # noqa: E402
 from astrbot.core.star.star_tools import StarTools  # noqa: E402
 
@@ -43,6 +45,8 @@ for _m in (
     "slot_mapping",
     "recipe_store",
     "model_families",
+    "image_cache",
+    "resource_catalog",
 ):
     _sys.modules.pop(_m, None)
 
@@ -114,13 +118,14 @@ except ImportError:
     from model_families import ModelFamilyRegistry, WorkflowProfileStore
     from recipe_store import RecipeStore
 
+from image_cache import manage_cache  # noqa: E402
+
 # 与 _conf_schema.json 一致的默认值（配置缺失时的兜底）
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8188
 DEFAULT_TIMEOUT = 300
 DEFAULT_CACHE_TTL = 600
 DEFAULT_WORKFLOW = "anima-v3"
-
 
 BASIC_LLM_TOOLS = {"comfyui_draw", "comfyui_recipe_draw", "comfyui_lookup"}
 # 这些工具可能读取任意本地文件、执行未经映射的自定义节点或影响其他任务，
@@ -235,6 +240,10 @@ class ComfyUIDirectPlugin(Star):
         data_dir = StarTools.get_data_dir("astrbot_plugin_comfyui_direct")
         self._output_dir = data_dir / "output"
         self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._cache_auto_clean = _as_bool(cfg.get("image_cache_auto_clean", True))
+        self._cache_days = self._cache_limit(cfg.get("image_cache_days", 7), 7)
+        self._cache_max_mb = self._cache_limit(cfg.get("image_cache_max_mb", 1024), 1024)
+        self._cache_task = None
         llm_tool_mode = str(cfg.get("llm_tool_mode") or "basic").strip().lower()
         allow_llm_unsafe_tools = _as_bool(cfg.get("allow_llm_unsafe_tools", False))
         lora_manager_enabled = _as_bool(cfg.get("lora_manager_enabled", True))
@@ -252,6 +261,7 @@ class ComfyUIDirectPlugin(Star):
             cache_ttl=ttl,
             lora_manager_enabled=lora_manager_enabled,
         )
+        self._client.resource_family_rules = cfg.get("resource_family_rules") or []
         self._civitai = CivitaiClient(api_key=civitai_key)
         # 注入 civitai 客户端到 ComfyUIClient，用于本地无触发词时在线回退
         self._client.civitai_client = self._civitai
@@ -434,8 +444,59 @@ class ComfyUIDirectPlugin(Star):
                 family=first_family.name,
             )
 
+    @staticmethod
+    def _cache_limit(value: Any, default: int) -> int:
+        try:
+            return max(0, int(value))
+        except (ValueError, TypeError, OverflowError):
+            return default
+
+    async def initialize(self) -> None:
+        if self._cache_auto_clean and self._cache_task is None:
+            self._cache_task = asyncio.create_task(self._cache_cleanup_loop())
+
+    async def _manage_image_cache(self, action: str) -> dict:
+        return await asyncio.to_thread(
+            manage_cache, self._output_dir, action=action,
+            days=self._cache_days, max_mb=self._cache_max_mb,
+        )
+
+    async def _cache_cleanup_loop(self) -> None:
+        while True:
+            try:
+                result = await self._manage_image_cache("expired")
+                if result["removed"] or result["errors"]:
+                    logger.info(f"[ComfyUIDirect] 图片缓存清理: {result}")
+            except Exception as e:
+                logger.warning(f"[ComfyUIDirect] 图片缓存清理失败: {e}")
+            await asyncio.sleep(3600)
+
+    @filter.command("comfyui_cache")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cache_command(self, event: AstrMessageEvent, action: str = "status"):
+        """图片缓存：status 查看，expired 按配置清理，clear 清空（保留最近 5 分钟文件）。"""
+        action = action.strip().lower()
+        if action not in {"status", "clear", "expired"}:
+            yield event.plain_result("用法：/comfyui_cache [status|expired|clear]")
+            return
+        try:
+            result = await self._manage_image_cache(action)
+        except OSError as e:
+            yield event.plain_result(f"缓存操作失败：{e}")
+            return
+        yield event.plain_result(
+            f"图片缓存：{result['files']} 个，{result['bytes'] / 1048576:.1f} MiB。"
+            f"已清理 {result['removed']} 个，释放 {result['freed'] / 1048576:.1f} MiB；"
+            f"近期文件保留 {result['protected']} 个，失败 {result['errors']} 个。\n"
+            f"目录：{self._output_dir}"
+        )
+
     async def terminate(self) -> None:
         """插件重载/卸载时关闭异步连接。"""
+        if self._cache_task is not None:
+            self._cache_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._cache_task
         await self._client.close()
         await self._danbooru.close()
         await self._gelbooru.close()

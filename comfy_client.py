@@ -20,6 +20,7 @@ from typing import Any
 import httpx
 
 from astrbot.api import logger
+from resource_catalog import infer_family
 
 # ZeroTier 虚拟局域网偶尔抽风（瞬时丢包/路径切换），这类连接级异常可安全重试：
 # - ConnectError/ConnectTimeout：TCP 连接未建立，请求肯定没发出去，重试无副作用
@@ -627,6 +628,9 @@ class ComfyUIClient:
         )
         base_model = (
             metadata.get("base_model")
+            or metadata.get("baseModel")
+            or metadata.get("ss_base_model_version")
+            or metadata.get("modelspec.architecture")
             or civitai.get("baseModel")
             or fallback.get("base_model")
         )
@@ -960,6 +964,9 @@ class ComfyUIClient:
                     words, source = self._extract_trigger_words(meta)
                     if words:
                         local_info = {"trigger_words": words, "source": source}
+                    base_model = self.normalize_lora_metadata(meta).get("base_model")
+                    if base_model:
+                        local_info["base_model"] = base_model
                 except Exception as e:
                     logger.warning(f"[ComfyUIDirect] 读取 {name} 本地触发词失败: {e}")
 
@@ -992,8 +999,20 @@ class ComfyUIClient:
                             )
                         selected: dict | None = None
                         for item in items:
-                            versions = item.get("modelVersions") or []
+                            # Search rank alone does not establish that an online
+                            # LoRA matches this local file or model architecture.
+                            basename = name.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+                            versions = [
+                                version for version in item.get("modelVersions") or []
+                                if any(str(f.get("name") or "").casefold() == basename
+                                       for f in version.get("files") or [])
+                            ]
                             if not versions:
+                                continue
+                            item = {**item, "modelVersions": versions}
+                            local_family = infer_family(info.get("base_model") or "")
+                            online_family = infer_family(versions[0].get("baseModel") or "")
+                            if local_family and online_family and local_family != online_family:
                                 continue
                             civitai_info = self.normalize_lora_metadata(
                                 self._civitai_item_metadata(item), fallback=info
@@ -1266,7 +1285,7 @@ class ComfyUIClient:
                     or time.time() - cached.get("fetched_at", 0) < self.cache_ttl
                 ) and (
                     not self.lora_manager_enabled
-                    or cached.get("lora_metadata_v2") is True
+                    or cached.get("lora_metadata_v3") is True
                 ):
                     return cached["resources"], True
 
@@ -1274,7 +1293,7 @@ class ComfyUIClient:
             if resources is not None:
                 data = {
                     "fetched_at": time.time(),
-                    "lora_metadata_v2": True,
+                    "lora_metadata_v3": True,
                     "resources": resources,
                 }
                 self._save_cache(data)
@@ -1305,7 +1324,7 @@ class ComfyUIClient:
                         self._save_cache(
                             {
                                 "fetched_at": time.time(),
-                                "lora_metadata_v2": True,
+                                "lora_metadata_v3": True,
                                 "resources": resources,
                             }
                         )

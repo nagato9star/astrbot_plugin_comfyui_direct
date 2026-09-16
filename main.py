@@ -36,19 +36,22 @@ from astrbot.core.star.star_tools import StarTools  # noqa: E402
 # 导致改代码后热重载仍在跑旧逻辑。这里在导入前主动踢掉它们。
 import sys as _sys  # noqa: E402
 
-for _m in (
-    "external_search",
-    "tools",
-    "comfy_client",
-    "workflow_builder",
-    "webapi",
-    "slot_mapping",
-    "recipe_store",
-    "model_families",
-    "image_cache",
-    "resource_catalog",
-):
-    _sys.modules.pop(_m, None)
+for _pkg_prefix in ("", "astrbot_plugin_comfyui_direct."):
+    for _m in (
+        "external_search",
+        "tools",
+        "comfy_client",
+        "workflow_builder",
+        "webapi",
+        "slot_mapping",
+        "recipe_store",
+        "model_families",
+        "image_cache",
+        "resource_catalog",
+        "animadex",
+        "api_to_ui",
+    ):
+        _sys.modules.pop(_pkg_prefix + _m, None)
 
 try:
     from astrbot_plugin_comfyui_direct.animadex import AnimaDexClient

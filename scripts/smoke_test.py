@@ -536,7 +536,8 @@ def test_family_and_recipe_generation_paths() -> None:
                 {
                     "unet_name": ["base.safetensors", "other.safetensors"],
                     "lora_name": ["style.safetensors", "soft.safetensors"],
-                    "lora_meta": {},
+                    "lora_meta": {n: {"model_family": "demo"} for n in ("style.safetensors", "soft.safetensors")},
+                    "model_meta": {n: {"model_family": "demo"} for n in ("base.safetensors", "other.safetensors")},
                 },
                 False,
             )
@@ -606,7 +607,8 @@ def test_family_and_recipe_generation_paths() -> None:
                 steps=12,
                 save_as="柔光",
             )
-            assert "家族=demo" in result
+            assert "图片已发送" in result
+            assert store.list_history(1)[0]["family"] == "demo"
             assert client.submitted[-1]["2"]["inputs"]["text"] == "a silver cat"
             assert client.submitted[-1]["1"]["inputs"]["unet_name"] == "other.safetensors"
             assert client.submitted[-1]["7"]["inputs"]["lora_1"]["lora"] == "soft.safetensors"
@@ -620,7 +622,8 @@ def test_family_and_recipe_generation_paths() -> None:
                 families=registry,
             )
             result2 = await recipe_draw.call(context, recipe="柔光", prompt="a blue bird", seed=8)
-            assert "配方=柔光" in result2
+            assert "图片已发送" in result2
+            assert store.list_history(1)[0]["recipe"] == "柔光"
             assert client.submitted[-1]["2"]["inputs"]["text"] == "a blue bird"
             assert client.submitted[-1]["1"]["inputs"]["unet_name"] == "other.safetensors"
             assert client.submitted[-1]["5"]["inputs"]["seed"] == 8
@@ -646,8 +649,15 @@ def test_family_and_recipe_generation_paths() -> None:
                 families=moved_registry,
             )
             result3 = await moved_recipe_draw.call(context, recipe="柔光", prompt="new workflow")
-            assert "工作流=mini-v2" in result3
+            assert "图片已发送" in result3
+            assert store.list_history(1)[0]["workflow"] == "mini-v2"
             assert event.sent == 3
+            before = len(client.submitted)
+            client.resource_family_rules = [
+                {"kind": "lora", "family": "sdxl", "pattern": "soft.safetensors"}
+            ]
+            blocked = await recipe_draw.call(context, recipe="柔光", prompt="blocked")
+            assert "家族不匹配" in blocked and len(client.submitted) == before
 
     asyncio.run(run())
     print("  family / recipe generation paths OK")
@@ -1079,6 +1089,11 @@ def test_webapi_original_output_and_interrupt_guard() -> None:
                         "9": {
                             "images": [
                                 {
+                                    "filename": "preview.png",
+                                    "subfolder": "previews",
+                                    "type": "temp",
+                                },
+                                {
                                     "filename": "astrbot_test_00001_.png",
                                     "subfolder": "",
                                     "type": "output",
@@ -1178,6 +1193,18 @@ def test_webapi_original_output_and_interrupt_guard() -> None:
                 assert saved_path.suffix == ".png"
                 assert saved_path.read_bytes() == png
 
+                client.entries["preview-pid"] = {
+                    "status": {"status_str": "success", "completed": True},
+                    "outputs": {"9": {"images": [
+                        {"filename": "preview.png", "subfolder": "previews", "type": "temp"}
+                    ]}},
+                }
+                query["pid"] = "preview-pid"
+                preview_result = await api.generate_poll()
+                assert preview_result["ok"] is True
+                assert client.download_calls[-1] == ("preview.png", "previews", None, "temp")
+                assert Path(store.list_history(1)[0]["local_path"]).read_bytes() == png
+
                 query["pid"] = "error-pid"
                 failed = await api.generate_poll()
                 assert "509" in failed["error"] and "sampler exploded" in failed["error"]
@@ -1215,6 +1242,166 @@ def test_cache_atomic() -> None:
     print("  cache atomic write OK")
 
 
+def test_image_cache_lifecycle() -> None:
+    import os
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from image_cache import manage_cache, save_image
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "output"
+        a = save_image(root, "../same.png", b"first")
+        b = save_image(root, "same.png", b"second")
+        assert a != b and a.parent == root.resolve()
+        assert a.read_bytes() == b"first" and b.read_bytes() == b"second"
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            paths = list(pool.map(lambda _: save_image(root, "same.png", b"first"), range(8)))
+        assert set(paths) == {a}
+        assert not list(root.glob("*.tmp"))
+        assert manage_cache(root, action="clear")["protected"] == 2
+        old = time.time() - 10 * 86400
+        os.utime(a, (old, old))
+        # Reusing an image refreshes its retention.
+        save_image(root, "same.png", b"first")
+        assert manage_cache(root, action="expired")["removed"] == 0
+        os.utime(a, (old, old))
+        keep = root / "history.json"
+        keep.write_text("{}")
+        nested = root / "nested"
+        nested.mkdir()
+        (nested / "keep.png").write_bytes(b"keep")
+        result = manage_cache(root, action="expired", days=7, max_mb=0)
+        assert result["removed"] == 1 and result["freed"] == 5 and b.exists()
+        assert keep.exists() and (nested / "keep.png").exists()
+        os.utime(b, (old, old))
+        assert manage_cache(root, action="expired", days=0, max_mb=0)["removed"] == 0
+        big = save_image(root, "large.png", b"x" * (1024 * 1024 + 1))
+        os.utime(big, (old + 10, old + 10))
+        limited = manage_cache(root, action="expired", days=0, max_mb=1)
+        assert limited["bytes"] <= 1024 * 1024 and limited["removed"] == 2
+        fresh = save_image(root, "clear.png", b"clear")
+        os.utime(fresh, (old, old))
+        assert manage_cache(root, action="clear")["removed"] == 1
+    print("  image cache atomic dedup / retention / size / clear OK")
+
+
+def test_manual_profile_skips_detection() -> None:
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as td:
+        profiles = WorkflowProfileStore(Path(td))
+        slots = {"prompt": {"node": "2", "field": "text"}}
+        profiles.save("custom", slots)
+        with patch("model_families.detect_slots", side_effect=AssertionError("unexpected detection")):
+            assert profiles.effective("custom", {})["slots"]["prompt"]["node"] == "2"
+        try:
+            apply_slots({}, slots, {"prompt": "test"})
+        except ValueError as e:
+            assert "映射" in str(e)
+        else:
+            raise AssertionError("stale prompt mapping must fail before submission")
+    print("  manual profile bypass / stale mapping guard OK")
+
+
+def test_resource_family_queries() -> None:
+    from resource_catalog import filter_family, resource_family, selection_error
+    from tools import ComfyuiLookupTool, ComfyuiListModelsTool, ComfyuiModelsSearchTool, _match_resource
+
+    resources = {
+        "unet_name": ["Anima/base.safetensors", "SDXL/base.safetensors", "mystery.safetensors"],
+        "lora_name": [f"Anima/style{i:02}.safetensors" for i in range(16)] + [
+            "Krea2/style.safetensors", "SDXL/style.safetensors", "unknown.safetensors",
+            "Anima/wrong.safetensors",
+        ],
+        "lora_meta": {"Anima/wrong.safetensors": {"base_model": "SDXL 1.0"}},
+    }
+    class Client(ComfyUIClient):
+        resource_family_rules = []
+        def __init__(self):
+            pass
+        async def list_resources(self, **kwargs):
+            return resources, False
+        async def list_models_folder(self, folder):
+            return resources["lora_name" if folder == "loras" else "unet_name"]
+
+    assert resource_family("Anima/wrong.safetensors", {"base_model": "SDXL 1.0"})[0] == "sdxl"
+    assert resource_family("Krea2\\test.safetensors")[0] == "krea2"
+    assert resource_family("flux1-krea-dev.safetensors")[0] == "flux"
+    assert resource_family("animal.safetensors")[0] == ""
+    assert resource_family("Anima/test", {"base_model": "unrecognized architecture"})[0] == ""
+    rule = [{"kind": "model", "family": "krea2", "pattern": "mystery.*"}]
+    assert resource_family("mystery.safetensors", rules=rule, kind="model")[0] == "krea2"
+    assert resource_family("mystery.safetensors", rules=rule, kind="lora")[0] == ""
+    assert len(_match_resource(resources["unet_name"], "base.safetensors")) == 2
+    assert "unknown.safetensors" not in filter_family(resources["lora_name"], {}, "anima")
+    assert selection_error(resources, {"loras": [{"name": "SDXL/style.safetensors"}]}, "anima")
+    assert selection_error(resources, {"model": "SDXL/base.safetensors"}, "anima")
+
+    async def run():
+        client = Client()
+        lookup = ComfyuiLookupTool(client=client)
+        summary = await lookup.call(None, type="lora")
+        assert "anima=16" in summary and ".safetensors" not in summary
+        first = await lookup.call(None, type="lora", model_family="anima", query="style", limit=100)
+        assert first.count(".safetensors") == 10 and "next_offset=10" in first
+        assert "Krea2/" not in first and "unknown.safetensors" not in first and "wrong" not in first
+        second = await lookup.call(None, type="lora", model_family="anima", query="style", offset=10)
+        assert "style10" in second and "style00" not in second
+        models = await lookup.call(None, type="model", model_family="sdxl")
+        assert "SDXL/base" in models and "Anima/base" not in models
+        unknown = await lookup.call(None, type="lora", model_family="unknown")
+        assert "unknown.safetensors" in unknown and "未确认兼容性" in unknown
+        listing = await ComfyuiListModelsTool(client=client).call(None, kind="lora", model_family="krea2")
+        assert "Krea2/style" in listing and "SDXL/style" not in listing
+        model_listing = await ComfyuiListModelsTool(client=client).call(None, kind="model", model_family="sdxl")
+        assert "SDXL/base" in model_listing and "Anima/base" not in model_listing
+        folder = await ComfyuiModelsSearchTool(client=client).call(None, folder="unet", model_family="anima")
+        assert "Anima/base" in folder and "SDXL/base" not in folder
+        draw = ComfyuiDrawTool(client=client)
+        name, error = await draw._resolve_model("base", "anima")
+        assert name == "Anima/base.safetensors" and error is None
+        name, error = await draw._resolve_model("SDXL/base.safetensors", "anima")
+        assert name is None and error
+        loras, error = await draw._resolve_loras("SDXL/style.safetensors", "anima")
+        assert loras is None and error
+        loras, error = await draw._resolve_loras("style", "krea2")
+        assert loras[0]["name"] == "Krea2/style.safetensors" and error is None
+        name, error = await draw._resolve_model("mystery", "anima")
+        assert name is None and error
+        # An explicitly selected unknown file stays usable without a false compatibility claim.
+        name, error = await draw._resolve_model("mystery.safetensors", "anima")
+        assert name == "mystery.safetensors" and error is None
+    asyncio.run(run())
+    print("  family filters / paging / ambiguity / generation guards OK")
+
+
+def test_online_lora_identity() -> None:
+    class Online:
+        async def search_models(self, *args, **kwargs):
+            return [
+                {"modelVersions": [{"baseModel": "SDXL", "trainedWords": ["wrong"],
+                                    "files": [{"name": "other.safetensors"}]}]},
+                {"modelVersions": [{"baseModel": "SDXL", "trainedWords": ["wrong-family"],
+                                    "files": [{"name": "test.safetensors"}]}]},
+                {"modelVersions": [{"baseModel": "Anima", "trainedWords": ["correct"],
+                                    "files": [{"name": "test.safetensors"}]}]},
+            ]
+    async def run():
+        client = ComfyUIClient(host="test", port=1, lora_manager_enabled=False)
+        async def empty(*args, **kwargs):
+            return {"ss_base_model_version": "Anima"}
+        client.get_model_metadata = empty
+        client.civitai_client = Online()
+        try:
+            meta = await client._fetch_lora_trigger_words(["test.safetensors"], {})
+            assert meta["test.safetensors"]["base_model"] == "Anima"
+            assert meta["test.safetensors"]["trigger_words"] == ["correct"]
+            assert ComfyUIClient.normalize_lora_metadata({"ss_base_model_version": "sdxl_base_v1-0"})["base_model"] == "sdxl_base_v1-0"
+        finally:
+            await client.close()
+    asyncio.run(run())
+    print("  online LoRA exact-file identity / header family OK")
+
+
 def main() -> None:
     print("[smoke] astrbot_plugin_comfyui_direct 冒烟测试")
     test_slot_mapping_generic()
@@ -1242,6 +1429,10 @@ def main() -> None:
     test_execution_status_and_image_media_type()
     test_webapi_original_output_and_interrupt_guard()
     test_cache_atomic()
+    test_image_cache_lifecycle()
+    test_manual_profile_skips_detection()
+    test_resource_family_queries()
+    test_online_lora_identity()
     print("ALL OK")
 
 

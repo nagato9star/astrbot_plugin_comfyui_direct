@@ -15,6 +15,7 @@ from typing import Any
 from astrbot.api import logger
 
 from recipe_store import model_family, recipe_template
+from resource_catalog import canonical_family
 from slot_mapping import (
     ANIMA_DROP_NODES,
     detect_slots,
@@ -65,7 +66,7 @@ class ModelFamilyRegistry:
 
         if not self._items:
             workflow = str(default_workflow or "anima-v3").strip() or "anima-v3"
-            guessed = model_family(workflow) or "default"
+            guessed = canonical_family(model_family(workflow)) or "default"
             self._items[guessed.casefold()] = ModelFamily(
                 name=guessed,
                 workflow=workflow,
@@ -122,7 +123,7 @@ class ModelFamilyRegistry:
         if found:
             return found
         defaults = (recipe or {}).get("defaults") or {}
-        guessed = model_family(str(defaults.get("model") or ""))
+        guessed = canonical_family(model_family(str(defaults.get("model") or "")))
         if guessed:
             found = self.get(guessed)
             if found:
@@ -138,8 +139,8 @@ class ModelFamilyRegistry:
     def catalog(self) -> str:
         parts = []
         for item in self._items.values():
-            detail = item.description or item.prompt_style
-            parts.append(f"{item.name}→{item.workflow}（{detail}）")
+            detail = " ".join(item.description.split())[:100]
+            parts.append(f"{item.name}（prompt_style={item.prompt_style}" + (f"；{detail}" if detail else "") + "）")
         return "；".join(parts)
 
 
@@ -260,7 +261,6 @@ class WorkflowProfileStore:
 
     def effective(self, workflow: str, wf: dict) -> dict:
         """配置页映射优先，其次工作台档案，最后采用自动检测结果。"""
-        detected = detect_slots(wf)
         saved = self.get(workflow)
         configured = self.configured(workflow)
         if configured is not None:
@@ -276,7 +276,7 @@ class WorkflowProfileStore:
             drop_nodes = list(saved.get("drop_nodes") or [])
             source = "profile"
         else:
-            slots = detected
+            slots = detect_slots(wf)
             drop_nodes = list(ANIMA_DROP_NODES) if looks_like_anima(wf) else []
             source = "detected"
         return {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import random
@@ -15,8 +16,9 @@ from comfy_client import (
     ComfyUIClient,
     execution_error_message,
     image_media_type,
-    safe_output_path,
 )
+from image_cache import save_image
+from resource_catalog import selection_error
 from model_families import ModelFamilyRegistry, WorkflowProfileStore
 from recipe_store import RecipeStore, materialize_values, recipe_template
 from slot_mapping import (
@@ -570,6 +572,12 @@ class StudioApi:
         for key, val in self.config_defaults.items():
             if key not in values and val not in (None, "", 0, 0.0, []):
                 values["negative" if key == "negative_prompt" else key] = val
+        if family is not None and (values.get("model") or values.get("loras")):
+            resources, _ = await self.client.list_resources()
+            error = selection_error(resources, values, family.name,
+                                    getattr(self.client, "resource_family_rules", []))
+            if error:
+                return _json({"ok": False, "error": error}, 400)
         if body.get("size"):
             values["width"], values["height"] = resolve_size(
                 int(values["width"]) if values.get("width") else None,
@@ -577,13 +585,16 @@ class StudioApi:
                 str(body.get("size")),
                 presets=recipe.get("size_presets"),
             )
-        apply_slots(
-            wf,
-            slots,
-            values,
-            prefix=f"astrbot_{uuid.uuid4().hex[:8]}",
-            drop_nodes=drop_nodes,
-        )
+        try:
+            apply_slots(
+                wf,
+                slots,
+                values,
+                prefix=f"astrbot_{uuid.uuid4().hex[:8]}",
+                drop_nodes=drop_nodes,
+            )
+        except ValueError as e:
+            return _json({"ok": False, "error": str(e)}, 400)
         pid, err = await self.client.submit_prompt_detail(wf)
         if err:
             return _json({"ok": False, "error": err})
@@ -625,17 +636,15 @@ class StudioApi:
             images.extend(node_out.get("images") or [])
         if not images:
             return _json({"ok": True, "done": True, "error": "执行完成但无输出图片"})
-        img = images[0]
-        content = await self.client.download_image(img["filename"], img.get("subfolder", ""))
+        img = next((item for item in images if item.get("type", "output") == "output"), images[-1])
+        content = await self.client.download_image(
+            img["filename"], img.get("subfolder", ""), image_type=img.get("type", "output")
+        )
         if not content:
             return _json({"ok": True, "done": True, "error": f"图片下载失败: {img['filename']}"})
         try:
-            local_path = safe_output_path(self.output_dir, img["filename"])
-        except ValueError as e:
-            return _json({"ok": True, "done": True, "error": str(e)})
-        try:
-            local_path.write_bytes(content)
-        except OSError as e:
+            local_path = await asyncio.to_thread(save_image, self.output_dir, img["filename"], content)
+        except (ValueError, OSError) as e:
             return _json({"ok": True, "done": True, "error": f"图片本地保存失败: {e}"})
         pending_runs = self.shared.get("web_pending_runs") or {}
         pending = pending_runs.get(pid) or {}

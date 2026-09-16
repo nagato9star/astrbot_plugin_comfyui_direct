@@ -914,6 +914,10 @@ def apply_slots(
     drop_nodes: list[str] | None = None,
 ) -> dict:
     """按已确认的槽位写节点。None 值跳过。"""
+    if values.get("prompt") is not None:
+        prompt_node = str((slots.get("prompt") or {}).get("node") or "")
+        if prompt_node not in wf or prompt_node in {str(n) for n in (drop_nodes or [])}:
+            raise ValueError("主提示词映射已失效，请在工作台重新确认工作流节点映射")
     if drop_nodes:
         for nid in drop_nodes:
             wf.pop(str(nid), None)

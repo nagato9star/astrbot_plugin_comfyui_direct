@@ -31,7 +31,8 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
 from animadex import AnimaDexClient
-from comfy_client import ComfyUIClient, execution_error_message, safe_output_path
+from comfy_client import ComfyUIClient, execution_error_message
+from image_cache import save_image
 from external_search import CivitaiClient, DanbooruClient, GelbooruClient
 from model_families import ModelFamily, ModelFamilyRegistry, WorkflowProfileStore
 from recipe_store import (
@@ -50,6 +51,10 @@ from slot_mapping import (
     parse_lora,
     read_current_values,
     resolve_size,
+)
+from resource_catalog import (
+    canonical_family, exact_matches, family_summary, filter_family, metadata_for,
+    page_number, resource_family, selection_error,
 )
 from workflow_builder import WorkflowBuilder
 
@@ -245,6 +250,49 @@ def _match_lora_resources(
     return hits[:limit]
 
 
+_RESOURCE_QUERY_PROPERTIES = {
+    "model_family": {"type": "string", "description": "资源家族，如 anima/krea2/sdxl/flux/illustrious；unknown 查未识别项。底模和 LoRA 按生图家族查询"},
+    "limit": {"type": "integer", "description": "每页数量，默认 5，最多 10"},
+    "offset": {"type": "integer", "description": "分页偏移，默认 0；使用返回的 next_offset"},
+    "include_unknown": {"type": "boolean", "description": "同时显示家族未知项，默认 false；未知项需核实兼容性"},
+}
+
+
+def _resource_page(client, resources, kind, query="", family="", limit=5, offset=0,
+                   include_unknown=False) -> str:
+    names = resources.get("lora_name" if kind == "lora" else "unet_name") or []
+    meta = metadata_for(resources, kind)
+    rules = getattr(client, "resource_family_rules", [])
+    title = "LoRA" if kind == "lora" else "底模"
+    if not family:
+        return f"【{title}家族摘要】" + family_summary(names, meta, rules, kind) + "。请指定 model_family 后查询文件；query 可省略。"
+    names = filter_family(names, meta, family, rules, kind, include_unknown)
+    if query:
+        exact = exact_matches(names, query)
+        if exact:
+            names = exact
+        elif kind == "lora":
+            names = _match_lora_resources(names, meta, query, limit=len(names))
+        else:
+            names = [n for n in names if query.casefold() in n.casefold()]
+    limit = max(1, page_number(limit, 5, 10))
+    offset = page_number(offset)
+    shown = names[offset:offset + limit]
+    lines = [f"【{title} {canonical_family(family)}】共 {len(names)} 项，显示 {offset + 1 if shown else 0}-{offset + len(shown)}"]
+    for name in shown:
+        found, source = resource_family(name, meta.get(name), rules, kind)
+        lines.append(f"{name} [家族={found or 'unknown'}；{source}]")
+        if kind == "lora":
+            lines.extend("  " + line[:240] for line in _lora_info_summary(meta.get(name) or {}, detailed=True))
+    if offset + limit < len(names):
+        lines.append(f"next_offset={offset + limit}；可进一步用 query 缩小范围。")
+    if not shown:
+        lines.append("无匹配项；检查家族/关键词，或用 model_family=unknown 查看未识别资源并配置归类规则。")
+    if include_unknown or canonical_family(family) == "unknown":
+        lines.append("unknown 项未确认兼容性，请核实元数据或配置归类后选用。")
+    return "\n".join(lines)
+
+
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
 class ComfyuiListModelsTool(FunctionTool[AstrAgentContext]):
     """查询 ComfyUI 可用模型/LoRA/CLIP 清单。"""
@@ -266,8 +314,8 @@ class ComfyuiListModelsTool(FunctionTool[AstrAgentContext]):
                 },
                 "kind": {
                     "type": "string",
-                    "enum": ["all", "unet", "lora", "clip", "vae", "embedding"],
-                    "description": "只查看某一类资源，默认 all",
+                    "enum": ["all", "model", "unet", "lora", "clip", "vae", "embedding"],
+                    "description": "只查看某一类资源，model/unet 都表示底模，默认 all",
                 },
                 "query": {
                     "type": "string",
@@ -275,8 +323,9 @@ class ComfyuiListModelsTool(FunctionTool[AstrAgentContext]):
                 },
                 "limit": {
                     "type": "number",
-                    "description": "每类最多返回多少项（1-50，默认 30）",
+                    "description": "每页数量，默认 5，最多 10",
                 },
+                **_RESOURCE_QUERY_PROPERTIES,
             },
         }
     )
@@ -285,6 +334,8 @@ class ComfyuiListModelsTool(FunctionTool[AstrAgentContext]):
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         force = _as_bool(kwargs.get("refresh", False))
         kind = str(kwargs.get("kind") or "all").strip().lower()
+        if kind == "model":
+            kind = "unet"
         field_titles = {
             "unet": ("unet_name", "UNET 底模"),
             "lora": ("lora_name", "LoRA"),
@@ -294,39 +345,24 @@ class ComfyuiListModelsTool(FunctionTool[AstrAgentContext]):
         }
         if kind != "all" and kind not in field_titles:
             return "查询失败：kind 仅支持 all/unet/lora/clip/vae/embedding。"
-        query = str(kwargs.get("query") or "").strip().casefold()
-        limit = _bounded_limit(kwargs.get("limit"), MAX_LLM_LIST_ITEMS)
         resources, from_cache = await self.client.list_resources(force_refresh=force)
-
-        parts = ["【ComfyUI 可用资源】"]
-        if from_cache:
-            parts.append("（来源：本地缓存，自动同步失败时回退）")
-        parts.append("")
-        lora_meta = resources.get("lora_meta") or {}
-        fields = list(field_titles.values()) if kind == "all" else [field_titles[kind]]
-        for field, title in fields:
-            items = resources.get(field) or []
-            if query:
-                if field == "lora_name":
-                    items = _match_lora_resources(items, lora_meta, query, limit=len(items))
-                else:
-                    items = [item for item in items if query in str(item).casefold()]
-            parts.append(f"--- {title} ---")
-            shown_items = items[:limit]
-            if len(items) > limit:
-                parts.append(f"  共 {len(items)} 项，仅显示前 {limit} 项；请继续用 query 筛选。")
-            if field == "lora_name":
-                for m in shown_items:
-                    parts.append(f"  {m}")
-                    info = lora_meta.get(m)
-                    if info:
-                        parts.extend(f"    {line}" for line in _lora_info_summary(info))
-            elif shown_items:
-                parts.extend(f"  {m}" for m in shown_items)
-            else:
-                parts.append("  (无)")
-            parts.append("")
-        return "\n".join(parts)
+        family = str(kwargs.get("model_family") or "").strip()
+        query = str(kwargs.get("query") or "").strip()
+        if kind == "all":
+            return "【资源数量摘要】\n" + "\n".join(
+                f"{title}: {len(resources.get(field) or [])}" for field, title in field_titles.values()
+            ) + "\n请指定 kind 和 model_family 查询底模或 LoRA。"
+        if kind in {"unet", "lora"}:
+            return _resource_page(self.client, resources, "model" if kind == "unet" else "lora",
+                                  query, family, kwargs.get("limit", 5), kwargs.get("offset", 0),
+                                  _as_bool(kwargs.get("include_unknown")))
+        field, title = field_titles[kind]
+        items = sorted(n for n in resources.get(field) or [] if query.casefold() in n.casefold())
+        limit = max(1, page_number(kwargs.get("limit"), 5, 10))
+        offset = page_number(kwargs.get("offset"))
+        shown = items[offset:offset + limit]
+        more = f"\nnext_offset={offset + limit}" if offset + limit < len(items) else ""
+        return f"【{title}】共 {len(items)} 项\n" + "\n".join(shown) + more
 
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
@@ -634,6 +670,12 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                     if self.families is not None
                     else None
                 )
+                if family_entry is not None and (values.get("model") or values.get("loras")):
+                    resources, _ = await self.client.list_resources()
+                    error = selection_error(resources, values, family_entry.name,
+                                            getattr(self.client, "resource_family_rules", []))
+                    if error:
+                        return error
                 workflow_name = (
                     family_entry.workflow if family_entry is not None else recipe_template(recipe_data)
                 )
@@ -672,6 +714,16 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                     denoise=generation_values.get("denoise"),
                     prefix=prefix,
                 )
+                family_entry = self.families.by_workflow(
+                    kwargs.get("workflow") or self.builder.default_workflow
+                ) if self.families is not None else None
+                if family_entry is not None and (pick("model") or lora_val):
+                    resources, _ = await self.client.list_resources()
+                    error = selection_error(resources,
+                                            {"model": pick("model"), "loras": parse_lora(lora_val)},
+                                            family_entry.name, getattr(self.client, "resource_family_rules", []))
+                    if error:
+                        return error
         except FileNotFoundError as e:
             return f"生成失败：{e}"
         except (ValueError, json.JSONDecodeError) as e:
@@ -699,10 +751,10 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
         if not images:
             return "生成似乎已完成，但未找到输出图片文件。"
 
-        img = images[0]
+        img = next((item for item in images if item.get("type", "output") == "output"), images[-1])
         filename = img["filename"]
         subfolder = img.get("subfolder", "")
-        content = await self.client.download_image(filename, subfolder)
+        content = await self.client.download_image(filename, subfolder, image_type=img.get("type", "output"))
         if not content:
             return (
                 f"图片已在ComfyUI生成（{filename}），但下载到本地失败。\n"
@@ -710,8 +762,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
             )
 
         try:
-            local_path = safe_output_path(self.output_dir, filename)
-            local_path.write_bytes(content)
+            local_path = await asyncio.to_thread(save_image, self.output_dir, filename, content)
         except (OSError, ValueError) as e:
             logger.error(f"[ComfyUIDirect] 写入图片失败: {e}")
             return f"图片已生成但本地保存失败（{e}）。文件名: {filename}"
@@ -1061,8 +1112,9 @@ class ComfyuiModelInfoTool(FunctionTool[AstrAgentContext]):
                 "types": {
                     "type": "string",
                     "enum": ["LORA", "Checkpoint"],
-                    "description": "civitai 搜索的模型类型（默认 LORA；底模用 Checkpoint）",
+                    "description": "模型类型：LORA 或 Checkpoint（底模）；本地可省略并自动识别",
                 },
+                "model_family": _RESOURCE_QUERY_PROPERTIES["model_family"],
             },
             "required": ["name"],
         }
@@ -1076,17 +1128,19 @@ class ComfyuiModelInfoTool(FunctionTool[AstrAgentContext]):
         words, _source = ComfyUIClient._extract_trigger_words(meta)
         return words
 
-    async def _query_local(self, name: str) -> str:
+    async def _query_local(self, name: str, kind: str = "lora") -> str:
         # LoRA Manager 保存的 sidecar/Civitai 信息比 safetensors 头部更完整，
         # 尤其是 style/character 分类、用途说明和推荐权重。
-        manager_meta = await self.client.get_lora_manager_metadata(name)
+        manager_meta = await self.client.get_lora_manager_metadata(name) if kind == "lora" else None
         manager_info = ComfyUIClient.normalize_lora_metadata(manager_meta)
         if manager_info:
             lines = [f"【LoRA Manager】{name}"]
             lines.extend(_lora_info_summary(manager_info, detailed=True))
             return "\n".join(lines)
 
-        meta = await self.client.get_model_metadata(name)
+        meta = await self.client.get_model_metadata(
+            name, folders=["loras"] if kind == "lora" else ["checkpoints", "diffusion_models", "unet"]
+        )
         if not meta:
             return f"本地未找到模型 {name}，或该文件没有元数据头部（可试 source=civitai 在线搜索）。"
 
@@ -1160,13 +1214,39 @@ class ComfyuiModelInfoTool(FunctionTool[AstrAgentContext]):
         if source == "local":
             if self.client is None:
                 return "查询失败：本地模型接口未配置。"
-            return await self._query_local(name)
+            resources, _ = await self.client.list_resources()
+            requested = str(kwargs.get("types") or "").casefold()
+            kinds = ["lora"] if requested == "lora" else ["model"] if requested == "checkpoint" else ["lora", "model"]
+            family = str(kwargs.get("model_family") or "")
+            matches = []
+            for kind in kinds:
+                names = resources.get("lora_name" if kind == "lora" else "unet_name") or []
+                if family:
+                    names = filter_family(names, metadata_for(resources, kind), family,
+                                          getattr(self.client, "resource_family_rules", []), kind)
+                matches.extend((kind, n) for n in _match_resource(names, name))
+            if len(matches) != 1:
+                return "未找到唯一匹配模型；请指定 types、model_family 和含目录的完整文件名，先用 comfyui_lookup 查询。"
+            kind, filename = matches[0]
+            found, evidence = resource_family(filename, metadata_for(resources, kind).get(filename),
+                                               getattr(self.client, "resource_family_rules", []), kind)
+            detail = await self._query_local(filename, kind)
+            return f"家族={found or 'unknown'}（{evidence}）\n{detail}"
 
         if source == "civitai":
             if self.civitai is None:
                 return "查询失败：civitai 接口未配置。"
             types = str(kwargs.get("types") or "LORA").strip()
             items = await self.civitai.search_models(name, types=types, limit=3)
+            family = canonical_family(kwargs.get("model_family"))
+            if family:
+                filtered = []
+                for item in items:
+                    versions = [v for v in item.get("modelVersions") or []
+                                if resource_family("", {"base_model": v.get("baseModel")})[0] == family]
+                    if versions:
+                        filtered.append({**item, "modelVersions": versions})
+                items = filtered
             return self._query_civitai_items(items, name)
 
         return "查询失败：source 仅支持 local / civitai。"
@@ -1326,15 +1406,14 @@ class ComfyuiRunWorkflowTool(FunctionTool[AstrAgentContext]):
                     images.extend(node_out.get("images", []))
                 if not images:
                     return f"工作流执行完成（prompt_id: {pid}），但无图片输出。"
-                img = images[0]
+                img = next((item for item in images if item.get("type", "output") == "output"), images[-1])
                 filename = img["filename"]
                 subfolder = img.get("subfolder", "")
-                content = await self.client.download_image(filename, subfolder)
+                content = await self.client.download_image(filename, subfolder, image_type=img.get("type", "output"))
                 if not content:
                     return f"工作流执行完成，图片下载失败（{filename}）。prompt_id: {pid}"
                 try:
-                    local_path = safe_output_path(self.output_dir, filename)
-                    local_path.write_bytes(content)
+                    local_path = await asyncio.to_thread(save_image, self.output_dir, filename, content)
                 except (OSError, ValueError) as e:
                     return f"工作流执行完成但本地保存失败（{e}）。prompt_id: {pid}"
                 try:
@@ -1484,12 +1563,11 @@ class ComfyuiFetchOutputsTool(FunctionTool[AstrAgentContext]):
         for img in images:
             filename = img["filename"]
             subfolder = img.get("subfolder", "")
-            content = await self.client.download_image(filename, subfolder)
+            content = await self.client.download_image(filename, subfolder, image_type=img.get("type", "output"))
             if not content:
                 continue
             try:
-                local_path = safe_output_path(self.output_dir, filename)
-                local_path.write_bytes(content)
+                local_path = await asyncio.to_thread(save_image, self.output_dir, filename, content)
                 saved.append(str(local_path))
             except (OSError, ValueError):
                 continue
@@ -1755,6 +1833,7 @@ class ComfyuiModelsSearchTool(FunctionTool[AstrAgentContext]):
                     "type": "string",
                     "description": "文件名关键词过滤（可选）",
                 },
+                **_RESOURCE_QUERY_PROPERTIES,
             },
         }
     )
@@ -1766,13 +1845,19 @@ class ComfyuiModelsSearchTool(FunctionTool[AstrAgentContext]):
         names = await self.client.list_models_folder(folder)
         if names is None:
             return f"查询失败：无法连接 ComfyUI 或目录 {folder} 不存在。"
-        if query:
-            names = [n for n in names if query in n.lower()]
-        if not names:
-            return f"{folder} 下未找到匹配模型。"
-        shown = sorted(names)[:MAX_LLM_LIST_ITEMS]
-        suffix = f"\n（共 {len(names)} 个，仅显示前 {MAX_LLM_LIST_ITEMS} 个；请继续用 query 筛选）" if len(names) > len(shown) else ""
-        return f"【{folder}】模型 ({len(names)}):\n" + "\n".join(shown) + suffix
+        if folder in {"loras", "checkpoints", "unet", "diffusion_models"}:
+            resources, _ = await self.client.list_resources()
+            resources = dict(resources)
+            kind = "lora" if folder == "loras" else "model"
+            resources["lora_name" if kind == "lora" else "unet_name"] = names
+            return _resource_page(self.client, resources, kind, query,
+                                  str(kwargs.get("model_family") or ""), kwargs.get("limit", 5),
+                                  kwargs.get("offset", 0), _as_bool(kwargs.get("include_unknown")))
+        names = sorted(n for n in names if query in n.casefold())
+        offset = page_number(kwargs.get("offset"))
+        limit = max(1, page_number(kwargs.get("limit"), 5, 10))
+        suffix = f"\nnext_offset={offset + limit}" if offset + limit < len(names) else ""
+        return f"【{folder}】共 {len(names)} 项\n" + "\n".join(names[offset:offset + limit]) + suffix
 
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
@@ -1923,18 +2008,10 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
 
 
 _DRAW_DESC = (
-    "按模型家族自由生成图片，完成后直接发送到当前会话。model_family 和 prompt 必填。"
-    "模型家族决定工作流；其余参数仅按本次需求填写，未填写的值保留该工作流自身设置。"
-    "当 LoRA 有助于实现用户要求的画风、角色、服饰或效果时，可主动查询并选用，用户无需点名 LoRA 或提供文件名。"
-    "先用 comfyui_lookup(type=\"lora\", query=需求关键词)，如 style、character、服饰或效果标签；"
-    "根据返回的用途说明、模型适用信息和推荐权重选择，将实际文件名填入 lora。"
-    "使用已记录的触发词时同步填写 trigger_words；查询未提供触发词时可省略该字段并继续使用 LoRA。"
-    "传入 lora 会覆盖工作流映射的可选 LoRA 槽；Power Loader 原条目仅作占位，独立加速 LoRA 始终保留。"
-    "沿用工作流可选 LoRA 设置时省略 lora。"
-    "要求画幅时填写 size=portrait/landscape/square；画师、画质、负向内容、steps、cfg 等按需求调整。"
-    "用户要求记住本次参数时填写 save_as，插件会保存成引用该模型家族的快捷配方。"
-    "提示词格式遵循模型家族清单中的 prompt_style。"
-    "模型和 LoRA 文件名使用查询结果，触发词保留已知原词格式。"
+    "按模型家族生成并发送图片；model_family、prompt 必填，提示词遵循家族 prompt_style。"
+    "省略可选参数沿用工作流。可按画风、角色、服饰或效果需求主动用 comfyui_lookup 查询并选用 LoRA；"
+    "查询底模/LoRA 必须传同一 model_family，使用返回文件名和推荐权重，已知触发词填 trigger_words。"
+    "复用配方用 comfyui_recipe_draw。图片已直接发送，成功后无需再次发送。"
 )
 
 
@@ -1948,18 +2025,13 @@ def _recipe_enum(store: RecipeStore | None) -> list[str]:
 
 
 def _match_resource(names: list[str], query: str, limit: int = 8) -> list[str]:
-    q = str(query or "").strip().lower().replace("\\", "/")
-    if not q or not names:
+    q = str(query or "").strip().casefold().replace("\\", "/")
+    if not q:
         return []
-    q_base = q.split("/")[-1]
-    exact = []
-    for n in names:
-        base = n.replace("\\", "/").split("/")[-1].lower()
-        if n.lower() == q or base == q_base:
-            exact.append(n)
+    exact = exact_matches(names, q)
     if exact:
-        return exact[:1]
-    return [n for n in names if q in n.lower() or q_base in n.replace("\\", "/").split("/")[-1].lower()][:limit]
+        return exact[:limit]
+    return [n for n in names if q in n.casefold().replace("\\", "/")][:limit]
 
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
@@ -2066,7 +2138,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         family_prop = props.setdefault("model_family", {"type": "string"})
         if names:
             family_prop["enum"] = names
-            family_prop["description"] = "必填。可选模型家族：" + "、".join(names[:24])
+            family_prop["description"] = "必填，从 enum 选择模型家族"
         else:
             family_prop.pop("enum", None)
             family_prop["description"] = "必填。请先由管理员在插件配置中添加模型家族"
@@ -2077,19 +2149,33 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         resources, _ = await self.client.list_resources()
         return resources
 
-    async def _resolve_model(self, query: str) -> tuple[str | None, str | None]:
-        names = (await self._resource_lists()).get("unet_name") or []
+    def _family_candidates(self, resources, kind, query, family):
+        names = resources.get("lora_name" if kind == "lora" else "unet_name") or []
+        meta = metadata_for(resources, kind)
+        rules = getattr(self.client, "resource_family_rules", [])
+        if not family:
+            return names
+        # An exact filename remains usable when metadata is absent; never treat
+        # an unclassified fuzzy match as a recommendation.
+        exact = exact_matches(names, query)
+        if exact:
+            return [n for n in exact if not selection_error(
+                resources, {"loras": [{"name": n}]} if kind == "lora" else {"model": n}, family, rules
+            )]
+        return filter_family(names, meta, family, rules, kind)
+
+    async def _resolve_model(self, query: str, family: str = "") -> tuple[str | None, str | None]:
+        resources = await self._resource_lists()
+        names = self._family_candidates(resources, "model", query, family)
         hits = _match_resource(names, query)
         if len(hits) == 1:
             return hits[0], None
         if not hits:
-            return None, f"没找到叫「{query}」的底模。可以再搜一下，或让用户说完整文件名。"
-        preview = "、".join(hits[:6])
-        return None, f"「{query}」对上了好几份底模：{preview}。请让用户选一个，或填更完整的名字。"
+            return None, f"家族 {family} 中未找到可用底模「{query}」。请用 comfyui_lookup(type=model, model_family=家族) 查询；未知资源需核实后填写完整文件名。"
+        return None, f"底模名称有歧义：{'、'.join(hits[:6])}。请填写含目录的完整文件名。"
 
-    async def _resolve_loras(self, raw: Any) -> tuple[list[dict] | None, str | None]:
+    async def _resolve_loras(self, raw: Any, family: str = "") -> tuple[list[dict] | None, str | None]:
         resources = await self._resource_lists()
-        names = resources.get("lora_name") or []
         metadata = resources.get("lora_meta") or {}
         try:
             parsed = parse_lora(raw)
@@ -2102,16 +2188,14 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             query = str(item.get("name") or "").strip()
             if not query:
                 continue
-            hits = _match_lora_resources(names, metadata, query)
+            names = self._family_candidates(resources, "lora", query, family)
+            hits = exact_matches(names, query) or _match_lora_resources(names, metadata, query)
             if len(hits) == 1:
-                spec = dict(item)
-                spec["name"] = hits[0]
-                resolved.append(spec)
+                resolved.append({**item, "name": hits[0]})
                 continue
             if not hits:
-                return None, f"没找到叫「{query}」的 LoRA。可以再搜一下，或让用户说完整文件名。"
-            preview = "、".join(hits[:6])
-            return None, f"「{query}」对上了好几份 LoRA：{preview}。请让用户选一个，或填更完整的名字。"
+                return None, f"家族 {family} 中未找到可用 LoRA「{query}」。请按 model_family 查询；未知资源需核实后填写完整文件名。"
+            return None, f"LoRA 名称有歧义：{'、'.join(hits[:6])}。请填写含目录的完整文件名。"
         return resolved, None
 
     async def _execute(
@@ -2136,6 +2220,12 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             or self.output_dir is None
         ):
             return "生成失败：插件未初始化完成。"
+
+        if family is not None and (values.get("model") or values.get("loras")):
+            error = selection_error(await self._resource_lists(), values, family.name,
+                                    getattr(self.client, "resource_family_rules", []))
+            if error:
+                return error
 
         workflow_name = family.workflow if family is not None else legacy_workflow
         if not workflow_name:
@@ -2237,8 +2327,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         if not content:
             return f"图片已生成但下载失败（{filename}）。"
         try:
-            local_path = safe_output_path(self.output_dir, filename)
-            local_path.write_bytes(content)
+            local_path = await asyncio.to_thread(save_image, self.output_dir, filename, content)
         except (OSError, ValueError) as e:
             return f"图片已生成但本地保存失败（{e}）。"
 
@@ -2305,26 +2394,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             logger.error(f"[ComfyUIDirect] 图片发送失败: {e}")
             return f"图片已生成但发送失败（{e}）。路径: {local_path}"
 
-        w, h = used.get("width") or "?", used.get("height") or "?"
-        source = (
-            f"配方={recipe.get('name')} 家族={family_name or '旧版'}"
-            if recipe
-            else f"家族={family_name}"
-        )
-        model_note = used.get("model") or "工作流原底模"
-        lora_items = used.get("loras") or []
-        if isinstance(lora_items, list) and lora_items:
-            lora_note = ",".join(
-                str(x.get("name") if isinstance(x, dict) else x) for x in lora_items[:4]
-            )
-        elif "loras" in values:
-            lora_note = "可选 LoRA 已关闭"
-        else:
-            lora_note = "工作流原 LoRA"
-        return (
-            f"已发送。{source} 工作流={workflow_name} 底模={model_note} "
-            f"lora={lora_note} seed={seed} size={w}x{h}.{saved_note}"
-        )
+        return f"图片已发送。seed={seed} prompt_id={pid}.{saved_note}"
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         prompt = str(kwargs.get("prompt") or "").strip()
@@ -2348,7 +2418,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         }
         model_raw = str(kwargs.get("model") or "").strip()
         if model_raw:
-            resolved_model, err = await self._resolve_model(model_raw)
+            resolved_model, err = await self._resolve_model(model_raw, family.name)
             if err:
                 return err
             values["model"] = resolved_model
@@ -2362,7 +2432,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                 if kwargs.get("lora") not in (None, "")
                 else kwargs.get("loras")
             )
-            resolved_loras, err = await self._resolve_loras(raw_loras)
+            resolved_loras, err = await self._resolve_loras(raw_loras, family.name)
             if err:
                 return err
             values["loras"] = resolved_loras
@@ -2439,16 +2509,13 @@ class ComfyuiRecipeDrawTool(FunctionTool[AstrAgentContext]):
 
     def refresh_schema(self) -> None:
         names = _recipe_enum(self.store)
-        catalog = self.store.catalog() if self.store is not None else ""
-        self.description = _RECIPE_DRAW_DESC + (
-            f" 可用配方：{catalog}" if catalog else " 当前还没有配方。"
-        )
+        self.description = _RECIPE_DRAW_DESC + ("" if names else " 当前还没有配方。")
         prop = self.parameters.setdefault("properties", {}).setdefault(
             "recipe", {"type": "string"}
         )
         if names:
             prop["enum"] = names
-            prop["description"] = "用户点名时填写；可选：" + "、".join(names[:24])
+            prop["description"] = "用户点名时从 enum 选择；省略用默认配方"
         else:
             prop.pop("enum", None)
             prop["description"] = "当前没有配方，请先在配方工作台保存"
@@ -2520,7 +2587,7 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
 
     name: str = "comfyui_lookup"
     description: str = (
-        "查询角色/画师的规范词，以及已安装的底模和 LoRA。"
+        "查询角色/画师规范词和已安装底模/LoRA。model/lora 请传与生图一致的 model_family；省略仅返回家族数量。"
         "绘图需要某种画风、角色、服饰或效果时，可主动查询匹配的 LoRA，用户无需点名 LoRA 或提供文件名。"
         "character/artist：把触发词写进 prompt 或 artist。"
         "model/lora：选择符合需求的结果，把实际文件名填进 comfyui_draw 的 model/lora。LoRA 的 query 支持 LoRA Manager/Civitai "
@@ -2545,8 +2612,9 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
                     "type": "number",
                     "description": "type=lora 时最多返回几项（1-8，默认 5）",
                 },
+                **_RESOURCE_QUERY_PROPERTIES,
             },
-            "required": ["type", "query"],
+            "required": ["type"],
         }
     )
     danbooru: DanbooruClient | None = None
@@ -2557,13 +2625,17 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         kind = str(kwargs.get("type") or "").strip().lower()
         query = str(kwargs.get("query") or "").strip()
-        if kind not in ("character", "artist", "model", "lora") or not query:
-            return "查询失败：需要 type（character/artist/model/lora）和 query。"
-
-        if kind == "lora":
-            return await self._lookup_lora(query, _bounded_limit(kwargs.get("limit"), 5))
-        if kind == "model":
-            return await self._lookup_model(query)
+        if kind not in ("character", "artist", "model", "lora"):
+            return "查询失败：需要 type（character/artist/model/lora）。"
+        if kind in {"model", "lora"}:
+            if self.client is None:
+                return "查询失败：ComfyUI 未配置。"
+            resources, _ = await self.client.list_resources()
+            return _resource_page(self.client, resources, kind, query,
+                                  str(kwargs.get("model_family") or ""), kwargs.get("limit", 5),
+                                  kwargs.get("offset", 0), _as_bool(kwargs.get("include_unknown")))
+        if not query:
+            return "查询角色/画师时 query 必填。"
 
         if kind == "character" and self.animadex is not None:
             text = await self.animadex.search_characters(query, page=1)
@@ -2602,32 +2674,6 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
         extra = f"\n别名: {aliases}" if aliases else ""
         return f"【角色 {name}】来源 {source}{extra}\n触发词: {name}"
 
-    async def _lookup_model(self, query: str) -> str:
-        if self.client is None:
-            return "查询失败：ComfyUI 未配置。"
-        resources, _ = await self.client.list_resources()
-        hits = _match_resource(resources.get("unet_name") or [], query)
-        if not hits:
-            return f"未找到匹配底模：{query}"
-        return "【底模】把下面的文件名填进 comfyui_draw 的 model：\n" + "\n".join(hits)
-
-    async def _lookup_lora(self, query: str, limit: int = 5) -> str:
-        if self.client is None:
-            return "查询失败：ComfyUI 未配置。"
-        resources, _ = await self.client.list_resources()
-        names = resources.get("lora_name") or []
-        meta = resources.get("lora_meta") or {}
-        hits = _match_lora_resources(
-            names, meta, query, limit=min(limit, MAX_LLM_DETAIL_ITEMS)
-        )
-        if not hits:
-            return f"未找到匹配 LoRA：{query}（可按文件名、style/character 分类或标签查询）"
-        lines = ["【LoRA】把文件名填进 comfyui_draw 的 lora："]
-        for name in hits:
-            info = meta.get(name) or {}
-            lines.append(name)
-            lines.extend(f"  {line}" for line in _lora_info_summary(info, detailed=True))
-        return "\n".join(lines)
 
 
 async def _auto_fill_trigger_words(client: ComfyUIClient, lora_input: Any) -> str | None:

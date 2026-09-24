@@ -89,6 +89,7 @@ try:
     )
     from astrbot_plugin_comfyui_direct.workflow_builder import WorkflowBuilder
     from astrbot_plugin_comfyui_direct.model_families import (
+        EditWorkflowRegistry,
         ModelFamilyRegistry,
         WorkflowProfileStore,
     )
@@ -123,7 +124,7 @@ except ImportError:
         ComfyuiLookupTool,
     )
     from workflow_builder import WorkflowBuilder
-    from model_families import ModelFamilyRegistry, WorkflowProfileStore
+    from model_families import EditWorkflowRegistry, ModelFamilyRegistry, WorkflowProfileStore
     from recipe_store import RecipeStore
 
 from image_cache import manage_cache  # noqa: E402
@@ -264,6 +265,11 @@ class ComfyUIDirectPlugin(Star):
             default_workflow,
             edit_raw=cfg.get("edit_families") or [],
         )
+        self._edit_workflows = EditWorkflowRegistry(
+            raw=cfg.get("edit_workflows") or [],
+            legacy_edit_raw=cfg.get("edit_families") or [],
+            legacy_families_raw=self._model_families_cfg,
+        )
 
         self._client = ComfyUIClient(
             host=host,
@@ -318,10 +324,11 @@ class ComfyUIDirectPlugin(Star):
             output_dir=self._output_dir,
             shared=shared,
             families=self._families,
+            edit_workflows=self._edit_workflows,
             profiles=self._profiles,
         )
         self._edit_tool.refresh_schema()
-        if not self._families.editable_names():
+        if not self._edit_workflows.names():
             self._edit_tool.active = False
         self._recipe_draw_tool = ComfyuiRecipeDrawTool(
             draw_tool=self._draw_tool,
@@ -404,6 +411,7 @@ class ComfyUIDirectPlugin(Star):
                 self._profiles,
                 config_defaults=defaults,
                 plugin_config=config,
+                edit_workflows=self._edit_workflows,
             )
         except Exception as e:
             logger.error(f"[ComfyUIDirect] WebUI 接口注册失败: {e}")

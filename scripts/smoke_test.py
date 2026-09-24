@@ -756,7 +756,7 @@ def test_qwen_edit_upload_and_output_path() -> None:
                 output_dir=root / "output", shared={}, families=families, profiles=profiles,
             )
             tool.refresh_schema()
-            assert tool.parameters["properties"]["model_family"]["enum"] == ["qwen"]
+            assert tool.parameters["properties"]["edit_workflow"]["enum"] == ["qwen"]
             result = await tool.call(context, model_family="qwen", prompt="make the sky blue")
             assert "图片已编辑并发送" in result and "本地路径:" in result
             assert client.uploads[0][1] == png

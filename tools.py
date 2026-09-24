@@ -35,7 +35,12 @@ from animadex import AnimaDexClient
 from comfy_client import ComfyUIClient, execution_error_message, image_media_type
 from image_cache import save_image
 from external_search import CivitaiClient, DanbooruClient, GelbooruClient
-from model_families import ModelFamily, ModelFamilyRegistry, WorkflowProfileStore
+from model_families import (
+    EditWorkflowRegistry,
+    ModelFamily,
+    ModelFamilyRegistry,
+    WorkflowProfileStore,
+)
 from recipe_store import (
     RecipeStore,
     materialize_values,
@@ -2485,15 +2490,15 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
 
 
 _EDIT_DESC = (
-    "修改已有图片并直接发送结果。优先使用当前消息或引用消息中的图片；"
+    "按独立编辑工作流路由修改已有图片并直接发送结果。优先使用当前消息或引用消息中的图片；"
     "没有附图时可使用本插件上次生成的图片，或在 image_path 填本插件此前返回的本地路径。"
-    "只填写修改要求和已配置的模型家族，不要猜测图片路径；成功回执包含新图片的本地保存路径。"
+    "只填写修改要求和已配置的 edit_workflow，不要猜测图片路径；成功回执包含新图片的本地保存路径。"
 )
 
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
 class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
-    """Upload an attached image and run a family's mapped edit workflow."""
+    """Upload an attached image and run a selected independent edit workflow."""
 
     name: str = "comfyui_edit"
     description: str = _EDIT_DESC
@@ -2501,9 +2506,9 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "model_family": {
+                "edit_workflow": {
                     "type": "string",
-                    "description": "在编辑图家族中配置了工作流的家族，如 qwen",
+                    "description": "独立的编辑工作流路由名，与生图模型家族无关；只有一个路由时可省略",
                 },
                 "prompt": {
                     "type": "string",
@@ -2518,7 +2523,7 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
                     "description": "当前或引用消息有多张图时，选择第几张（从 1 开始）",
                 },
             },
-            "required": ["model_family", "prompt"],
+            "required": ["prompt"],
         }
     )
     client: ComfyUIClient | None = None
@@ -2527,16 +2532,33 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
     output_dir: Path | None = None
     shared: dict = Field(default_factory=dict)
     families: ModelFamilyRegistry | None = None
+    edit_workflows: EditWorkflowRegistry | None = None
     profiles: WorkflowProfileStore | None = None
 
     def refresh_schema(self) -> None:
-        names = self.families.editable_names() if self.families else []
-        prop = self.parameters["properties"]["model_family"]
+        names = (
+            self.edit_workflows.names()
+            if self.edit_workflows is not None
+            else (self.families.editable_names() if self.families else [])
+        )
+        prop = self.parameters["properties"]["edit_workflow"]
         if names:
             prop["enum"] = names
-            self.description = _EDIT_DESC + " 可编辑家族：" + "、".join(names) + "。"
+            self.parameters["required"] = ["prompt"] + (
+                ["edit_workflow"] if len(names) > 1 else []
+            )
+            descriptions = []
+            if self.edit_workflows is not None:
+                descriptions = [
+                    f"{row['name']}：{row['description']}"
+                    for row in self.edit_workflows.list()
+                    if row.get("workflow") and row.get("description")
+                ]
+            suffix = " 路由说明：" + "；".join(descriptions) if descriptions else ""
+            self.description = _EDIT_DESC + " 可用编辑路由：" + "、".join(names) + "。" + suffix
         else:
             prop.pop("enum", None)
+            self.parameters["required"] = ["prompt"]
             self.description = _EDIT_DESC + " 当前尚未配置编辑工作流。"
 
     async def _source_path(self, context: ContextWrapper[AstrAgentContext], kwargs: dict) -> tuple[Path | None, str | None]:
@@ -2577,23 +2599,39 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         prompt = str(kwargs.get("prompt") or "").strip()
         if not prompt:
             return "编辑失败：prompt 不能为空。"
-        if not all((self.client, self.builder, self.store, self.output_dir, self.families)):
+        if not all((self.client, self.builder, self.store, self.output_dir)):
             return "编辑失败：插件未初始化完成。"
-        family_name = str(kwargs.get("model_family") or "").strip()
-        family = self.families.get(family_name)
-        if family is None or not family.edit_workflow:
-            return f"编辑失败：家族「{family_name}」尚无编辑工作流；请在「编辑图家族与工作流」中选择。"
+        workflows = self.edit_workflows
+        if workflows is None:
+            legacy = [
+                {"name": row.get("name"), "workflow": row.get("edit_workflow")}
+                for row in (self.families.list() if self.families else [])
+                if row.get("edit_workflow")
+            ]
+            workflows = EditWorkflowRegistry(raw=legacy)
+        route_name = str(
+            kwargs.get("edit_workflow") or kwargs.get("model_family") or ""
+        ).strip()
+        if not route_name:
+            available = workflows.names()
+            if len(available) == 1:
+                route_name = available[0]
+            elif len(available) > 1:
+                return "编辑失败：请从可用 edit_workflow 中选择一个编辑路由：" + "、".join(available)
+        edit_route = workflows.get(route_name)
+        if edit_route is None or not edit_route.workflow:
+            return f"编辑失败：编辑路由「{route_name or '(未指定)'}」没有可用工作流；请在 Workflow Studio 中绑定编辑工作流。"
         try:
-            wf = self.builder.load_template(family.edit_workflow)
+            wf = self.builder.load_template(edit_route.workflow)
         except (FileNotFoundError, ValueError) as e:
             return f"编辑失败：{e}"
-        profile = self.profiles.effective(family.edit_workflow, wf) if self.profiles else {"slots": detect_slots(wf), "drop_nodes": []}
+        profile = self.profiles.effective(edit_route.workflow, wf) if self.profiles else {"slots": detect_slots(wf), "drop_nodes": []}
         slots = profile.get("slots") or {}
         image_node = wf.get(str((slots.get("source_image") or {}).get("node") or ""))
         if not isinstance(image_node, dict) or image_node.get("class_type") != "LoadImage":
-            return f"编辑失败：工作流「{family.edit_workflow}」缺少有效的来源图片 LoadImage 槽位映射。"
+            return f"编辑失败：工作流「{edit_route.workflow}」缺少有效的来源图片 LoadImage 槽位映射。"
         if not slots.get("prompt"):
-            return f"编辑失败：工作流「{family.edit_workflow}」缺少提示词槽位映射。"
+            return f"编辑失败：工作流「{edit_route.workflow}」缺少提示词槽位映射。"
 
         source_path, source_error = await self._source_path(context, kwargs)
         if source_error:
@@ -2644,8 +2682,9 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
             return f"编辑完成，但保存图片失败（{e}）。"
         _remember_image_path(self.shared, context, local_path)
         self.store.save_history({
-            "prompt_id": pid, "entry": "edit", "family": family.name,
-            "workflow": family.edit_workflow, "prompt": prompt, "source_path": str(source_path),
+            "prompt_id": pid, "entry": "edit", "family": edit_route.name,
+            "edit_route": edit_route.name, "workflow": edit_route.workflow,
+            "prompt": prompt, "source_path": str(source_path),
             "filename": filename, "local_path": str(local_path),
         })
         try:

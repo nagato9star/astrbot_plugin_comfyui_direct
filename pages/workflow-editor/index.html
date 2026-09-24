@@ -60,16 +60,18 @@
       </div>
 
       <div id="workflow-pane" role="tabpanel" aria-labelledby="tab-workflow">
-        <p id="empty-guide" class="callout">先导入工作流，再选择生图或编辑图用途及模型家族，核对节点映射并分别保存。</p>
+        <p id="empty-guide" class="callout">先导入工作流，再选择生图家族或独立编辑路由，核对节点映射并保存。</p>
         <div class="workflow-card">
           <div class="workflow-title"><span>当前工作流</span><strong id="workflow-active-name">尚未选择</strong><span id="workflow-active-source" class="workflow-source"></span></div>
           <div class="workflow-routing">
             <label class="field"><span>用途</span><select id="workflow-purpose"><option value="generate">生图</option><option value="edit">编辑图</option></select></label>
-            <label class="field grow"><span>模型家族</span><select id="workflow-family"></select></label>
+            <label class="field grow" id="workflow-family-wrap"><span>生图家族</span><select id="workflow-family"></select></label>
+            <label class="field grow" id="workflow-edit-route-wrap" hidden><span>编辑路由名</span><input id="workflow-edit-route" list="workflow-edit-route-options" placeholder="如 qwen-edit" /><datalist id="workflow-edit-route-options"></datalist><small>可选已有路由，也可输入新名称；无需创建生图家族</small></label>
+            <label class="field grow" id="workflow-edit-description-wrap" hidden><span>用途说明</span><input id="workflow-edit-description" placeholder="例如：Qwen 图片转真人风格" /><small>有多个编辑路由时，帮助 LLM 选对工作流</small></label>
             <button id="btn-bind-workflow" class="primary" type="button">绑定当前工作流</button>
             <button id="btn-unbind-edit" type="button" hidden>解除编辑绑定</button>
           </div>
-          <p id="workflow-bind-status" class="hint">工作流绑定属于家族路由，不会修改任何配方。</p>
+          <p id="workflow-bind-status" class="hint">工作流和节点映射独立管理；绑定不会修改任何配方。</p>
         </div>
 
         <div class="sec-head"><h3>节点映射</h3><div class="sec-actions"><button id="btn-detect-slots" type="button">重新识别</button><button id="btn-save-profile" type="button">保存映射</button></div></div>

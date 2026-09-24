@@ -173,6 +173,109 @@ class ModelFamilyRegistry:
         return "；".join(parts)
 
 
+@dataclass(frozen=True)
+class EditWorkflow:
+    """独立的图片编辑路由，不依赖生图模型家族。"""
+
+    name: str
+    workflow: str
+    description: str = ""
+
+    def public(self) -> dict[str, str]:
+        return asdict(self)
+
+
+class EditWorkflowRegistry:
+    """解析独立编辑路由，并读取旧的家族绑定作为迁移兼容。"""
+
+    def __init__(
+        self,
+        raw: Any = None,
+        legacy_edit_raw: Any = None,
+        legacy_families_raw: Any = None,
+    ) -> None:
+        self._items: dict[str, EditWorkflow] = {}
+        # Older edit_families rows used the generation family name as route name.
+        for row in ModelFamilyRegistry._rows(legacy_edit_raw):
+            name = str(
+                row.get("name") or row.get("model_family") or row.get("family") or ""
+            ).strip()
+            workflow = str(row.get("workflow") or "").strip()
+            if name:
+                self._items.setdefault(
+                    name.casefold(),
+                    EditWorkflow(name, workflow, str(row.get("description") or "").strip()),
+                )
+        # The original configuration put edit_workflow directly on model_families.
+        for row in ModelFamilyRegistry._rows(legacy_families_raw):
+            name = str(row.get("name") or row.get("family") or "").strip()
+            workflow = str(row.get("edit_workflow") or "").strip()
+            if name and workflow:
+                self._items.setdefault(name.casefold(), EditWorkflow(name, workflow))
+        # New independent edit_workflows always take precedence over legacy values.
+        for row in ModelFamilyRegistry._rows(raw):
+            name = str(row.get("name") or row.get("route") or "").strip()
+            if not name:
+                continue
+            self._items[name.casefold()] = EditWorkflow(
+                name=name,
+                workflow=str(row.get("workflow") or "").strip(),
+                description=str(row.get("description") or "").strip(),
+            )
+
+    def list(self) -> list[dict[str, str]]:
+        return [item.public() for item in self._items.values()]
+
+    def names(self) -> list[str]:
+        return [item.name for item in self._items.values() if item.workflow]
+
+    def get(self, name: str) -> EditWorkflow | None:
+        return self._items.get(str(name or "").strip().casefold())
+
+    def by_workflow(self, workflow: str) -> EditWorkflow | None:
+        wanted = str(workflow or "").strip().casefold()
+        if not wanted:
+            return None
+        return next(
+            (item for item in self._items.values() if item.workflow.casefold() == wanted),
+            None,
+        )
+
+    def set(self, name: str, workflow: str, description: str | None = None) -> EditWorkflow:
+        route_name = str(name or "").strip()
+        if not route_name:
+            raise ValueError("编辑路由名不能为空")
+        key = route_name.casefold()
+        previous = self._items.get(key)
+        route = EditWorkflow(
+            name=previous.name if previous else route_name,
+            workflow=str(workflow or "").strip(),
+            description=(
+                str(description).strip()
+                if description is not None
+                else (previous.description if previous else "")
+            ),
+        )
+        self._items[key] = route
+        return route
+
+    def reconfigure(
+        self,
+        raw: Any = None,
+        legacy_edit_raw: Any = None,
+        legacy_families_raw: Any = None,
+    ) -> None:
+        updated = EditWorkflowRegistry(raw, legacy_edit_raw, legacy_families_raw)
+        self._items = updated._items
+
+    def workflow_references(self) -> dict[str, list[str]]:
+        refs: dict[str, list[str]] = {}
+        for item in self._items.values():
+            if item.workflow:
+                refs.setdefault(item.workflow, []).append(item.name)
+        return refs
+
+
 class WorkflowProfileStore:
     """持久化工作流的槽位映射，使多份配方共享同一份节点定义。"""
 

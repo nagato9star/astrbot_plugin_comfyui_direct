@@ -20,7 +20,7 @@ from comfy_client import (
 )
 from image_cache import save_image
 from resource_catalog import selection_error
-from model_families import ModelFamilyRegistry, WorkflowProfileStore
+from model_families import EditWorkflowRegistry, ModelFamilyRegistry, WorkflowProfileStore
 from config_options import refresh_config_options
 from recipe_store import RecipeStore, materialize_values, recipe_template
 from slot_mapping import (
@@ -110,6 +110,7 @@ class StudioApi:
         profiles: WorkflowProfileStore | None = None,
         config_defaults: dict | None = None,
         plugin_config: Any = None,
+        edit_workflows: EditWorkflowRegistry | None = None,
     ) -> None:
         self.client = client
         self.builder = builder
@@ -120,6 +121,7 @@ class StudioApi:
         self.recipe_draw_tool = recipe_draw_tool
         self.edit_tool = edit_tool
         self.families = families
+        self.edit_workflows = edit_workflows
         self.profiles = profiles
         self.config_defaults = config_defaults or {}
         # AstrBotConfig（或测试用的 dict）：供「设为默认配方」直接写配置
@@ -133,7 +135,11 @@ class StudioApi:
             self.recipe_draw_tool.refresh_schema()
         if self.edit_tool is not None:
             self.edit_tool.refresh_schema()
-            self.edit_tool.active = bool(self.families and self.families.editable_names())
+            self.edit_tool.active = bool(
+                self.edit_workflows.names()
+                if self.edit_workflows is not None
+                else (self.families and self.families.editable_names())
+            )
 
     async def status(self) -> Any:
         connected = await self.client.ping(timeout=5.0)
@@ -158,6 +164,7 @@ class StudioApi:
                 "schedulers": SCHEDULERS,
                 "default_workflow": self.builder.default_workflow,
                 "model_families": self.families.list() if self.families else [],
+                "edit_workflows": self.edit_workflows.list() if self.edit_workflows else [],
                 "slot_roles": [
                     {
                         "id": r,
@@ -280,7 +287,7 @@ class StudioApi:
         name = str(body.get("name") or "").strip()
         if not name:
             return _json({"ok": False, "error": "缺少 name"})
-        # 引用完整性：家族配置或旧配方仍引用时拒绝删除。
+        # 引用完整性：生图家族、编辑路由或旧配方仍引用时拒绝删除。
         refs = self.store.used_templates().get(name) or []
         family_refs = (
             self.families.workflow_references().get(name) or []
@@ -288,11 +295,17 @@ class StudioApi:
             else []
         )
         refs.extend(f"模型家族:{family}" for family in family_refs)
+        edit_refs = (
+            self.edit_workflows.workflow_references().get(name) or []
+            if self.edit_workflows is not None
+            else []
+        )
+        refs.extend(f"编辑路由:{route}" for route in edit_refs)
         if refs:
             return _json(
                 {
                     "ok": False,
-                    "error": f"模板 {name} 正被配方使用：{'、'.join(refs)}。先删掉或改绑这些配方再删模板。",
+                    "error": f"模板 {name} 仍被配置引用：{'、'.join(refs)}。请先解除或改绑这些引用。",
                     "used_by": refs,
                 }
             )
@@ -357,14 +370,20 @@ class StudioApi:
         body = await _body()
         mode = str(body.get("mode") or "").strip().lower()
         family_name = str(body.get("family") or "").strip()
+        edit_route_name = str(body.get("edit_route") or "").strip()
         workflow = str(body.get("workflow") or "").strip()
         if mode not in {"generate", "edit"}:
             return _json({"ok": False, "error": "mode 仅支持 generate / edit"})
+        independent_edit = mode == "edit" and self.edit_workflows is not None and "edit_route" in body
         family = self.families.get(family_name) if self.families is not None else None
-        if family is None:
+        if mode == "generate" and family is None:
+            return _json({"ok": False, "error": f"模型家族不存在: {family_name}"})
+        if mode == "edit" and not independent_edit and family is None:
             return _json({"ok": False, "error": f"模型家族不存在: {family_name}"})
         if mode == "generate" and not workflow:
             return _json({"ok": False, "error": "生图工作流不能为空"})
+        if independent_edit and not edit_route_name:
+            return _json({"ok": False, "error": "编辑路由名不能为空"})
         workflow_data = None
         if workflow:
             try:
@@ -386,6 +405,41 @@ class StudioApi:
                 image_node = str((slots.get("source_image") or {}).get("node") or "")
                 if (workflow_data.get(image_node) or {}).get("class_type") != "LoadImage":
                     warnings.append("编辑来源图片尚未映射到 LoadImage")
+
+        if independent_edit:
+            old_edit_workflows = copy.deepcopy(self.plugin_config.get("edit_workflows") or [])
+            editing = copy.deepcopy(old_edit_workflows)
+            row = next(
+                (r for r in editing if isinstance(r, dict)
+                 and str(r.get("name") or "").casefold() == edit_route_name.casefold()),
+                None,
+            )
+            if row is None:
+                row = {"__template_key": "edit_workflow", "name": edit_route_name}
+                editing.append(row)
+            row["workflow"] = workflow
+            if "description" in body:
+                row["description"] = str(body.get("description") or "").strip()
+            self.plugin_config["edit_workflows"] = editing
+            save = getattr(self.plugin_config, "save_config", None)
+            try:
+                if callable(save):
+                    save()
+            except (OSError, ValueError) as e:
+                self.plugin_config["edit_workflows"] = old_edit_workflows
+                return _json({"ok": False, "error": f"保存编辑路由失败: {e}"})
+
+            self.edit_workflows.reconfigure(
+                editing,
+                self.plugin_config.get("edit_families") or [],
+                self.plugin_config.get("model_families") or [],
+            )
+            self._refresh_draw_schema()
+            return _json({
+                "ok": True,
+                "edit_workflows": self.edit_workflows.list(),
+                "warnings": warnings,
+            })
 
         old_gen = copy.deepcopy(self.plugin_config.get("model_families") or [])
         old_edit = copy.deepcopy(self.plugin_config.get("edit_families") or [])
@@ -428,8 +482,19 @@ class StudioApi:
 
         self.families.reconfigure(generation, self.builder.default_workflow, editing)
         self.builder.default_workflow = self.families.first().workflow
+        if self.edit_workflows is not None:
+            self.edit_workflows.reconfigure(
+                self.plugin_config.get("edit_workflows") or [],
+                editing,
+                generation,
+            )
         self._refresh_draw_schema()
-        return _json({"ok": True, "model_families": self.families.list(), "warnings": warnings})
+        return _json({
+            "ok": True,
+            "model_families": self.families.list(),
+            "edit_workflows": self.edit_workflows.list() if self.edit_workflows else [],
+            "warnings": warnings,
+        })
 
     async def list_recipes(self) -> Any:
         return _json(
@@ -751,6 +816,7 @@ def register_web_apis(
     profiles: WorkflowProfileStore | None = None,
     config_defaults: dict | None = None,
     plugin_config: Any = None,
+    edit_workflows: EditWorkflowRegistry | None = None,
 ) -> None:
     if store is None or output_dir is None:
         logger.error("[ComfyUIDirect] WebUI 缺少 recipe store，跳过注册")
@@ -768,6 +834,7 @@ def register_web_apis(
         profiles,
         config_defaults=config_defaults,
         plugin_config=plugin_config,
+        edit_workflows=edit_workflows,
     )
     routes = [
         ("/status", api.status, ["GET"], "ComfyUI 状态"),
@@ -778,7 +845,7 @@ def register_web_apis(
         ("/workflow/delete", api.delete_workflow, ["POST"], "删除工作流"),
         ("/workflow/detect", api.detect, ["POST"], "检测槽位"),
         ("/workflow/profile", api.save_workflow_profile, ["POST"], "保存工作流槽位档案"),
-        ("/workflow/bind", api.save_workflow_binding, ["POST"], "绑定家族工作流"),
+        ("/workflow/bind", api.save_workflow_binding, ["POST"], "绑定生图家族或编辑路由"),
         ("/comfy-history", api.comfy_history, ["GET"], "ComfyUI 历史"),
         ("/recipes", api.list_recipes, ["GET"], "列出配方"),
         ("/recipe", api.get_recipe, ["GET"], "获取配方"),

@@ -18,6 +18,7 @@ const state = {
   connected: false,
   templates: [],
   families: [],
+  editWorkflows: [],
   recipes: [],
   defaultRecipe: "",
   slotRoles: SLOT_FALLBACK,
@@ -31,6 +32,8 @@ const state = {
   workflowSource: "",
   workflowPurpose: "generate",
   workflowFamily: "",
+  workflowEditRoute: "",
+  workflowEditDescription: "",
   workflowJsonOriginal: "",
   profileSlotsOriginal: "{}",
   profileSlots: {},
@@ -129,16 +132,29 @@ function renderWorkflowRouting() {
   $("#workflow-active-name").textContent = active || "尚未选择";
   $("#workflow-active-source").textContent = active ? (state.workflowSource === "custom" ? "已导入" : state.workflowSource) : "";
   $("#workflow-purpose").value = state.workflowPurpose;
-  const bound = state.families.find((family) => (state.workflowPurpose === "edit" ? family.edit_workflow : family.workflow) === active);
-  if (!familyByName(state.workflowFamily) && bound) state.workflowFamily = bound.name;
+  const isEdit = state.workflowPurpose === "edit";
+  const boundFamily = state.families.find((family) => family.workflow === active);
+  if (!familyByName(state.workflowFamily) && boundFamily) state.workflowFamily = boundFamily.name;
   fillSelect($("#workflow-family"), state.families.map((family) => family.name), state.workflowFamily, [""]);
   const family = familyByName(state.workflowFamily);
-  const linked = family ? (state.workflowPurpose === "edit" ? family.edit_workflow : family.workflow) : "";
-  $("#workflow-bind-status").textContent = family
-    ? `${family.name} 的${state.workflowPurpose === "edit" ? "编辑图" : "生图"}工作流：${linked || "未绑定"}`
-    : "选择家族后绑定当前工作流；配方数据不会改变。";
-  $("#btn-bind-workflow").disabled = !active || !family;
-  $("#btn-unbind-edit").hidden = state.workflowPurpose !== "edit" || !family?.edit_workflow;
+  const route = state.editWorkflows.find((item) => String(item.name || "").toLocaleLowerCase() === state.workflowEditRoute.toLocaleLowerCase());
+  $("#workflow-family-wrap").hidden = isEdit;
+  $("#workflow-edit-route-wrap").hidden = !isEdit;
+  $("#workflow-edit-description-wrap").hidden = !isEdit;
+  $("#workflow-edit-route").value = state.workflowEditRoute;
+  $("#workflow-edit-description").value = state.workflowEditDescription;
+  $("#workflow-edit-route-options").innerHTML = state.editWorkflows
+    .filter((item) => item.name)
+    .map((item) => `<option value="${escapeAttr(item.name)}"></option>`)
+    .join("");
+  $("#workflow-bind-status").textContent = isEdit
+    ? `编辑路由「${state.workflowEditRoute || "(未命名)"}」：${route?.workflow || "尚未绑定"}`
+    : family
+      ? `${family.name} 的生图工作流：${family.workflow || "未绑定"}`
+      : "选择生图家族后绑定当前工作流；配方数据不会改变。";
+  $("#btn-bind-workflow").disabled = !active || (isEdit ? !state.workflowEditRoute.trim() : !family);
+  $("#btn-bind-workflow").textContent = isEdit ? "保存编辑路由" : "绑定生图工作流";
+  $("#btn-unbind-edit").hidden = !isEdit || !route?.workflow;
   $("#btn-save-workflow-json").disabled = !active;
 }
 
@@ -269,17 +285,17 @@ function renderLists() {
     li.className = t.name === state.activeWorkflow ? "active" : "";
     const src = t.source === "custom" ? "已导入" : (t.source || "");
     const drawFamilies = state.families.filter((item) => item.workflow === t.name).map((item) => item.name);
-    const editFamilies = state.families.filter((item) => item.edit_workflow === t.name).map((item) => item.name);
+    const editRoutes = state.editWorkflows.filter((item) => item.workflow === t.name).map((item) => item.name);
     const routes = [
       drawFamilies.length ? `生图 ${drawFamilies.join("、")}` : "",
-      editFamilies.length ? `编辑 ${editFamilies.join("、")}` : "",
+      editRoutes.length ? `编辑 ${editRoutes.join("、")}` : "",
     ].filter(Boolean).join(" · ");
     li.innerHTML = `<strong>${escapeHtml(t.name)}</strong><span class="meta">${escapeHtml(src)} · ${t.node_count || "?"} 个节点${routes ? ` · ${escapeHtml(routes)}` : ""}</span>`;
     li.addEventListener("click", () => bindWorkflow(t.name));
     const del = document.createElement("button");
     del.className = "wf-del";
     del.textContent = "×";
-    del.title = "删除这张模板（模型家族或旧配方仍引用时会被拒绝）";
+    del.title = "删除这张模板（生图家族、编辑路由或旧配方仍引用时会被拒绝）";
     del.addEventListener("click", (e) => {
       e.stopPropagation();
       deleteTemplate(t.name);
@@ -402,6 +418,7 @@ async function refreshStatus() {
   state.connected = !!res.connected;
   state.resources = res.resources || state.resources;
   state.families = res.model_families || state.families;
+  state.editWorkflows = res.edit_workflows || state.editWorkflows;
   if (res.sampler_names) state.samplers = res.sampler_names;
   if (res.schedulers) state.schedulers = res.schedulers;
   if (res.slot_roles) state.slotRoles = res.slot_roles;
@@ -464,11 +481,19 @@ async function bindWorkflow(name, force = false) {
   state.workflowJsonOriginal = JSON.stringify(res.workflow || {}, null, 2);
   state.profileSlotsOriginal = JSON.stringify(state.profileSlots);
   $("#workflow-json").value = state.workflowJsonOriginal;
-  const editFamily = state.families.find((item) => item.edit_workflow === name);
+  const editRoute = state.editWorkflows.find((item) => item.workflow === name && item.workflow);
   const drawFamily = state.families.find((item) => item.workflow === name);
-  if (editFamily && !drawFamily) state.workflowPurpose = "edit";
+  if (editRoute && !drawFamily) state.workflowPurpose = "edit";
   else if (drawFamily) state.workflowPurpose = "generate";
-  if (editFamily || drawFamily) state.workflowFamily = (editFamily && !drawFamily ? editFamily : drawFamily).name;
+  if (editRoute && !drawFamily) {
+    state.workflowEditRoute = editRoute.name;
+    state.workflowEditDescription = editRoute.description || "";
+  }
+  else if (drawFamily) state.workflowFamily = drawFamily.name;
+  else if (state.workflowPurpose === "edit") {
+    state.workflowEditRoute = name;
+    state.workflowEditDescription = "";
+  }
   if (switched) toast(`已打开工作流「${name}」的共享槽位`);
   renderLists();
   renderSlots();
@@ -488,7 +513,7 @@ async function loadRecipe(name) {
 }
 
 async function deleteTemplate(name) {
-  if (!confirm(`删除模板「${name}」？模型家族或旧配方仍引用时会被拒绝。`)) return;
+  if (!confirm(`删除模板「${name}」？生图家族、编辑路由或旧配方仍引用时会被拒绝。`)) return;
   const res = await apiPost("workflow/delete", { name });
   if (!res || !res.ok) {
     toast(res?.error || "删除失败", true);
@@ -547,8 +572,8 @@ async function redetectSlots() {
   state.slotOptions = res.slot_options || state.slotOptions;
   renderSlots();
   const count = Object.keys(state.profileSlots).length;
-  const editFamily = state.families.find((item) => item.edit_workflow === state.activeWorkflow);
-  if (editFamily && !slotNode("source_image")) {
+  const editRoute = state.editWorkflows.find((item) => item.workflow === state.activeWorkflow && item.workflow);
+  if ((editRoute || state.workflowPurpose === "edit") && !slotNode("source_image")) {
     toast("编辑来源图片无法唯一识别，请手动选择 LoadImage 后保存映射", true);
   } else {
     toast(count ? `已加载 ${count} 个节点建议，核对后点「保存映射」` : "无法唯一识别节点，请手动选择后保存", !count);
@@ -680,23 +705,35 @@ async function newRecipe() {
 
 async function saveWorkflowBinding(unbind = false) {
   if (!state.activeWorkflow && !unbind) return toast("请先选择工作流", true);
-  const family = $("#workflow-family").value;
-  if (!family) return toast("请选择模型家族", true);
   const mode = $("#workflow-purpose").value;
   if (unbind && mode !== "edit") return;
-  const res = await apiPost("workflow/bind", {
-    family,
-    mode,
-    workflow: unbind ? "" : state.activeWorkflow,
-  });
+  let payload;
+  if (mode === "edit") {
+    const editRoute = $("#workflow-edit-route").value.trim();
+    if (!editRoute) return toast("请填写编辑路由名", true);
+    payload = {
+      edit_route: editRoute,
+      description: $("#workflow-edit-description").value.trim(),
+      mode,
+      workflow: unbind ? "" : state.activeWorkflow,
+    };
+  } else {
+    const family = $("#workflow-family").value;
+    if (!family) return toast("请选择生图家族", true);
+    payload = { family, mode, workflow: state.activeWorkflow };
+  }
+  const res = await apiPost("workflow/bind", payload);
   if (!res || !res.ok) return toast(res?.error || "绑定工作流失败", true);
   state.families = res.model_families || state.families;
-  state.workflowFamily = family;
+  state.editWorkflows = res.edit_workflows || state.editWorkflows;
+  if (mode === "generate") state.workflowFamily = payload.family;
+  else state.workflowEditRoute = payload.edit_route;
+  if (mode === "edit") state.workflowEditDescription = payload.description;
   state.workflowPurpose = mode;
   renderLists();
   renderWorkflowRouting();
   const warning = (res.warnings || []).join("；");
-  toast(warning ? `已绑定；${warning}，请检查节点映射` : (unbind ? `已解除 ${family} 的编辑图绑定` : `已将「${state.activeWorkflow}」绑定到 ${family} 的${mode === "edit" ? "编辑图" : "生图"}入口`), !!warning);
+  toast(warning ? `已保存；${warning}，请检查节点映射` : (unbind ? `已解除「${payload.edit_route}」的工作流绑定` : mode === "edit" ? `已将「${state.activeWorkflow}」绑定到编辑路由「${payload.edit_route}」` : `已将「${state.activeWorkflow}」绑定到生图家族「${payload.family}」`), !!warning);
 }
 
 async function saveWorkflowJson() {
@@ -726,13 +763,32 @@ function bindUi() {
   $("#btn-save-workflow-json").addEventListener("click", () => saveWorkflowJson().catch((e) => toast(String(e), true)));
   $("#workflow-purpose").addEventListener("change", () => {
     state.workflowPurpose = $("#workflow-purpose").value;
-    const bound = state.families.find((item) => (state.workflowPurpose === "edit" ? item.edit_workflow : item.workflow) === state.activeWorkflow);
-    if (bound) state.workflowFamily = bound.name;
+    if (state.workflowPurpose === "edit") {
+      const route = state.editWorkflows.find((item) => item.workflow === state.activeWorkflow && item.workflow);
+      state.workflowEditRoute = route?.name || state.activeWorkflow;
+      state.workflowEditDescription = route?.description || "";
+    } else {
+      const family = state.families.find((item) => item.workflow === state.activeWorkflow);
+      if (family) state.workflowFamily = family.name;
+    }
     renderWorkflowRouting();
   });
   $("#workflow-family").addEventListener("change", () => {
     state.workflowFamily = $("#workflow-family").value;
     renderWorkflowRouting();
+  });
+  $("#workflow-edit-route").addEventListener("input", () => {
+    state.workflowEditRoute = $("#workflow-edit-route").value;
+    renderWorkflowRouting();
+  });
+  $("#workflow-edit-route").addEventListener("change", () => {
+    const wanted = $("#workflow-edit-route").value.trim().toLocaleLowerCase();
+    const route = state.editWorkflows.find((item) => String(item.name || "").toLocaleLowerCase() === wanted);
+    state.workflowEditDescription = route?.description || "";
+    renderWorkflowRouting();
+  });
+  $("#workflow-edit-description").addEventListener("input", () => {
+    state.workflowEditDescription = $("#workflow-edit-description").value;
   });
   $("#btn-save").addEventListener("click", () => saveRecipe().catch((e) => toast(String(e), true)));
   $("#btn-detect-slots").addEventListener("click", () => redetectSlots().catch((e) => toast(String(e), true)));

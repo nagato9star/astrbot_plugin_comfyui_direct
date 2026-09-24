@@ -1275,11 +1275,13 @@ def apply_slots(
 
     # 槽位指向的节点必须存在，否则对应值会被静默丢弃；统一先告警。
     for role, spec in (slots or {}).items():
-        nid = str((spec or {}).get("node") or "")
-        if nid and str(nid) not in wf:
-            logger.warning(
-                f"[slot_mapping] 配方槽位 {role} 指向节点 {nid}，但当前工作流里没有它，该槽位本轮不会写入"
-            )
+        specs = spec if role == "source_images" and isinstance(spec, list) else [spec]
+        for item in specs:
+            nid = str((item or {}).get("node") or "") if isinstance(item, dict) else ""
+            if nid and nid not in wf:
+                logger.warning(
+                    f"[slot_mapping] 配方槽位 {role} 指向节点 {nid}，但当前工作流里没有它，该槽位本轮不会写入"
+                )
 
     prompt = values.get("prompt")
     if prompt is not None and slots.get("prompt"):

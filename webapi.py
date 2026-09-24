@@ -95,6 +95,15 @@ def _query(key: str, default: str = "") -> str:
         return str(request.args.get(key) or default)
 
 
+def _mapped_node_id(spec: Any) -> str:
+    """Return the first selected node for scalar or multi-node workflow slots."""
+    if isinstance(spec, list):
+        spec = spec[0] if spec else None
+    if isinstance(spec, dict):
+        return str(spec.get("node") or "")
+    return str(spec or "")
+
+
 class StudioApi:
     def __init__(
         self,
@@ -200,7 +209,7 @@ class StudioApi:
             "profile_source": profile.get("source", "detected"),
             "drop_nodes": profile.get("drop_nodes") or [],
             "slot_options": {
-                role: node_options_for_slot(wf, role, str((selected.get(role) or {}).get("node") or ""))
+                role: node_options_for_slot(wf, role, _mapped_node_id(selected.get(role)))
                 for role, _ in SLOT_ROLES
             },
         }
@@ -335,7 +344,7 @@ class StudioApi:
                 "values": read_current_values(wf, detected),
                 "anima": looks_like_anima(wf),
                 "slot_options": {
-                    role: node_options_for_slot(wf, role, str((detected.get(role) or {}).get("node") or ""))
+                    role: node_options_for_slot(wf, role, _mapped_node_id(detected.get(role)))
                     for role, _ in SLOT_ROLES
                 },
             }

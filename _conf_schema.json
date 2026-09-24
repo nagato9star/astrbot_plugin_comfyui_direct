@@ -188,6 +188,11 @@
             "default": "",
             "hint": "编辑来源图片的 LoadImage 节点 ID；使用编辑工作流时必填"
           },
+          "source_images": {
+            "type": "string",
+            "default": "",
+            "hint": "多图编辑时按顺序填写 LoadImage 节点 ID，以逗号分隔；顺序对应工作流 images.image_1、images.image_2 等输入"
+          },
           "resolution": {
             "type": "string",
             "default": "",

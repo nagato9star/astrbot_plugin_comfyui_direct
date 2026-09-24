@@ -23,6 +23,7 @@ NEGATIVE_MARKERS = ("lowres", "worst quality")
 SLOT_ROLES: tuple[tuple[str, str], ...] = (
     ("prompt", "用户要画的内容"),
     ("source_image", "编辑来源图片"),
+    ("source_images", "编辑参考图输入（多选）"),
     ("resolution", "编辑输出分辨率"),
     ("custom_size", "按参考图自适配画布"),
     ("model", "底模"),
@@ -44,6 +45,7 @@ SLOT_BASIC = ("prompt", "model", "loras", "size", "sampler")
 SLOT_HELP: dict[str, str] = {
     "prompt": "机器人会把用户的描述写到这里。必选。",
     "source_image": "图片编辑工作流中的 LoadImage 节点。上传后的图片文件名写到这里。",
+    "source_images": "多参考图工作流的 LoadImage 节点，按节点顺序对应 images.image_1、images.image_2 等输入。",
     "resolution": "编辑分辨率输入；也可复用画面大小槽位，按参考图宽高比写入 EmptyLatentImage.width/height。0 保留原始尺寸。",
     "custom_size": "编辑工作流的 custom_size 开关；开启时由工作流使用分辨率选择器画布。",
     "aspect_ratio": "T2I 分辨率选择器的比例输入，例如 1:1、16:9。",
@@ -64,6 +66,7 @@ SLOT_HELP: dict[str, str] = {
 
 SLOT_CLASS_HINTS: dict[str, tuple[str, ...]] = {
     "source_image": ("LoadImage",),
+    "source_images": ("LoadImage",),
     "prompt": (
         "TextEncodeQwenImageEdit",
         "CR Prompt Text",
@@ -561,6 +564,8 @@ def node_matches_slot(node: dict, slot: str) -> bool:
     }[slot]
     if aliases.intersection(fields) or wanted in normalized_name:
         return True
+    if slot == "custom_size" and "switch" in fields and "switch" in cls.casefold():
+        return True
     if slot == "resolution" and ("resolutionselector" in normalized_name or "resolution_select" in normalized_name):
         return True
     if slot in {"aspect_ratio", "megapixels"} and "resolutionselector" in normalized_name:
@@ -599,6 +604,32 @@ def _unique_class_on_path(wf: dict, roots: list[str], classes: tuple[str, ...]) 
     return matches[0] if len(matches) == 1 else None
 
 
+def _edit_canvas_switch(wf: dict, sampler_ids: list[str], edit_id: str) -> str | None:
+    """Find a switch selecting the Qwen edit latent or an explicit size canvas."""
+    for sampler_id in sampler_ids:
+        sampler_inputs = wf[sampler_id].get("inputs") or {}
+        for key in ("latent", "latent_image"):
+            switch_id = _linked_node_id(wf, sampler_inputs.get(key))
+            switch = wf.get(switch_id or "") or {}
+            switch_class = str(switch.get("class_type") or "").casefold()
+            if not switch_id or "switch" not in switch_class:
+                continue
+            switch_inputs = switch.get("inputs") or {}
+            branches = [
+                _linked_node_id(wf, switch_inputs.get(branch))
+                for branch in ("on_false", "on_true")
+            ]
+            branches = [branch for branch in branches if branch]
+            has_edit = any(edit_id in _upstream_ids(wf, [branch]) for branch in branches)
+            has_canvas = any(
+                _unique_class_on_path(wf, [branch], SLOT_CLASS_HINTS["size"])
+                for branch in branches
+            )
+            if has_edit and has_canvas:
+                return switch_id
+    return None
+
+
 def _edit_branch_slots(wf: dict) -> dict[str, dict] | None:
     """Map only the Qwen edit branch that reaches an image output.
 
@@ -608,13 +639,13 @@ def _edit_branch_slots(wf: dict) -> dict[str, dict] | None:
     output_ids = [
         str(nid) for nid, node in wf.items()
         if isinstance(node, dict) and node.get("class_type") in
-        {"SaveImage", "SaveImageWithAlpha", "PreviewImage"}
+        {"SaveImage", "SaveImageAdvanced", "SaveImageWithAlpha", "PreviewImage"}
     ]
     active = _upstream_ids(wf, output_ids) if output_ids else set(wf)
     edit_ids = [
         str(nid) for nid, node in wf.items()
         if str(nid) in active and isinstance(node, dict)
-        and node.get("class_type") == "TextEncodeQwenImageEdit"
+        and node.get("class_type") in {"TextEncodeQwenImageEdit", "TextEncodeQwenImage21"}
     ]
     if not edit_ids:
         return None
@@ -636,11 +667,30 @@ def _edit_branch_slots(wf: dict) -> dict[str, dict] | None:
     elif isinstance(edit_inputs.get("prompt"), str):
         slots["prompt"] = _slot(edit_id, wf, "prompt")
 
-    image_link = _linked_node_id(wf, edit_inputs.get("image"))
-    if image_link:
-        source_id = _unique_class_on_path(wf, [image_link], ("LoadImage",))
-        if source_id:
-            slots["source_image"] = _slot(source_id, wf, "source_image")
+    image_inputs = [
+        (key, value) for key, value in edit_inputs.items()
+        if key == "image" or re.fullmatch(r"images\.image_\d+", str(key))
+    ]
+    image_inputs.sort(
+        key=lambda item: 0 if item[0] == "image" else int(str(item[0]).rsplit("_", 1)[-1])
+    )
+    source_specs: list[dict] = []
+    for input_field, value in image_inputs:
+        image_link = _linked_node_id(wf, value)
+        if not image_link:
+            continue
+        source_ids = [
+            nid for nid in _upstream_ids(wf, [image_link])
+            if wf[nid].get("class_type") == "LoadImage"
+        ]
+        if len(source_ids) == 1:
+            spec = _slot(source_ids[0], wf, "source_image")
+            spec["field"] = "image"
+            spec["input_field"] = str(input_field)
+            source_specs.append(spec)
+    if source_specs:
+        slots["source_images"] = source_specs
+        slots["source_image"] = dict(source_specs[0])
 
     for role in ("resolution", "custom_size", "aspect_ratio", "megapixels"):
         value = edit_inputs.get(role)
@@ -676,6 +726,10 @@ def _edit_branch_slots(wf: dict) -> dict[str, dict] | None:
         slots["sampler"] = _slot(sampler_ids[0], wf, "sampler")
         if len(sampler_ids) > 1:
             slots["sampler_2"] = _slot(sampler_ids[1], wf, "sampler")
+        if not slots.get("custom_size"):
+            switch_id = _edit_canvas_switch(wf, sampler_ids, edit_id)
+            if switch_id:
+                slots["custom_size"] = _slot(switch_id, wf, "custom_size")
 
     for role in ("clip", "vae"):
         root = _linked_node_id(wf, edit_inputs.get(role))
@@ -722,7 +776,7 @@ def detect_slots(wf: dict) -> dict[str, dict]:
     active = _upstream_ids(
         wf,
         [str(nid) for nid, node in wf.items() if isinstance(node, dict)
-         and node.get("class_type") in {"SaveImage", "SaveImageWithAlpha", "PreviewImage"}],
+         and node.get("class_type") in {"SaveImage", "SaveImageAdvanced", "SaveImageWithAlpha", "PreviewImage"}],
     )
     source_image_ids = [
         str(nid) for nid, node in wf.items()
@@ -801,6 +855,8 @@ def infer_field(node: dict, role: str) -> str:
     cls = str(node.get("class_type") or "")
     if role == "source_image":
         return "image"
+    if role == "source_images":
+        return "image"
     if role in ("prompt", "artist", "quality", "trigger_words"):
         if "prompt" in ins:
             return "prompt"
@@ -832,7 +888,7 @@ def infer_field(node: dict, role: str) -> str:
             return _int_field(node) or "resolution"
         return "resolution"
     if role == "custom_size":
-        for key in ("custom_size", "value", "boolean", "bool", "enabled"):
+        for key in ("custom_size", "switch", "value", "boolean", "bool", "enabled"):
             if key in ins:
                 return key
         return "custom_size"
@@ -988,12 +1044,28 @@ def _find_negative_node(wf: dict) -> str | None:
     return None
 
 
-def slots_from_config(raw: Any) -> dict[str, dict]:
+def slots_from_config(raw: Any) -> dict[str, Any]:
     """把配置对象 node_slots 收成配方 slots。"""
     if not isinstance(raw, dict):
         return {}
-    out: dict[str, dict] = {}
+    out: dict[str, Any] = {}
     for role, _label in SLOT_ROLES:
+        if role == "source_images":
+            value = raw.get(role)
+            if isinstance(value, str):
+                values = value.split(",")
+            elif isinstance(value, list):
+                values = value
+            else:
+                values = []
+            specs = []
+            for item in values:
+                node = parse_node_option(item.get("node") if isinstance(item, dict) else item)
+                if node:
+                    specs.append({"node": node, "field": "image", "mode": "replace"})
+            if specs:
+                out[role] = specs
+            continue
         nid = parse_node_option(raw.get(role))
         if nid:
             out[role] = {"node": nid, "mode": "append" if role in ("negative", "quality") else "replace"}
@@ -1220,6 +1292,20 @@ def apply_slots(
         if node is not None:
             field = spec.get("field") or infer_field(node, "source_image")
             node.setdefault("inputs", {})[field] = str(source_image)
+
+    source_images = values.get("source_images")
+    source_specs = slots.get("source_images")
+    if source_images is not None:
+        if not isinstance(source_images, list) or not isinstance(source_specs, list):
+            raise ValueError("多图来源映射必须是图片名与节点列表")
+        if len(source_images) > len(source_specs):
+            raise ValueError(f"工作流只映射了 {len(source_specs)} 个参考图输入")
+        for spec, filename in zip(source_specs, source_images):
+            node = wf.get(str((spec or {}).get("node") or ""))
+            if node is None:
+                raise ValueError("多图来源映射的 LoadImage 节点不存在")
+            field = (spec or {}).get("field") or infer_field(node, "source_image")
+            node.setdefault("inputs", {})[field] = str(filename)
 
     for role in ("artist", "trigger_words"):
         val = values.get(role)

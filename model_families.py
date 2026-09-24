@@ -284,7 +284,7 @@ class WorkflowProfileStore:
         self._configured = self._parse_configured(configured)
 
     @staticmethod
-    def _parse_configured(raw: Any) -> dict[str, dict[str, dict]]:
+    def _parse_configured(raw: Any) -> dict[str, dict[str, Any]]:
         """解析配置页按工作流填写的完整槽位映射。"""
         if isinstance(raw, str):
             try:
@@ -304,7 +304,7 @@ class WorkflowProfileStore:
         else:
             rows = []
 
-        configured: dict[str, dict[str, dict]] = {}
+        configured: dict[str, dict[str, Any]] = {}
         for row in rows:
             workflow = str(row.get("workflow") or "").strip()
             if not workflow:
@@ -316,16 +316,32 @@ class WorkflowProfileStore:
             configured[key] = slots_from_config(row)
         return configured
 
-    def configured(self, workflow: str) -> dict[str, dict] | None:
+    def configured(self, workflow: str) -> dict[str, Any] | None:
         slots = self._configured.get(str(workflow or "").strip().casefold())
         return dict(slots) if slots is not None else None
 
     @staticmethod
-    def _normalize_slots(raw: Any) -> dict[str, dict]:
+    def _normalize_slots(raw: Any) -> dict[str, Any]:
         if not isinstance(raw, dict):
             return {}
-        out: dict[str, dict] = {}
+        out: dict[str, Any] = {}
         for role, spec in raw.items():
+            if role == "source_images" and isinstance(spec, list):
+                nodes = []
+                for item in spec:
+                    if isinstance(item, str):
+                        node = parse_node_option(item)
+                        if node:
+                            nodes.append({"node": node, "field": "image", "mode": "replace"})
+                    elif isinstance(item, dict):
+                        node = parse_node_option(item.get("node"))
+                        if node:
+                            normalized_item = dict(item)
+                            normalized_item["node"] = node
+                            nodes.append(normalized_item)
+                if nodes:
+                    out[str(role)] = nodes
+                continue
             if isinstance(spec, str):
                 node = parse_node_option(spec)
                 if node:

@@ -145,6 +145,25 @@ def _edit_canvas_dimensions(width: int, height: int, resolution: int) -> tuple[i
     return scaled_width, scaled_height
 
 
+def _custom_edit_canvas_dimensions(
+    source_dimensions: tuple[int, int] | None,
+    width: int | None,
+    height: int | None,
+) -> tuple[int, int]:
+    """Apply an explicit canvas size; infer one missing side from the reference ratio."""
+    if width is None and height is None:
+        raise ValueError("请至少指定 width 或 height")
+    if width is None or height is None:
+        if source_dimensions is None:
+            raise ValueError("无法读取来源图片宽高，不能按参考图比例补齐画布尺寸")
+        source_width, source_height = source_dimensions
+        if width is None:
+            width = int(round(height * source_width / source_height / 8) * 8)
+        if height is None:
+            height = int(round(width * source_height / source_width / 8) * 8)
+    return max(8, int(round(width / 8) * 8)), max(8, int(round(height / 8) * 8))
+
+
 def _event_scope(context: ContextWrapper[AstrAgentContext]) -> str:
     """Return a conversation scope for per-session task state."""
     event = getattr(getattr(context, "context", None), "event", None)
@@ -2519,8 +2538,8 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
 _EDIT_DESC = (
     "按独立编辑工作流路由修改已有图片并直接发送结果。优先使用当前消息或引用消息中的图片；"
     "没有附图时可使用本插件上次生成的图片，或在 image_path 填本插件此前返回的本地路径。"
-    "可选 resolution 控制编辑画布目标边长，默认 1024，保持参考图比例后写入已映射的 EmptyLatentImage.width/height；传 0 保留原始尺寸。custom_size 开关可让工作流使用分辨率选择器画布。"
-    "这两个参数只写入当前工作流已映射的输入；成功回执包含新图片的本地保存路径。"
+    "局部改动默认沿用参考图原始宽高。需要按参考图比例缩放时使用 resolution；需要新画布/抠出素材时使用 custom_size 和 width/height。"
+    "这些画布参数只写入当前工作流已映射的输入；成功回执包含新图片的本地保存路径。"
 )
 
 
@@ -2546,11 +2565,23 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 8192,
-                    "description": "可选；目标画布边长，默认 1024，保持参考图宽高比写入已映射的 size 槽位（EmptyLatentImage.width/height）；0 保持原始宽高。也支持映射独立 resolution 输入",
+                    "description": "按来源图比例缩放的最长边像素数；局部修改默认行为等同于 0（原始宽高）。只有明确要缩放时填写；不能与 width/height 同时填写",
                 },
                 "custom_size": {
                     "type": "boolean",
-                    "description": "可选；覆盖已映射的 custom_size 开关。开启时由工作流使用分辨率选择器画布；省略时使用工作流默认值",
+                    "description": "新画布或抠出素材时开启；工作流已映射 custom_size 开关时会启用分辨率选择器画布。width/height 可以自动开启此模式",
+                },
+                "width": {
+                    "type": "integer",
+                    "minimum": 64,
+                    "maximum": 8192,
+                    "description": "自定义画布宽度；需有 size 槽位。只填写一边时按参考图比例计算另一边；与 resolution 互斥。",
+                },
+                "height": {
+                    "type": "integer",
+                    "minimum": 64,
+                    "maximum": 8192,
+                    "description": "自定义画布高度；需有 size 槽位。只填写一边时按参考图比例计算另一边；与 resolution 互斥。",
                 },
                 "image_path": {
                     "type": "string",
@@ -2672,7 +2703,8 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
             return f"编辑失败：工作流「{edit_route.workflow}」缺少提示词槽位映射。"
 
         resolution = kwargs.get("resolution")
-        if resolution not in (None, ""):
+        resolution_provided = resolution not in (None, "")
+        if resolution_provided:
             if isinstance(resolution, bool):
                 return "编辑失败：resolution 必须是 0 到 8192 之间的整数。"
             try:
@@ -2681,14 +2713,38 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
                 )
             except ValueError as e:
                 return f"编辑失败：{e}。"
-            if not slots.get("resolution") and not slots.get("size"):
-                return "编辑失败：此工作流尚未映射 resolution 输入或画面大小节点；请映射 resolution 或 EmptyLatentImage.width/height。"
+        width, height = kwargs.get("width"), kwargs.get("height")
+        width_provided = width not in (None, "")
+        height_provided = height not in (None, "")
+        if width_provided:
+            if isinstance(width, bool):
+                return "编辑失败：width 必须是 64 到 8192 之间的整数。"
+            try:
+                width = _number(width, "width", integer=True, minimum=64, maximum=8192)
+            except ValueError as e:
+                return f"编辑失败：{e}。"
+        if height_provided:
+            if isinstance(height, bool):
+                return "编辑失败：height 必须是 64 到 8192 之间的整数。"
+            try:
+                height = _number(height, "height", integer=True, minimum=64, maximum=8192)
+            except ValueError as e:
+                return f"编辑失败：{e}。"
+        dimensions_provided = width_provided or height_provided
+        if resolution_provided and dimensions_provided:
+            return "编辑失败：resolution 与 width/height 是两种画布设置方式，请只选一种。"
+        if resolution_provided and not slots.get("resolution") and not slots.get("size"):
+            return "编辑失败：此工作流尚未映射 resolution 输入或画面大小节点；请映射 resolution 或 EmptyLatentImage.width/height。"
+        if dimensions_provided and not slots.get("size"):
+            return "编辑失败：此工作流尚未映射画面大小节点，无法写入 width/height。"
         custom_size = kwargs.get("custom_size")
         if custom_size is not None:
             if not isinstance(custom_size, bool):
                 return "编辑失败：custom_size 必须是布尔值。"
-            if not slots.get("custom_size"):
-                return "编辑失败：此工作流尚未映射 custom_size 开关，请在 Workflow Studio 的节点映射中选择对应节点。"
+            if custom_size and not slots.get("custom_size"):
+                return "编辑失败：此工作流尚未映射 custom_size 开关；若只需指定 EmptyLatentImage 画布，请传 width/height。"
+        if dimensions_provided and custom_size is False:
+            return "编辑失败：填写 width/height 时请开启 custom_size 或省略该开关。"
 
         source_path, source_error = await self._source_path(context, kwargs)
         if source_error:
@@ -2703,27 +2759,45 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         suffix = suffixes.get(image_media_type(content))
         if not suffix:
             return "编辑失败：来源文件需为 PNG、JPEG、WebP 或 GIF 图片。"
-        effective_resolution = resolution
-        if effective_resolution in (None, "") and (slots.get("resolution") or slots.get("size")):
+        if resolution_provided:
+            effective_resolution = resolution
+        elif dimensions_provided:
+            effective_resolution = 0
+        elif custom_size is True:
             effective_resolution = 1024
+        else:
+            effective_resolution = 0
         canvas_dimensions = None
-        if slots.get("size") and effective_resolution not in (None, ""):
-            dimensions = image_dimensions(content)
-            if dimensions is None:
-                return "编辑失败：无法读取来源图片宽高，不能按参考图比例设置画布。"
-            canvas_dimensions = _edit_canvas_dimensions(*dimensions, int(effective_resolution))
+        if slots.get("size"):
+            source_dimensions = image_dimensions(content)
+            if dimensions_provided:
+                try:
+                    canvas_dimensions = _custom_edit_canvas_dimensions(
+                        source_dimensions, width, height,
+                    )
+                except ValueError as e:
+                    return f"编辑失败：{e}。"
+            else:
+                if source_dimensions is None:
+                    return "编辑失败：无法读取来源图片宽高，不能按参考图比例设置画布。"
+                canvas_dimensions = _edit_canvas_dimensions(*source_dimensions, int(effective_resolution))
+        effective_custom_size = custom_size
+        if dimensions_provided and effective_custom_size is None and slots.get("custom_size"):
+            effective_custom_size = True
         upload_name, upload_error = await self.client.upload_image(f"astrbot_edit_{uuid.uuid4().hex}{suffix}", content)
         if upload_error or not upload_name:
             return f"编辑失败：上传来源图片失败（{upload_error or 'ComfyUI 未返回文件名'}）。"
 
         seed = random.randint(0, 2**31 - 1) if slots.get("sampler") or slots.get("sampler_2") else None
         apply_values = {"prompt": prompt, "source_image": upload_name, "seed": seed}
-        if effective_resolution not in (None, "") and slots.get("resolution"):
+        if slots.get("resolution"):
             apply_values["resolution"] = effective_resolution
         if canvas_dimensions is not None:
             apply_values["width"], apply_values["height"] = canvas_dimensions
-        if custom_size is not None:
-            apply_values["custom_size"] = custom_size
+        if slots.get("custom_size"):
+            apply_values["custom_size"] = (
+                effective_custom_size if effective_custom_size is not None else False
+            )
         try:
             apply_slots(
                 wf, slots, apply_values,

@@ -2585,7 +2585,7 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
                 },
                 "image_path": {
                     "type": "string",
-                    "description": "可选的单张来源图；仅填本插件此前回执给出的本地保存路径。附图时省略",
+                    "description": "可选单张本地图路径；支持本插件回执路径或 AstrBot data/temp 中的消息图片路径。附图时省略",
                 },
                 "image_index": {
                     "type": "integer",
@@ -2599,7 +2599,7 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
                 "image_paths": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "多图工作流使用本插件此前回执的本地图片路径数组，最多与工作流参考图输入数相同",
+                    "description": "多图工作流使用本插件回执路径或 AstrBot data/temp 消息图片路径数组，最多与工作流参考图输入数相同",
                 },
             },
             "required": ["prompt"],
@@ -2666,15 +2666,30 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         elif requested_single:
             raw_paths = [requested_single]
 
-        def resolve_output_paths(values: list[str]) -> tuple[list[Path] | None, str | None]:
+        def resolve_allowed_paths(values: list[str]) -> tuple[list[Path] | None, str | None]:
             resolved: list[Path] = []
-            root = self.output_dir.resolve()
+            roots = [self.output_dir.resolve()]
+            try:
+                from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+
+                roots.append(Path(get_astrbot_temp_path()).resolve())
+            except (ImportError, OSError, RuntimeError):
+                pass
             for value in values:
                 try:
                     path = Path(value).expanduser().resolve(strict=True)
-                    path.relative_to(root)
                 except (OSError, ValueError):
-                    return None, "来源路径必须是本插件此前回执给出的有效本地保存路径。"
+                    return None, "来源路径无法读取；请确认它是插件输出或 AstrBot 临时媒体目录中的图片。"
+                allowed = False
+                for root in roots:
+                    try:
+                        path.relative_to(root)
+                        allowed = True
+                        break
+                    except ValueError:
+                        continue
+                if not allowed:
+                    return None, "来源路径仅支持本插件输出目录或 AstrBot data/temp 中的文件。"
                 if not path.is_file():
                     return None, "来源图片文件不存在。"
                 resolved.append(path)
@@ -2683,7 +2698,7 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
             return (resolved or None), (None if resolved else "没有提供有效的来源图片路径。")
 
         if raw_paths:
-            return resolve_output_paths(raw_paths)
+            return resolve_allowed_paths(raw_paths)
 
         images = _message_images(context)
         if images:

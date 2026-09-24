@@ -13,6 +13,7 @@ import html
 import json
 import mimetypes
 import re
+import struct
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -97,6 +98,68 @@ def image_media_type(content: bytes, filename: str = "") -> str:
         return "image/gif"
     mime_type, _ = mimetypes.guess_type(filename)
     return mime_type if mime_type and mime_type.startswith("image/") else "application/octet-stream"
+
+
+def image_dimensions(content: bytes) -> tuple[int, int] | None:
+    """Read width/height from the image formats accepted by comfyui_edit."""
+    if content.startswith(b"\x89PNG\r\n\x1a\n") and len(content) >= 24:
+        width, height = struct.unpack_from(">II", content, 16)
+        return (width, height) if width and height else None
+    if content.startswith((b"GIF87a", b"GIF89a")) and len(content) >= 10:
+        width, height = struct.unpack_from("<HH", content, 6)
+        return (width, height) if width and height else None
+    if content.startswith(b"\xff\xd8\xff"):
+        sof_markers = {
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+            0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+        }
+        offset = 2
+        while offset + 4 <= len(content):
+            if content[offset] != 0xFF:
+                offset += 1
+                continue
+            while offset < len(content) and content[offset] == 0xFF:
+                offset += 1
+            if offset >= len(content):
+                break
+            marker = content[offset]
+            offset += 1
+            if marker in {0xD8, 0xD9, 0x01} or 0xD0 <= marker <= 0xD7:
+                continue
+            if offset + 2 > len(content):
+                break
+            segment_size = struct.unpack_from(">H", content, offset)[0]
+            if segment_size < 2 or offset + segment_size > len(content):
+                break
+            if marker in sof_markers and segment_size >= 7:
+                height, width = struct.unpack_from(">HH", content, offset + 3)
+                return (width, height) if width and height else None
+            offset += segment_size
+    if len(content) >= 30 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        offset = 12
+        while offset + 8 <= len(content):
+            chunk_type = content[offset : offset + 4]
+            chunk_size = struct.unpack_from("<I", content, offset + 4)[0]
+            start = offset + 8
+            end = start + chunk_size
+            if end > len(content):
+                break
+            data = content[start:end]
+            if chunk_type == b"VP8X" and len(data) >= 10:
+                width = 1 + int.from_bytes(data[4:7], "little")
+                height = 1 + int.from_bytes(data[7:10], "little")
+                return (width, height) if width and height else None
+            if chunk_type == b"VP8 " and len(data) >= 10 and data[3:6] == b"\x9d\x01\x2a":
+                width = struct.unpack_from("<H", data, 6)[0] & 0x3FFF
+                height = struct.unpack_from("<H", data, 8)[0] & 0x3FFF
+                return (width, height) if width and height else None
+            if chunk_type == b"VP8L" and len(data) >= 5 and data[0] == 0x2F:
+                b1, b2, b3, b4 = data[1:5]
+                width = 1 + ((b2 & 0x3F) << 8) + b1
+                height = 1 + ((b4 & 0x0F) << 10) + (b3 << 2) + ((b2 & 0xC0) >> 6)
+                return (width, height) if width and height else None
+            offset = end + (chunk_size & 1)
+    return None
 
 
 def execution_error_message(status: Any, fallback: str = "执行出错") -> str:

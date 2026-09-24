@@ -49,13 +49,50 @@ def _num(v) -> int | None:
     return None
 
 
-def _is_link(value) -> bool:
-    return (
-        isinstance(value, list)
-        and len(value) == 2
-        and _num(value[0]) is not None
-        and _num(value[1]) is not None
-    )
+def _ui_node_id_map(api: dict) -> dict[str, int]:
+    """Assign numeric UI ids to API nodes, including subgraph ids like ``459:474``."""
+    result: dict[str, int] = {}
+    used: set[int] = set()
+    for raw_id in api:
+        key = str(raw_id)
+        numeric_id = _num(raw_id)
+        if numeric_id is not None and numeric_id >= 0 and numeric_id not in used:
+            result[key] = numeric_id
+            used.add(numeric_id)
+    for node in api.values():
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        if not isinstance(inputs, dict):
+            continue
+        for value in inputs.values():
+            if isinstance(value, list) and len(value) == 2 and _num(value[1]) is not None:
+                referenced_id = _num(value[0])
+                if referenced_id is not None and referenced_id >= 0:
+                    used.add(referenced_id)
+
+    next_id = max(used, default=0) + 1
+    for raw_id in api:
+        key = str(raw_id)
+        if key in result:
+            continue
+        while next_id in used:
+            next_id += 1
+        result[key] = next_id
+        used.add(next_id)
+        next_id += 1
+    return result
+
+
+def _ui_link(value, node_ids: dict[str, int]) -> tuple[int, int] | None:
+    """Map an API node link to numeric UI node and output ids."""
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    source_id = node_ids.get(str(value[0]))
+    if source_id is None:
+        source_id = _num(value[0])
+    output_id = _num(value[1])
+    if source_id is None or output_id is None:
+        return None
+    return source_id, output_id
 
 
 def _needs_control_after_generate(field_type, class_type: str = "", field: str = "") -> bool:
@@ -79,13 +116,13 @@ def api_to_ui(api: dict, object_info: dict | None = None) -> dict:
     """把 ComfyUI API 格式工作流转换为 UI 格式（extra_pnginfo.workflow 用）。"""
     nodes: list[dict] = []
     links: list[list] = []
+    node_ids = _ui_node_id_map(api)
     link_id = 1
     order = 0
 
     for nid_s, node in api.items():
-        try:
-            nid = int(nid_s)
-        except (TypeError, ValueError):
+        nid = node_ids.get(str(nid_s))
+        if nid is None or not isinstance(node, dict):
             continue
         class_type = node.get("class_type", "")
         info = (object_info or {}).get(class_type, {})
@@ -132,8 +169,9 @@ def api_to_ui(api: dict, object_info: dict | None = None) -> dict:
             if is_rgthree_pll and _LINK_RE.match(field) and isinstance(value, dict):
                 rgthree_loras.append(value)
                 continue
-            if _is_link(value):
-                src, slot = _num(value[0]), _num(value[1])
+            mapped_link = _ui_link(value, node_ids)
+            if mapped_link is not None:
+                src, slot = mapped_link
                 ltype = in_defs.get(field, [None])[0] if field in in_defs else None
                 if not isinstance(ltype, str):
                     ltype = "*"

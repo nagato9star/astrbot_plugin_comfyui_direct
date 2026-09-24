@@ -1184,6 +1184,31 @@ def test_api_to_ui_linked_widget_positions() -> None:
     print("  api to ui linked widget positions OK")
 
 
+def test_api_to_ui_composite_node_ids() -> None:
+    api = {
+        "13": {"class_type": "ResolutionSelector", "inputs": {"aspect_ratio": "1:1 (Square)"}},
+        "459:470": {"class_type": "LoadImage", "inputs": {"image": "source.png"}},
+        "459:474": {"class_type": "TextEncodeQwenImage21", "inputs": {"images.image_1": ["459:470", 0]}},
+        "461": {"class_type": "SaveImageAdvanced", "inputs": {"images": ["459:474", 0]}},
+    }
+    snapshot = api_to_ui(api)
+    nodes = snapshot["nodes"]
+    node_ids = {node["id"] for node in nodes}
+    assert len(nodes) == len(api)
+    assert len(node_ids) == len(api) and all(isinstance(node_id, int) for node_id in node_ids)
+    by_type = {node["type"]: node for node in nodes}
+    assert set(by_type) == {"ResolutionSelector", "LoadImage", "TextEncodeQwenImage21", "SaveImageAdvanced"}
+    assert len(snapshot["links"]) == 2
+    assert {link[1] for link in snapshot["links"]}.issubset(node_ids)
+    assert {link[3] for link in snapshot["links"]}.issubset(node_ids)
+    type_by_id = {node["id"]: node["type"] for node in nodes}
+    assert {(type_by_id[link[1]], type_by_id[link[3]]) for link in snapshot["links"]} == {
+        ("LoadImage", "TextEncodeQwenImage21"),
+        ("TextEncodeQwenImage21", "SaveImageAdvanced"),
+    }
+    print("  api to ui retained composite subgraph nodes / links OK")
+
+
 def test_xb_sampler_seed_control_snapshot() -> None:
     """XB legacy aliases need a seed-control widget absent from /object_info."""
     normal_inputs = {
@@ -2022,6 +2047,7 @@ def main() -> None:
     test_ui_to_api_retained_widgets_and_power_lora()
     test_ui_import_prunes_unavailable_orphans()
     test_api_to_ui_linked_widget_positions()
+    test_api_to_ui_composite_node_ids()
     test_xb_sampler_seed_control_snapshot()
     test_workflow_build()
     test_defaults_precedence()

@@ -1,9 +1,13 @@
 const SLOT_FALLBACK = [
   { id: "prompt", label: "用户要画的内容", help: "必选", basic: true },
   { id: "source_image", label: "编辑来源图片", help: "图片编辑工作流中的 LoadImage 节点", basic: false },
+  { id: "resolution", label: "编辑输出分辨率", help: "Qwen Image 2.1 编辑 resolution 输入；0 保留参考图尺寸", basic: false },
+  { id: "custom_size", label: "编辑自定义画布", help: "custom_size 开关；启用后使用分辨率选择器画布", basic: false },
   { id: "model", label: "底模", help: "", basic: true },
   { id: "loras", label: "LoRA", help: "", basic: true },
   { id: "size", label: "画面大小", help: "", basic: true },
+  { id: "aspect_ratio", label: "分辨率选择器画幅比例", help: "例如 1:1、16:9", basic: false },
+  { id: "megapixels", label: "分辨率选择器目标 MP", help: "例如 1.0；Qwen Image 2.1 2K 方图约 4.0", basic: false },
   { id: "sampler", label: "出图采样", help: "必选", basic: true },
   { id: "negative", label: "不要出现的东西", help: "", basic: false },
   { id: "artist", label: "画师风格", help: "", basic: false },

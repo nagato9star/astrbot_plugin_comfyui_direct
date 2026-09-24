@@ -188,6 +188,16 @@
             "default": "",
             "hint": "编辑来源图片的 LoadImage 节点 ID；使用编辑工作流时必填"
           },
+          "resolution": {
+            "type": "string",
+            "default": "",
+            "hint": "可选编辑 resolution 输入节点 ID；0 表示保留参考图尺寸"
+          },
+          "custom_size": {
+            "type": "string",
+            "default": "",
+            "hint": "可选编辑 custom_size 开关节点 ID；启用后由工作流使用分辨率选择器画布"
+          },
           "model": {
             "type": "string",
             "default": "",
@@ -202,6 +212,16 @@
             "type": "string",
             "default": "",
             "hint": "画面宽高节点 ID"
+          },
+          "aspect_ratio": {
+            "type": "string",
+            "default": "",
+            "hint": "T2I 分辨率选择器的 aspect_ratio 输入节点 ID"
+          },
+          "megapixels": {
+            "type": "string",
+            "default": "",
+            "hint": "T2I 分辨率选择器的 MP 目标输入节点 ID"
           },
           "sampler": {
             "type": "string",

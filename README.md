@@ -74,7 +74,7 @@ Bot 生图、原始工作流执行、输出下载和工作台试画统一将原�
 
 需要图片编辑时，在“独立编辑工作流路由”配置编辑路由名并选择已导入的工作流，也可以在 Workflow Studio 的工作流页直接创建或修改编辑路由。编辑路由与生图家族相互独立；LLM 调用 `comfyui_edit` 时使用 `edit_workflow` 选择路由。工作流页还可编辑 API JSON、独立保存节点映射。工作流、家族和默认配方等选择框由本地插件数据填充；配置页保留按工作流的节点下拉与通用手填条目。导入新工作流后重新打开配置页即可看到新选项。
 
-Qwen Image 2.1 可分别配置 T2I 与编辑工作流：生图家族 `qwen` 绑定 T2I 模板，独立编辑路由 `qwen-edit` 绑定编辑模板。LLM 调 `comfyui_draw(model_family="qwen")` 生成新图，调 `comfyui_edit(edit_workflow="qwen-edit")` 修改已有图片；两条入口各走自己的工作流，不需要把编辑路由登记为生图家族。配置编辑工作流时，先在 Workflow Studio 从 ComfyUI 历史导入 API 工作流，再创建独立路由并绑定模板。智能识别会沿最终编辑分支选择提示词、采样、模型及来源图片；无法唯一判定时留空。点「重新识别」查看建议，核对后点「保存映射」；配置页手动映射始终优先。确认「用户要画的内容」指向 `TextEncodeQwenImageEdit`，「编辑来源图片」指向该分支的 `LoadImage`。当前消息或引用消息附图时，`comfyui_edit` 会自动上传图片并替换 `LoadImage.image`；也可以使用本插件此前回执中的本地图片路径。只有一条编辑路由时可省略 `edit_workflow`。旧版 `edit_families` 和 `model_families[].edit_workflow` 配置会作为兼容来源读取。
+Qwen Image 2.1 可分别配置 T2I 与编辑工作流：生图家族 `qwen` 绑定 T2I 模板，独立编辑路由 `qwen-edit` 绑定编辑模板。LLM 调 `comfyui_draw(model_family="qwen")` 生成新图，调 `comfyui_edit(edit_workflow="qwen-edit")` 修改已有图片；两条入口各走自己的工作流，不需要把编辑路由登记为生图家族。T2I 分辨率选择器映射 `aspect_ratio` 与 `megapixels`，例如方图 2K 约为 4.0 MP。编辑工作流可映射 `resolution` 与 `custom_size`：省略参数沿用工作流默认值，Qwen Image 2.1 编辑分辨率通常为 1024；`resolution=0` 保持参考图尺寸，`custom_size=true` 启用分辨率选择器画布。请在 Workflow Studio 对有这些输入的节点保存映射；显式传参但缺少映射时，工具会提示补齐。配置编辑工作流时，先在 Workflow Studio 从 ComfyUI 历史导入 API 工作流，再创建独立路由并绑定模板。智能识别会沿最终编辑分支选择提示词、采样、模型及来源图片；无法唯一判定时留空。点「重新识别」查看建议，核对后点「保存映射」；配置页手动映射始终优先。确认「用户要画的内容」指向 `TextEncodeQwenImageEdit`，「编辑来源图片」指向该分支的 `LoadImage`。当前消息或引用消息附图时，`comfyui_edit` 会自动上传图片并替换 `LoadImage.image`；也可以使用本插件此前回执中的本地图片路径。只有一条编辑路由时可省略 `edit_workflow`。旧版 `edit_families` 和 `model_families[].edit_workflow` 配置会作为兼容来源读取。
 
 ### 4. 分别保存工作流与配方
 
@@ -144,8 +144,8 @@ Qwen Image 2.1 可分别配置 T2I 与编辑工作流：生图家族 `qwen` 绑�
 
 | 工具 | 说明 |
 |:---|:---|
-| `comfyui_draw` | 自由生图；必填 `model_family` 和 `prompt`，按家族选择工作流，可自由填写底模、LoRA、尺寸与采样参数，并可另存配方 |
-| `comfyui_edit` | 用独立 `edit_workflow` 路由修改当前或引用消息中的图片；无附图时可用本插件上次生成的图片，成功回执给出本地保存路径 |
+| `comfyui_draw` | 自由生图；必填 `model_family` 和 `prompt`，按家族选择工作流，可填写底模、LoRA、尺寸、分辨率选择器比例与目标 MP，并可另存配方 |
+| `comfyui_edit` | 用独立 `edit_workflow` 路由修改当前或引用消息中的图片；可选 `resolution` 与 `custom_size`，无附图时可用本插件上次生成的图片 |
 | `comfyui_recipe_draw` | 快捷配方生图；填写本次 `prompt`，可选 `recipe`、`size` 和 `seed`，其余参数来自配方 |
 | `comfyui_lookup` | 查询角色 / 画师规范词，以及底模 / LoRA 文件名；支持按 LoRA 分类、标签、用途挑选，并返回用途说明、推荐权重和触发词 |
 

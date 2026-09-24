@@ -6,7 +6,7 @@ import copy
 import hashlib
 from typing import Any
 
-from slot_mapping import SLOT_CLASS_HINTS, SLOT_ROLES, node_options_for_slot, parse_node_option
+from slot_mapping import SLOT_ROLES, node_matches_slot, node_options_for_slot, parse_node_option
 
 
 _WORKFLOW_TEMPLATE_PREFIX = "local_workflow_"
@@ -79,10 +79,9 @@ def refresh_config_options(config: Any, builder: Any, store: Any) -> None:
                 parse_node_option(row.get(role)) for row in mappings
                 if str(row.get("workflow") or "").strip() == name
             }
-            hints = set(SLOT_CLASS_HINTS.get(role) or ())
             candidate_ids = {
                 str(nid) for nid, node in workflow.items()
-                if isinstance(node, dict) and node.get("class_type") in hints
+                if node_matches_slot(node, role)
             }
             options = [""] + [
                 label for label in node_options_for_slot(workflow, role)[1:]

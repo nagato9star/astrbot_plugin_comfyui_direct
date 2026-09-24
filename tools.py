@@ -119,6 +119,7 @@ def _validate_generation_values(values: dict[str, Any]) -> dict[str, Any]:
         "denoise": (False, 0, 1),
         "width": (True, 64, 8192),
         "height": (True, 64, 8192),
+        "megapixels": (False, 0.1, 64),
     }
     for key, (integer, minimum, maximum) in limits.items():
         value = result.get(key)
@@ -2034,6 +2035,7 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
 _DRAW_DESC = (
     "从文字生成新图片并发送；需要修改现有图片时使用 comfyui_edit。model_family、prompt 必填，提示词遵循家族 prompt_style。"
     "省略可选参数沿用工作流。可按画风、角色、服饰或效果需求主动用 comfyui_lookup 查询并选用 LoRA；"
+    "分辨率选择器工作流可用 aspect_ratio 和 megapixels 覆盖比例与目标百万像素数；"
     "查询底模/LoRA 必须传同一 model_family，使用返回文件名和推荐权重，已知触发词填 trigger_words。"
     "复用配方用 comfyui_recipe_draw。成功回执包含图片本地保存路径；图片已直接发送，无需再次发送。"
 )
@@ -2088,6 +2090,16 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                     "type": "string",
                     "enum": ["portrait", "landscape", "square", "same"],
                     "description": "portrait竖图 landscape横图 square方图。用户没提画幅就不要填",
+                },
+                "aspect_ratio": {
+                    "type": "string",
+                    "description": "分辨率选择器支持时设置画幅比例，例如 1:1、16:9；用户没指定时沿用工作流",
+                },
+                "megapixels": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 64,
+                    "description": "分辨率选择器支持时设置目标 MP，例如 1.0 MP；Qwen Image 2.1 原生 2K 方图约 4.0 MP。用户没指定时沿用工作流",
                 },
                 "artist": {
                     "type": "string",
@@ -2290,6 +2302,9 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             or values.get("height") not in (None, "")
         ) and not slots.get("size"):
             return f"工作流「{workflow_name}」没有映射画面大小槽位，无法修改画幅。"
+        for role in ("aspect_ratio", "megapixels"):
+            if values.get(role) not in (None, "") and not slots.get(role):
+                return f"工作流「{workflow_name}」没有映射 {role} 输入，无法修改分辨率选择器。"
 
         seed = values.get("seed")
         if seed is None:
@@ -2470,6 +2485,8 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             ("negative_prompt", "negative"),
             ("width", "width"),
             ("height", "height"),
+            ("aspect_ratio", "aspect_ratio"),
+            ("megapixels", "megapixels"),
             ("steps", "steps"),
             ("cfg", "cfg"),
             ("sampler_name", "sampler_name"),
@@ -2492,7 +2509,8 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
 _EDIT_DESC = (
     "按独立编辑工作流路由修改已有图片并直接发送结果。优先使用当前消息或引用消息中的图片；"
     "没有附图时可使用本插件上次生成的图片，或在 image_path 填本插件此前返回的本地路径。"
-    "只填写修改要求和已配置的 edit_workflow，不要猜测图片路径；成功回执包含新图片的本地保存路径。"
+    "可选 resolution 覆盖编辑目标边长，Qwen Image 2.1 通常默认 1024，传 0 可保留参考图尺寸；custom_size 开关可让工作流使用分辨率选择器画布。"
+    "这两个参数只写入当前工作流已映射的输入；成功回执包含新图片的本地保存路径。"
 )
 
 
@@ -2513,6 +2531,16 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
                 "prompt": {
                     "type": "string",
                     "description": "对来源图片的修改要求，必填",
+                },
+                "resolution": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 8192,
+                    "description": "可选；覆盖已映射的编辑 resolution 输入。Qwen Image 2.1 常用 1024；传 0 保留各参考图自身尺寸。省略时使用工作流默认值",
+                },
+                "custom_size": {
+                    "type": "boolean",
+                    "description": "可选；覆盖已映射的 custom_size 开关。开启时由工作流使用分辨率选择器画布；省略时使用工作流默认值",
                 },
                 "image_path": {
                     "type": "string",
@@ -2633,6 +2661,25 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         if not slots.get("prompt"):
             return f"编辑失败：工作流「{edit_route.workflow}」缺少提示词槽位映射。"
 
+        resolution = kwargs.get("resolution")
+        if resolution not in (None, ""):
+            if isinstance(resolution, bool):
+                return "编辑失败：resolution 必须是 0 到 8192 之间的整数。"
+            try:
+                resolution = _number(
+                    resolution, "resolution", integer=True, minimum=0, maximum=8192,
+                )
+            except ValueError as e:
+                return f"编辑失败：{e}。"
+            if not slots.get("resolution"):
+                return "编辑失败：此工作流尚未映射 resolution 输入，请在 Workflow Studio 的节点映射中选择对应节点。"
+        custom_size = kwargs.get("custom_size")
+        if custom_size is not None:
+            if not isinstance(custom_size, bool):
+                return "编辑失败：custom_size 必须是布尔值。"
+            if not slots.get("custom_size"):
+                return "编辑失败：此工作流尚未映射 custom_size 开关，请在 Workflow Studio 的节点映射中选择对应节点。"
+
         source_path, source_error = await self._source_path(context, kwargs)
         if source_error:
             return f"编辑失败：{source_error}"
@@ -2651,9 +2698,14 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
             return f"编辑失败：上传来源图片失败（{upload_error or 'ComfyUI 未返回文件名'}）。"
 
         seed = random.randint(0, 2**31 - 1) if slots.get("sampler") or slots.get("sampler_2") else None
+        apply_values = {"prompt": prompt, "source_image": upload_name, "seed": seed}
+        if resolution not in (None, ""):
+            apply_values["resolution"] = resolution
+        if custom_size is not None:
+            apply_values["custom_size"] = custom_size
         try:
             apply_slots(
-                wf, slots, {"prompt": prompt, "source_image": upload_name, "seed": seed},
+                wf, slots, apply_values,
                 prefix=f"astrbot_edit_{uuid.uuid4().hex[:8]}",
                 drop_nodes=profile.get("drop_nodes") or [],
             )

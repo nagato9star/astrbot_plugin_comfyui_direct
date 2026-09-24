@@ -23,9 +23,13 @@ NEGATIVE_MARKERS = ("lowres", "worst quality")
 SLOT_ROLES: tuple[tuple[str, str], ...] = (
     ("prompt", "用户要画的内容"),
     ("source_image", "编辑来源图片"),
+    ("resolution", "编辑输出分辨率"),
+    ("custom_size", "按参考图自适配画布"),
     ("model", "底模"),
     ("loras", "LoRA"),
     ("size", "画面大小"),
+    ("aspect_ratio", "分辨率选择器画幅比例"),
+    ("megapixels", "分辨率选择器目标 MP"),
     ("sampler", "出图采样"),
     ("sampler_2", "第二段采样"),
     ("negative", "不要出现的东西"),
@@ -40,6 +44,10 @@ SLOT_BASIC = ("prompt", "model", "loras", "size", "sampler")
 SLOT_HELP: dict[str, str] = {
     "prompt": "机器人会把用户的描述写到这里。必选。",
     "source_image": "图片编辑工作流中的 LoadImage 节点。上传后的图片文件名写到这里。",
+    "resolution": "编辑工作流的 resolution 输入。Qwen Image 2.1 常用默认值约 1024；传 0 可保留参考图尺寸。",
+    "custom_size": "编辑工作流的 custom_size 开关；开启时由工作流使用分辨率选择器画布。",
+    "aspect_ratio": "T2I 分辨率选择器的比例输入，例如 1:1、16:9。",
+    "megapixels": "T2I 分辨率选择器的目标百万像素数，例如 1.0；Qwen Image 2.1 的 2K 方图约为 4.0。",
     "model": "这套默认用哪颗底模。用户说换模型时也写到这里。",
     "loras": "这套默认挂哪些 LoRA。用户点名 LoRA 时覆盖这里。",
     "size": "宽和高写到这里。竖图/横图也靠它。",
@@ -510,7 +518,9 @@ def node_options_for_slot(wf: dict, slot: str, selected: str = "") -> list[str]:
     rest = []
     for row in list_nodes(wf):
         label = row["label"]
-        if hints and row["class_type"] not in hints and row["id"] != selected_id:
+        node = wf.get(row["id"]) or {}
+        matches = node_matches_slot(node, slot)
+        if (hints or slot in {"resolution", "custom_size", "aspect_ratio", "megapixels"}) and not matches and row["id"] != selected_id:
             rest.append(label)
             continue
         if label not in options:
@@ -526,6 +536,36 @@ def node_options_for_slot(wf: dict, slot: str, selected: str = "") -> list[str]:
         else:
             options.insert(1, selected)
     return options
+
+
+def node_matches_slot(node: dict, slot: str) -> bool:
+    """Match an editable slot to a node class or a named workflow input."""
+    if not isinstance(node, dict):
+        return False
+    classes = set(SLOT_CLASS_HINTS.get(slot) or ())
+    cls = str(node.get("class_type") or "")
+    if cls in classes:
+        return True
+    if slot not in {"resolution", "custom_size", "aspect_ratio", "megapixels"}:
+        return False
+
+    wanted = slot.casefold()
+    title = str((node.get("_meta") or {}).get("title") or "")
+    normalized_name = f"{cls} {title}".casefold().replace(" ", "_").replace("-", "_")
+    fields = node.get("inputs") or {}
+    aliases = {
+        "resolution": {"resolution"},
+        "custom_size": {"custom_size"},
+        "aspect_ratio": {"aspect_ratio", "aspect", "ratio"},
+        "megapixels": {"megapixels", "megapixel", "mp", "target_megapixels"},
+    }[slot]
+    if aliases.intersection(fields) or wanted in normalized_name:
+        return True
+    if slot == "resolution" and ("resolutionselector" in normalized_name or "resolution_select" in normalized_name):
+        return True
+    if slot in {"aspect_ratio", "megapixels"} and "resolutionselector" in normalized_name:
+        return True
+    return False
 
 
 def _linked_node_id(wf: dict, value: Any) -> str | None:
@@ -602,6 +642,32 @@ def _edit_branch_slots(wf: dict) -> dict[str, dict] | None:
         if source_id:
             slots["source_image"] = _slot(source_id, wf, "source_image")
 
+    for role in ("resolution", "custom_size", "aspect_ratio", "megapixels"):
+        value = edit_inputs.get(role)
+        if value is None:
+            continue
+        linked = _linked_node_id(wf, value)
+        if linked is None:
+            slots[role] = _slot(edit_id, wf, role)
+            continue
+        candidates = [
+            nid for nid in _upstream_ids(wf, [linked])
+            if node_matches_slot(wf[nid], role)
+        ]
+        if len(candidates) == 1:
+            slots[role] = _slot(candidates[0], wf, role)
+        elif not candidates:
+            source_node = wf.get(linked) or {}
+            source_cls = str(source_node.get("class_type") or "").casefold()
+            if role == "resolution" and _is_int_node(source_node):
+                slots[role] = _slot(linked, wf, role)
+            elif role == "custom_size" and ("bool" in source_cls or "boolean" in source_cls):
+                slots[role] = _slot(linked, wf, role)
+            elif role == "megapixels" and ("float" in source_cls or "primitive" in source_cls):
+                slots[role] = _slot(linked, wf, role)
+            elif role == "aspect_ratio" and any(tag in source_cls for tag in ("combo", "string", "primitive")):
+                slots[role] = _slot(linked, wf, role)
+
     sampler_ids = [
         nid for nid in _rank_sampler_ids(wf)
         if nid in active and edit_id in _upstream_ids(wf, [nid])
@@ -665,6 +731,10 @@ def detect_slots(wf: dict) -> dict[str, dict]:
     ]
     if len(source_image_ids) == 1:
         slots["source_image"] = _slot(source_image_ids[0], wf, "source_image")
+    for role in ("resolution", "custom_size", "aspect_ratio", "megapixels"):
+        matches = [nid for nid in active if node_matches_slot(wf[nid], role)]
+        if len(matches) == 1:
+            slots[role] = _slot(matches[0], wf, role)
     if roles.get("artist"):
         slots["artist"] = _slot(roles["artist"], wf, "artist")
     if roles.get("quality"):
@@ -755,6 +825,27 @@ def infer_field(node: dict, role: str) -> str:
         return "vae_name"
     if role == "guidance":
         return "strength"
+    if role == "resolution":
+        if "resolution" in ins:
+            return "resolution"
+        if _is_int_node(node):
+            return _int_field(node) or "resolution"
+        return "resolution"
+    if role == "custom_size":
+        for key in ("custom_size", "value", "boolean", "bool", "enabled"):
+            if key in ins:
+                return key
+        return "custom_size"
+    if role == "aspect_ratio":
+        for key in ("aspect_ratio", "aspect", "ratio", "value"):
+            if key in ins:
+                return key
+        return "aspect_ratio"
+    if role == "megapixels":
+        for key in ("megapixels", "megapixel", "target_megapixels", "mp", "value"):
+            if key in ins:
+                return key
+        return "megapixels"
     if role == "size":
         return "width"
     if role == "sampler":
@@ -1170,6 +1261,44 @@ def apply_slots(
                 node.setdefault("inputs", {})["strength"] = float(guidance)
             except (TypeError, ValueError):
                 pass
+
+    for role in ("resolution", "custom_size", "aspect_ratio", "megapixels"):
+        value = values.get(role)
+        if value is None:
+            continue
+        spec = slots.get(role)
+        if not spec:
+            raise ValueError(f"工作流未映射 {role} 输入，请先在工作台保存节点映射")
+        node = wf.get(str(spec.get("node") or ""))
+        if node is None:
+            raise ValueError(f"{role} 槽位映射的节点不存在")
+        field = spec.get("field") or infer_field(node, role)
+        if not field:
+            raise ValueError(f"无法确定 {role} 槽位的输入字段")
+        if role == "resolution":
+            if isinstance(value, bool):
+                raise ValueError("resolution 必须是 0 到 8192 之间的整数")
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError) as e:
+                raise ValueError("resolution 必须是 0 到 8192 之间的整数") from e
+            if not math.isfinite(numeric) or not numeric.is_integer() or not 0 <= numeric <= 8192:
+                raise ValueError("resolution 必须是 0 到 8192 之间的整数")
+            value = int(numeric)
+        elif role == "custom_size" and not isinstance(value, bool):
+            raise ValueError("custom_size 必须是布尔值")
+        elif role == "aspect_ratio":
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("aspect_ratio 必须是非空字符串")
+            value = value.strip()
+        elif role == "megapixels":
+            try:
+                value = float(value)
+            except (TypeError, ValueError) as e:
+                raise ValueError("megapixels 必须是数字") from e
+            if not math.isfinite(value) or not 0.1 <= value <= 64:
+                raise ValueError("megapixels 必须在 0.1 到 64 之间")
+        node.setdefault("inputs", {})[field] = value
 
     if values.get("loras") is not None and slots.get("loras"):
         _apply_loras(wf, str(slots["loras"]["node"]), parse_lora(values.get("loras")))

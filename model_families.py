@@ -326,9 +326,20 @@ class WorkflowProfileStore:
             return {}
         out: dict[str, Any] = {}
         for role, spec in raw.items():
-            if role == "source_images" and isinstance(spec, list):
+            if role == "source_images":
+                if isinstance(spec, str):
+                    specs = [item.strip() for item in spec.split(",") if item.strip()]
+                elif isinstance(spec, list):
+                    specs = spec
+                elif isinstance(spec, dict):
+                    specs = [spec]
+                elif spec in (None, ""):
+                    specs = []
+                else:
+                    raise ValueError("source_images 必须是有序节点列表")
                 nodes = []
-                for item in spec:
+                seen = set()
+                for item in specs:
                     if isinstance(item, str):
                         node = parse_node_option(item)
                         if node:
@@ -339,8 +350,14 @@ class WorkflowProfileStore:
                             normalized_item = dict(item)
                             normalized_item["node"] = node
                             nodes.append(normalized_item)
-                if nodes:
-                    out[str(role)] = nodes
+                    else:
+                        raise ValueError("参考图映射必须包含 node 字段")
+                    if not node:
+                        raise ValueError("参考图映射存在空节点，请选择节点或删除该行")
+                    if node in seen:
+                        raise ValueError(f"参考图节点 {node} 重复映射，请为每个输入选择不同节点")
+                    seen.add(node)
+                out[str(role)] = nodes
                 continue
             if isinstance(spec, str):
                 node = parse_node_option(spec)

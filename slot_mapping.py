@@ -69,6 +69,7 @@ SLOT_CLASS_HINTS: dict[str, tuple[str, ...]] = {
     "source_images": ("LoadImage",),
     "prompt": (
         "TextEncodeQwenImageEdit",
+        "TextEncodeQwenImage21",
         "CR Prompt Text",
         "CLIPTextEncode",
         "DanbooruText",
@@ -562,13 +563,11 @@ def node_matches_slot(node: dict, slot: str) -> bool:
         "aspect_ratio": {"aspect_ratio", "aspect", "ratio"},
         "megapixels": {"megapixels", "megapixel", "mp", "target_megapixels"},
     }[slot]
-    if aliases.intersection(fields) or wanted in normalized_name:
+    if aliases.intersection(fields):
+        return True
+    if wanted in normalized_name and infer_field(node, slot) in fields:
         return True
     if slot == "custom_size" and "switch" in fields and "switch" in cls.casefold():
-        return True
-    if slot == "resolution" and ("resolutionselector" in normalized_name or "resolution_select" in normalized_name):
-        return True
-    if slot in {"aspect_ratio", "megapixels"} and "resolutionselector" in normalized_name:
         return True
     return False
 
@@ -615,17 +614,14 @@ def _edit_canvas_switch(wf: dict, sampler_ids: list[str], edit_id: str) -> str |
             if not switch_id or "switch" not in switch_class:
                 continue
             switch_inputs = switch.get("inputs") or {}
-            branches = [
-                _linked_node_id(wf, switch_inputs.get(branch))
-                for branch in ("on_false", "on_true")
-            ]
-            branches = [branch for branch in branches if branch]
-            has_edit = any(edit_id in _upstream_ids(wf, [branch]) for branch in branches)
-            has_canvas = any(
-                _unique_class_on_path(wf, [branch], SLOT_CLASS_HINTS["size"])
-                for branch in branches
-            )
-            if has_edit and has_canvas:
+            edit_branch = _linked_node_id(wf, switch_inputs.get("on_false"))
+            canvas_branch = _linked_node_id(wf, switch_inputs.get("on_true"))
+            if (
+                edit_branch and canvas_branch
+                and edit_id in _upstream_ids(wf, [edit_branch])
+                and _unique_class_on_path(wf, [canvas_branch], SLOT_CLASS_HINTS["size"])
+                and "switch" in switch_inputs
+            ):
                 return switch_id
     return None
 
@@ -1256,9 +1252,41 @@ def resolve_size(
     return w, h
 
 
+def source_image_slots(wf: dict, slots: Any) -> list[dict]:
+    """Resolve ordered image mappings without silently dropping or reordering ports."""
+    if not isinstance(slots, dict):
+        raise ValueError("工作流节点映射必须是对象")
+    if "source_images" in slots:
+        specs = slots["source_images"]
+        if not isinstance(specs, list):
+            raise ValueError("source_images 必须是有序节点列表")
+        if not specs and slots.get("source_image") not in (None, ""):
+            specs = [slots["source_image"]]
+    else:
+        spec = slots.get("source_image")
+        specs = [spec] if spec not in (None, "") else []
+    result, seen = [], set()
+    for spec in specs:
+        if isinstance(spec, str):
+            spec = {"node": spec}
+        if not isinstance(spec, dict):
+            raise ValueError("参考图映射必须包含 node 字段")
+        nid = parse_node_option(spec.get("node"))
+        node = wf.get(nid)
+        if not isinstance(node, dict) or node.get("class_type") != "LoadImage":
+            raise ValueError(f"参考图映射 {nid or '(空)'} 未指向有效 LoadImage")
+        if "image" not in (node.get("inputs") or {}):
+            raise ValueError(f"参考图节点 {nid} 缺少 image 输入")
+        if nid in seen:
+            raise ValueError(f"参考图节点 {nid} 重复映射，会覆盖前一张图片")
+        seen.add(nid)
+        result.append({**spec, "node": nid, "field": "image"})
+    return result
+
+
 def apply_slots(
     wf: dict,
-    slots: dict[str, dict],
+    slots: dict[str, Any],
     values: dict[str, Any],
     *,
     prefix: str | None = None,
@@ -1275,11 +1303,13 @@ def apply_slots(
 
     # 槽位指向的节点必须存在，否则对应值会被静默丢弃；统一先告警。
     for role, spec in (slots or {}).items():
-        nid = str((spec or {}).get("node") or "")
-        if nid and str(nid) not in wf:
-            logger.warning(
-                f"[slot_mapping] 配方槽位 {role} 指向节点 {nid}，但当前工作流里没有它，该槽位本轮不会写入"
-            )
+        specs = spec if role == "source_images" and isinstance(spec, list) else [spec]
+        for item in specs:
+            nid = str((item or {}).get("node") or "") if isinstance(item, dict) else ""
+            if nid and nid not in wf:
+                logger.warning(
+                    f"[slot_mapping] 配方槽位 {role} 指向节点 {nid}，但当前工作流里没有它，该槽位本轮不会写入"
+                )
 
     prompt = values.get("prompt")
     if prompt is not None and slots.get("prompt"):
@@ -1294,9 +1324,9 @@ def apply_slots(
             node.setdefault("inputs", {})[field] = str(source_image)
 
     source_images = values.get("source_images")
-    source_specs = slots.get("source_images")
     if source_images is not None:
-        if not isinstance(source_images, list) or not isinstance(source_specs, list):
+        source_specs = source_image_slots(wf, slots)
+        if not isinstance(source_images, list):
             raise ValueError("多图来源映射必须是图片名与节点列表")
         if len(source_images) > len(source_specs):
             raise ValueError(f"工作流只映射了 {len(source_specs)} 个参考图输入")
@@ -1359,8 +1389,8 @@ def apply_slots(
         if node is None:
             raise ValueError(f"{role} 槽位映射的节点不存在")
         field = spec.get("field") or infer_field(node, role)
-        if not field:
-            raise ValueError(f"无法确定 {role} 槽位的输入字段")
+        if not field or field not in (node.get("inputs") or {}):
+            raise ValueError(f"{role} 映射节点缺少输入字段 {field or '(空)'}，请重新确认映射")
         if role == "resolution":
             if isinstance(value, bool):
                 raise ValueError("resolution 必须是 0 到 8192 之间的整数")
@@ -1404,12 +1434,15 @@ def apply_slots(
 
     if (width is not None or height is not None) and slots.get("size"):
         node = wf.get(str(slots["size"]["node"]))
-        if node is not None:
-            ins = node.setdefault("inputs", {})
-            if width is not None:
-                ins["width"] = int(width)
-            if height is not None:
-                ins["height"] = int(height)
+        if not isinstance(node, dict):
+            raise ValueError("画面大小映射的节点不存在")
+        ins = node.setdefault("inputs", {})
+        if any(value is not None and key not in ins for key, value in (("width", width), ("height", height))):
+            raise ValueError("画面大小映射节点缺少 width/height 输入，请重新确认映射")
+        if width is not None:
+            ins["width"] = int(width)
+        if height is not None:
+            ins["height"] = int(height)
 
     sampler_spec = slots.get("sampler")
     sampler2_spec = slots.get("sampler_2")

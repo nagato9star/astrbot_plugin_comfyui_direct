@@ -86,6 +86,9 @@ h3 { font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: 
 .workflow-source { color: var(--accent-2); font-size: 11px; }
 .workflow-routing { display: grid; grid-template-columns: minmax(120px, 150px) minmax(160px, 1fr) minmax(160px, 1fr) auto auto; gap: 8px; align-items: end; }
 .workflow-routing button { min-height: 30px; }
+.source-image-row { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.source-image-row select { flex: 1; min-width: 120px; width: 0; }
+.source-image-row button { padding: 4px 6px; }
 .workflow-card .hint { margin-bottom: 0; }
 .workflow-json-editor { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
 .workflow-json-editor summary { color: var(--accent-2); font-weight: 600; cursor: pointer; }

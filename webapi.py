@@ -37,6 +37,7 @@ from slot_mapping import (
     normalize_workflow,
     read_current_values,
     resolve_size,
+    source_image_slots,
     ANIMA_DROP_NODES,
 )
 from workflow_builder import WorkflowBuilder
@@ -93,6 +94,15 @@ def _query(key: str, default: str = "") -> str:
         from quart import request
 
         return str(request.args.get(key) or default)
+
+
+def _mapped_node_id(spec: Any) -> str:
+    """Return the first selected node for scalar or multi-node workflow slots."""
+    if isinstance(spec, list):
+        spec = spec[0] if spec else None
+    if isinstance(spec, dict):
+        return str(spec.get("node") or "")
+    return str(spec or "")
 
 
 class StudioApi:
@@ -200,7 +210,7 @@ class StudioApi:
             "profile_source": profile.get("source", "detected"),
             "drop_nodes": profile.get("drop_nodes") or [],
             "slot_options": {
-                role: node_options_for_slot(wf, role, str((selected.get(role) or {}).get("node") or ""))
+                role: node_options_for_slot(wf, role, _mapped_node_id(selected.get(role)))
                 for role, _ in SLOT_ROLES
             },
         }
@@ -335,7 +345,7 @@ class StudioApi:
                 "values": read_current_values(wf, detected),
                 "anima": looks_like_anima(wf),
                 "slot_options": {
-                    role: node_options_for_slot(wf, role, str((detected.get(role) or {}).get("node") or ""))
+                    role: node_options_for_slot(wf, role, _mapped_node_id(detected.get(role)))
                     for role, _ in SLOT_ROLES
                 },
             }
@@ -356,6 +366,8 @@ class StudioApi:
         if not isinstance(slots, dict):
             return _json({"ok": False, "error": "slots 必须是对象"})
         try:
+            if "source_images" in slots or "source_image" in slots:
+                source_image_slots(wf, self.profiles._normalize_slots(slots))
             saved = self.profiles.save(
                 name,
                 slots,
@@ -402,7 +414,7 @@ class StudioApi:
             if prompt_node not in workflow_data:
                 warnings.append("主提示词节点尚未有效映射")
             if mode == "edit":
-                image_node = str((slots.get("source_image") or {}).get("node") or "")
+                image_node = _mapped_node_id(slots.get("source_images") or slots.get("source_image"))
                 if (workflow_data.get(image_node) or {}).get("class_type") != "LoadImage":
                     warnings.append("编辑来源图片尚未映射到 LoadImage")
 

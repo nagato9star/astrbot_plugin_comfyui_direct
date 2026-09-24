@@ -29,6 +29,12 @@ logger = logging.getLogger("[ComfyUIDirect]")
 # 常见连线端口类型（API 值为 [node_id, slot] 二元组）
 _LINK_RE = re.compile(r"lora_\d+$")
 _DEFAULT_SIZE = [300.0, 130.0]
+# XB_ToolBox legacy aliases render a seed control widget in the UI, but their
+# /object_info INT spec omits control_after_generate. Keep that widget position.
+_SEED_CONTROL_COMPAT = {
+    ("XB_ROCmKSampler", "seed"),
+    ("XB_ROCmKSamplerAdvanced", "noise_seed"),
+}
 
 
 def _num(v) -> int | None:
@@ -52,11 +58,12 @@ def _is_link(value) -> bool:
     )
 
 
-def _needs_control_after_generate(field_type) -> bool:
+def _needs_control_after_generate(field_type, class_type: str = "", field: str = "") -> bool:
     if isinstance(field_type, list) and len(field_type) >= 2:
         cfg = field_type[1]
-        return isinstance(cfg, dict) and "control_after_generate" in cfg
-    return False
+        if isinstance(cfg, dict) and "control_after_generate" in cfg:
+            return True
+    return (class_type, field) in _SEED_CONTROL_COMPAT
 
 
 def _is_widget_spec(field_type) -> bool:
@@ -124,10 +131,10 @@ def api_to_ui(api: dict, object_info: dict | None = None) -> dict:
                 field_type = in_defs.get(field)
                 if _is_widget_spec(field_type):
                     widgets_values.append(None)
-                    if _needs_control_after_generate(field_type):
+                    if _needs_control_after_generate(field_type, class_type, field):
                         widgets_values.append("fixed")
                 continue
-            if field in in_defs and _needs_control_after_generate(in_defs[field]):
+            if field in in_defs and _needs_control_after_generate(in_defs[field], class_type, field):
                 widgets_values.extend([value, "fixed"])
             else:
                 widgets_values.append(value)

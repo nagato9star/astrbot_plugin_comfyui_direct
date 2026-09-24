@@ -85,7 +85,7 @@ from comfy_client import (  # noqa: E402
     execution_error_message,
     image_media_type,
 )
-from api_to_ui import api_to_ui  # noqa: E402
+from api_to_ui import api_to_ui, build_extra_pnginfo  # noqa: E402
 from model_families import ModelFamilyRegistry, WorkflowProfileStore  # noqa: E402
 from recipe_store import RecipeStore  # noqa: E402
 from slot_mapping import (  # noqa: E402
@@ -1072,6 +1072,86 @@ def test_api_to_ui_linked_widget_positions() -> None:
     print("  api to ui linked widget positions OK")
 
 
+def test_xb_sampler_seed_control_snapshot() -> None:
+    """XB legacy aliases need a seed-control widget absent from /object_info."""
+    normal_inputs = {
+        "model": ["MODEL"],
+        "seed": ["INT", {"default": 0}],
+        "steps": ["INT", {"default": 20}],
+        "cfg": ["FLOAT", {"default": 8.0}],
+        "sampler": [["euler", "er_sde"]],
+        "scheduler": [["simple", "karras"]],
+        "positive": ["CONDITIONING"],
+        "negative": ["CONDITIONING"],
+        "latent": ["LATENT"],
+        "denoise": ["FLOAT", {"default": 1.0}],
+        "cleanup": [["不做任何清理"]],
+    }
+    advanced_inputs = {
+        "model": ["MODEL"],
+        "add_noise": [["enable", "disable"]],
+        "noise_seed": ["INT", {"default": 0}],
+        "steps": ["INT", {"default": 20}],
+        "cfg": ["FLOAT", {"default": 8.0}],
+        "sampler": [["euler", "er_sde"]],
+        "scheduler": [["simple", "karras"]],
+        "positive": ["CONDITIONING"],
+        "negative": ["CONDITIONING"],
+        "latent": ["LATENT"],
+        "start_at_step": ["INT", {"default": 0}],
+        "end_at_step": ["INT", {"default": 10000}],
+        "return_with_leftover_noise": [["disable", "enable"]],
+        "cleanup": [["不做任何清理"]],
+    }
+    object_info = {
+        "XB_ROCmKSampler": {"input": {"required": normal_inputs}},
+        "XB_ROCmKSamplerAdvanced": {"input": {"required": advanced_inputs}},
+        "OtherSampler": {"input": {"required": {"seed": ["INT", {"default": 0}]}}},
+    }
+    api = {
+        "18": {
+            "class_type": "XB_ROCmKSampler",
+            "inputs": {
+                "seed": 1077777992415812,
+                "steps": 25,
+                "cfg": 1.0,
+                "sampler": "euler",
+                "scheduler": "simple",
+                "denoise": 1.0,
+                "cleanup": "不做任何清理",
+                "model": ["1", 0],
+            },
+        },
+        "19": {
+            "class_type": "XB_ROCmKSamplerAdvanced",
+            "inputs": {
+                "add_noise": "enable",
+                "noise_seed": ["30", 0],
+                "steps": 8,
+                "cfg": 1.0,
+                "sampler": "euler",
+                "scheduler": "simple",
+                "start_at_step": 0,
+                "end_at_step": 10000,
+                "return_with_leftover_noise": "disable",
+                "cleanup": "不做任何清理",
+            },
+        },
+        "20": {"class_type": "OtherSampler", "inputs": {"seed": 7}},
+    }
+    snapshot = build_extra_pnginfo(api, object_info)["workflow"]
+    by_id = {node["id"]: node for node in snapshot["nodes"]}
+    assert by_id[18]["widgets_values"] == [
+        1077777992415812, "fixed", 25, 1.0, "euler", "simple", 1.0, "不做任何清理"
+    ]
+    assert by_id[19]["widgets_values"] == [
+        "enable", None, "fixed", 8, 1.0, "euler", "simple", 0, 10000,
+        "disable", "不做任何清理",
+    ]
+    assert by_id[20]["widgets_values"] == [7]
+    print("  XB sampler seed-control PNG snapshot OK")
+
+
 def test_workflow_build() -> None:
     """anima-v3 五段式覆盖 + LoRA 插槽 + KSampler。模板不存在则跳过。"""
     b = _builder()
@@ -1675,6 +1755,7 @@ def main() -> None:
     test_split_family_config_dropdowns()
     test_ui_to_api()
     test_api_to_ui_linked_widget_positions()
+    test_xb_sampler_seed_control_snapshot()
     test_workflow_build()
     test_defaults_precedence()
     test_generation_entry_resolution()

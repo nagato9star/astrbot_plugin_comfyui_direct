@@ -75,6 +75,10 @@ def refresh_config_options(config: Any, builder: Any, store: Any) -> None:
             if role not in mapping_items:
                 continue
             item = copy.deepcopy(mapping_items[role])
+            if role == "source_images":
+                item["hint"] = str(item.get("hint") or "") + "；多个节点 ID 用逗号分隔，通常优先在 Workflow Studio 多选"
+                items[role] = item
+                continue
             selected = {
                 parse_node_option(row.get(role)) for row in mappings
                 if str(row.get("workflow") or "").strip() == name

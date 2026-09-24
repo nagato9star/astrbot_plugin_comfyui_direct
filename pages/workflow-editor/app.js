@@ -1,6 +1,7 @@
 const SLOT_FALLBACK = [
   { id: "prompt", label: "用户要画的内容", help: "必选", basic: true },
   { id: "source_image", label: "编辑来源图片", help: "图片编辑工作流中的 LoadImage 节点", basic: false },
+  { id: "source_images", label: "编辑参考图输入（多选）", help: "多选 LoadImage 节点，按列表顺序对应 images.image_1、images.image_2 等输入", basic: false },
   { id: "resolution", label: "编辑输出分辨率", help: "Qwen Image 2.1 编辑 resolution 输入；0 保留参考图尺寸", basic: false },
   { id: "custom_size", label: "编辑自定义画布", help: "custom_size 开关；启用后使用分辨率选择器画布", basic: false },
   { id: "model", label: "底模", help: "", basic: true },
@@ -170,6 +171,9 @@ function workflowDraftDirty() {
 function slotNode(role) {
   const spec = state.profileSlots?.[role];
   if (!spec) return "";
+  if (role === "source_images" && Array.isArray(spec)) {
+    return spec.map((item) => typeof item === "string" ? item : (item?.node || ""));
+  }
   if (typeof spec === "string") return spec;
   return spec.node || "";
 }
@@ -188,6 +192,29 @@ function renderSlotSelect(role, parent) {
   sel.dataset.slot = role.id;
   const current = slotNode(role.id);
   const options = state.slotOptions[role.id] || [""];
+  if (role.id === "source_images") {
+    const selectedNodes = Array.isArray(current) ? current : [];
+    sel.multiple = true;
+    sel.size = Math.min(5, Math.max(2, options.length - 1));
+    sel.innerHTML = options.filter(Boolean).map((option) => {
+      const isSelected = selectedNodes.some((node) => option === node || option.startsWith(`${node} —`) || option.startsWith(`${node} `));
+      return `<option value="${escapeAttr(option)}"${isSelected ? " selected" : ""}>${escapeHtml(prettyNode(option))}</option>`;
+    }).join("");
+    sel.addEventListener("change", () => {
+      state.profileSlots = state.profileSlots || {};
+      const selected = [...sel.selectedOptions].map((option) => option.value);
+      if (!selected.length) {
+        delete state.profileSlots.source_images;
+        delete state.profileSlots.source_image;
+        return;
+      }
+      state.profileSlots.source_images = selected.map((node) => ({ node, field: "image", mode: "replace" }));
+      state.profileSlots.source_image = { node: selected[0], field: "image", mode: "replace" };
+    });
+    label.append(span, sel);
+    parent.appendChild(label);
+    return;
+  }
   const selected = options.find((o) => o === current || o.startsWith(`${current} —`) || o.startsWith(`${current} `)) || current;
   fillSelect(sel, options, selected, [""]);
   sel.addEventListener("change", () => {

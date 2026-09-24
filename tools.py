@@ -2536,8 +2536,8 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
 
 
 _EDIT_DESC = (
-    "按独立编辑工作流路由修改已有图片并直接发送结果。优先使用当前消息或引用消息中的图片；"
-    "没有附图时可使用本插件上次生成的图片，或在 image_path 填本插件此前返回的本地路径。"
+    "按独立编辑工作流路由修改已有图片并直接发送结果。会按工作流输入顺序使用当前消息或引用消息中的多张图片；附件超过输入口时用 image_indices 选择；"
+    "没有附图时可使用本插件上次生成的图片，或填写本插件此前回执的本地路径。"
     "局部改动默认沿用参考图原始宽高。需要按参考图比例缩放时使用 resolution；需要新画布/抠出素材时使用 custom_size 和 width/height。"
     "这些画布参数只写入当前工作流已映射的输入；成功回执包含新图片的本地保存路径。"
 )
@@ -2585,11 +2585,21 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
                 },
                 "image_path": {
                     "type": "string",
-                    "description": "可选；仅填本插件此前回执给出的本地保存路径。当前消息或引用消息附图时省略",
+                    "description": "可选的单张来源图；仅填本插件此前回执给出的本地保存路径。附图时省略",
                 },
                 "image_index": {
                     "type": "integer",
-                    "description": "当前或引用消息有多张图时，选择第几张（从 1 开始）",
+                    "description": "单图工作流或只选一张图时，选择第几张（从 1 开始）；多图工作流可用 image_indices",
+                },
+                "image_indices": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1},
+                    "description": "多图工作流中按输入顺序选择多张消息图片的 1-based 序号，例如 [1,2]；省略时按消息顺序使用附件",
+                },
+                "image_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "多图工作流使用本插件此前回执的本地图片路径数组，最多与工作流参考图输入数相同",
                 },
             },
             "required": ["prompt"],
@@ -2630,38 +2640,91 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
             self.parameters["required"] = ["prompt"]
             self.description = _EDIT_DESC + " 当前尚未配置编辑工作流。"
 
-    async def _source_path(self, context: ContextWrapper[AstrAgentContext], kwargs: dict) -> tuple[Path | None, str | None]:
-        requested = str(kwargs.get("image_path") or "").strip()
-        if requested:
-            try:
-                path = Path(requested).expanduser().resolve(strict=True)
-                path.relative_to(self.output_dir.resolve())
-            except (OSError, ValueError):
-                return None, "image_path 必须是本插件此前回执给出的有效本地保存路径。"
-            return (path, None) if path.is_file() else (None, "来源图片文件不存在。")
+    async def _source_paths(
+        self,
+        context: ContextWrapper[AstrAgentContext],
+        kwargs: dict,
+        *,
+        max_inputs: int,
+    ) -> tuple[list[Path] | None, str | None]:
+        """Resolve one or more attached images in workflow input order."""
+        requested_many = kwargs.get("image_paths")
+        requested_single = str(kwargs.get("image_path") or "").strip()
+        if requested_many not in (None, "") and requested_single:
+            return None, "image_path 与 image_paths 只能选一个。"
+        if (requested_many not in (None, "") or requested_single) and (
+            kwargs.get("image_indices") not in (None, "")
+            or kwargs.get("image_index") not in (None, "")
+        ):
+            return None, "image_path/image_paths 与 image_index/image_indices 只能选一类输入。"
+
+        raw_paths: list[str] = []
+        if requested_many not in (None, ""):
+            if not isinstance(requested_many, list) or not all(isinstance(x, str) for x in requested_many):
+                return None, "image_paths 必须是本插件此前回执的本地路径数组。"
+            raw_paths = [path.strip() for path in requested_many if path.strip()]
+        elif requested_single:
+            raw_paths = [requested_single]
+
+        def resolve_output_paths(values: list[str]) -> tuple[list[Path] | None, str | None]:
+            resolved: list[Path] = []
+            root = self.output_dir.resolve()
+            for value in values:
+                try:
+                    path = Path(value).expanduser().resolve(strict=True)
+                    path.relative_to(root)
+                except (OSError, ValueError):
+                    return None, "来源路径必须是本插件此前回执给出的有效本地保存路径。"
+                if not path.is_file():
+                    return None, "来源图片文件不存在。"
+                resolved.append(path)
+            if len(resolved) > max_inputs:
+                return None, f"工作流有 {max_inputs} 个参考图输入，image_paths 不能超过该数量。"
+            return (resolved or None), (None if resolved else "没有提供有效的来源图片路径。")
+
+        if raw_paths:
+            return resolve_output_paths(raw_paths)
 
         images = _message_images(context)
         if images:
+            raw_indices = kwargs.get("image_indices")
             raw_index = kwargs.get("image_index")
-            if raw_index in (None, "") and len(images) > 1:
-                return None, f"当前消息有 {len(images)} 张图片，请用 image_index 指定其中一张。"
-            try:
-                index = int(raw_index) if raw_index not in (None, "") else 1
-            except (TypeError, ValueError):
-                return None, "image_index 必须是从 1 开始的整数。"
-            if not 1 <= index <= len(images):
-                return None, f"image_index 超出范围；当前有 {len(images)} 张图片。"
-            try:
-                path = Path(await images[index - 1].convert_to_file_path()).resolve(strict=True)
-            except Exception as e:  # noqa: BLE001 - platform media resolver may raise adapter errors
-                return None, f"无法读取消息中的图片（{e}）。"
-            return path, None
+            if raw_indices not in (None, "") and raw_index not in (None, ""):
+                return None, "image_index 与 image_indices 只能选一个。"
+            indices: list[int]
+            if raw_indices not in (None, ""):
+                if not isinstance(raw_indices, list) or not raw_indices:
+                    return None, "image_indices 必须是非空的 1-based 图片序号数组。"
+                try:
+                    indices = [int(index) for index in raw_indices]
+                except (TypeError, ValueError):
+                    return None, "image_indices 必须只包含整数。"
+            elif raw_index not in (None, ""):
+                try:
+                    indices = [int(raw_index)]
+                except (TypeError, ValueError):
+                    return None, "image_index 必须是从 1 开始的整数。"
+            else:
+                if len(images) > max_inputs:
+                    return None, f"当前消息有 {len(images)} 张图片，但工作流只有 {max_inputs} 个参考图输入；请用 image_indices 选择。"
+                indices = list(range(1, len(images) + 1))
+
+            if len(indices) > max_inputs:
+                return None, f"image_indices 不能超过工作流的 {max_inputs} 个参考图输入。"
+            if any(index < 1 or index > len(images) for index in indices):
+                return None, f"image_indices 超出范围；当前消息有 {len(images)} 张图片。"
+
+            paths: list[Path] = []
+            for index in indices:
+                try:
+                    paths.append(Path(await images[index - 1].convert_to_file_path()).resolve(strict=True))
+                except Exception as e:  # noqa: BLE001 - media resolver may raise adapter errors
+                    return None, f"无法读取第 {index} 张消息图片（{e}）。"
+            return paths, None
 
         last = str((self.shared.get("last_image_paths") or {}).get(_event_scope(context)) or "")
-        if last:
-            path = Path(last)
-            if path.is_file():
-                return path, None
+        if last and Path(last).is_file():
+            return [Path(last)], None
         return None, "当前消息没有图片，且本会话没有可用的上次生成图片；请附图后重试。"
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
@@ -2696,8 +2759,21 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
             return f"编辑失败：{e}"
         profile = self.profiles.effective(edit_route.workflow, wf) if self.profiles else {"slots": detect_slots(wf), "drop_nodes": []}
         slots = profile.get("slots") or {}
-        image_node = wf.get(str((slots.get("source_image") or {}).get("node") or ""))
-        if not isinstance(image_node, dict) or image_node.get("class_type") != "LoadImage":
+        source_specs = [
+            dict(spec) for spec in (slots.get("source_images") or []) if isinstance(spec, dict)
+        ]
+        single_source = slots.get("source_image")
+        if isinstance(single_source, dict):
+            if source_specs:
+                source_specs[0] = dict(single_source)
+            else:
+                source_specs = [dict(single_source)]
+        source_specs = [
+            spec for spec in source_specs
+            if isinstance(wf.get(str(spec.get("node") or "")), dict)
+            and wf[str(spec.get("node"))].get("class_type") == "LoadImage"
+        ]
+        if not source_specs:
             return f"编辑失败：工作流「{edit_route.workflow}」缺少有效的来源图片 LoadImage 槽位映射。"
         if not slots.get("prompt"):
             return f"编辑失败：工作流「{edit_route.workflow}」缺少提示词槽位映射。"
@@ -2746,19 +2822,31 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         if dimensions_provided and custom_size is False:
             return "编辑失败：填写 width/height 时请开启 custom_size 或省略该开关。"
 
-        source_path, source_error = await self._source_path(context, kwargs)
-        if source_error:
-            return f"编辑失败：{source_error}"
-        try:
-            if source_path.stat().st_size > 25 * 1024 * 1024:
-                return "编辑失败：来源图片超过 25 MiB。"
-            content = await asyncio.to_thread(source_path.read_bytes)
-        except OSError as e:
-            return f"编辑失败：读取来源图片失败（{e}）。"
+        source_paths, source_error = await self._source_paths(
+            context, kwargs, max_inputs=len(source_specs),
+        )
+        if source_error or not source_paths:
+            return f"编辑失败：{source_error or '没有可用的来源图片。'}"
+        contents: list[bytes] = []
+        for source_path in source_paths:
+            try:
+                if source_path.stat().st_size > 25 * 1024 * 1024:
+                    return "编辑失败：单张来源图片不能超过 25 MiB。"
+                contents.append(await asyncio.to_thread(source_path.read_bytes))
+            except OSError as e:
+                return f"编辑失败：读取来源图片失败（{e}）。"
         suffixes = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
-        suffix = suffixes.get(image_media_type(content))
-        if not suffix:
-            return "编辑失败：来源文件需为 PNG、JPEG、WebP 或 GIF 图片。"
+        uploads: list[str] = []
+        for index, content in enumerate(contents, start=1):
+            suffix = suffixes.get(image_media_type(content))
+            if not suffix:
+                return "编辑失败：来源文件需为 PNG、JPEG、WebP 或 GIF 图片。"
+            upload_name, upload_error = await self.client.upload_image(
+                f"astrbot_edit_{index}_{uuid.uuid4().hex}{suffix}", content,
+            )
+            if upload_error or not upload_name:
+                return f"编辑失败：上传第 {index} 张来源图片失败（{upload_error or 'ComfyUI 未返回文件名'}）。"
+            uploads.append(upload_name)
         if resolution_provided:
             effective_resolution = resolution
         elif dimensions_provided:
@@ -2769,7 +2857,7 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
             effective_resolution = 0
         canvas_dimensions = None
         if slots.get("size"):
-            source_dimensions = image_dimensions(content)
+            source_dimensions = image_dimensions(contents[0])
             if dimensions_provided:
                 try:
                     canvas_dimensions = _custom_edit_canvas_dimensions(
@@ -2784,12 +2872,12 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         effective_custom_size = custom_size
         if dimensions_provided and effective_custom_size is None and slots.get("custom_size"):
             effective_custom_size = True
-        upload_name, upload_error = await self.client.upload_image(f"astrbot_edit_{uuid.uuid4().hex}{suffix}", content)
-        if upload_error or not upload_name:
-            return f"编辑失败：上传来源图片失败（{upload_error or 'ComfyUI 未返回文件名'}）。"
-
         seed = random.randint(0, 2**31 - 1) if slots.get("sampler") or slots.get("sampler_2") else None
-        apply_values = {"prompt": prompt, "source_image": upload_name, "seed": seed}
+        apply_values = {"prompt": prompt, "seed": seed}
+        if slots.get("source_images"):
+            apply_values["source_images"] = uploads
+        else:
+            apply_values["source_image"] = uploads[0]
         if slots.get("resolution"):
             apply_values["resolution"] = effective_resolution
         if canvas_dimensions is not None:
@@ -2831,7 +2919,8 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         self.store.save_history({
             "prompt_id": pid, "entry": "edit", "family": edit_route.name,
             "edit_route": edit_route.name, "workflow": edit_route.workflow,
-            "prompt": prompt, "source_path": str(source_path),
+            "prompt": prompt, "source_path": str(source_paths[0]),
+            "source_paths": [str(path) for path in source_paths],
             "filename": filename, "local_path": str(local_path),
         })
         try:
@@ -2840,7 +2929,8 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         except Exception as e:
             return f"图片已编辑但发送失败（{e}）。本地路径: {local_path}"
         seed_note = f"seed={seed} " if seed is not None else ""
-        return f"图片已编辑并发送。本地路径: {local_path}\n{seed_note}prompt_id={pid}"
+        image_note = f" 使用参考图 {len(uploads)} 张。" if len(uploads) > 1 else ""
+        return f"图片已编辑并发送。本地路径: {local_path}\n{seed_note}prompt_id={pid}.{image_note}"
 
 
 _RECIPE_DRAW_DESC = (

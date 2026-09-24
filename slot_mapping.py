@@ -330,7 +330,33 @@ def normalize_workflow(data: dict, object_info: dict | None = None) -> dict:
     if is_api_workflow(data):
         return {str(k): v for k, v in data.items() if isinstance(v, dict) and "class_type" in v}
     if is_ui_workflow(data):
-        return ui_to_api(data, object_info)
+        wf = ui_to_api(data, object_info)
+        if object_info is not None:
+            missing = {
+                nid: str(node.get("class_type") or "")
+                for nid, node in wf.items()
+                if node.get("class_type") not in object_info
+            }
+            if missing:
+                outputs = [
+                    nid for nid, node in wf.items()
+                    if (object_info.get(str(node.get("class_type") or "")) or {}).get("output_node")
+                    or node.get("class_type") in {"SaveImage", "PreviewImage", "SaveImageWithAlpha"}
+                ]
+                if not outputs:
+                    raise ValueError("工作流中没有可识别的输出节点，无法判断缺失节点是否可移除")
+                active = _upstream_ids(wf, outputs)
+                required_missing = {nid: cls for nid, cls in missing.items() if nid in active}
+                if required_missing:
+                    detail = "、".join(f"{nid} ({cls})" for nid, cls in required_missing.items())
+                    raise ValueError(f"工作流输出依赖未安装节点：{detail}")
+                for nid in missing:
+                    wf.pop(nid)
+                logger.info(
+                    "[ComfyUIDirect] 导入时移除 %d 个未安装且不参与输出的 UI 节点",
+                    len(missing),
+                )
+        return wf
     raise ValueError("无法识别工作流格式。请在 ComfyUI 使用 Save (API Format) 再导入。")
 
 
@@ -365,17 +391,37 @@ def ui_to_api(ui: dict, object_info: dict | None = None) -> dict:
             inputs[str(name)] = [str(link[1]), int(link[2])]
 
         widgets = list(node.get("widgets_values") or [])
-        widgets = [v for v in widgets if not (isinstance(v, str) and v.lower() in _WIDGET_SKIP)]
         widget_names = _widget_input_names(cls, object_info)
+        # Seed controls live only in UI workflows. Keep literal strings such as
+        # a prompt of "fixed" intact on nodes without a seed widget.
+        if "seed" in widget_names or "noise_seed" in widget_names:
+            widgets = [v for v in widgets if not (isinstance(v, str) and v.lower() in _WIDGET_SKIP)]
         used = set(inputs)
+        # ComfyUI may retain widget values even when those inputs are linked.
+        # Other UI exports compact them away. Choose by the actual array size.
+        full_widget_layout = len(widgets) >= len(widget_names)
         wi = 0
         for name in widget_names:
             if name in used:
+                if full_widget_layout and wi < len(widgets):
+                    wi += 1
                 continue
             if wi >= len(widgets):
                 break
             inputs[name] = widgets[wi]
             wi += 1
+
+        if cls == POWER_LORA_CLASS:
+            lora_index = 1
+            for value in node.get("widgets_values") or []:
+                if not isinstance(value, dict) or not {"on", "lora", "strength"} <= value.keys():
+                    continue
+                inputs[f"lora_{lora_index}"] = {
+                    "on": bool(value["on"]),
+                    "lora": value["lora"],
+                    "strength": value["strength"],
+                }
+                lora_index += 1
         # 没有 object_info 时：把剩余 widgets 按常见字段名尽量填
         if object_info is None and wi < len(widgets):
             for guess, val in zip(
@@ -411,12 +457,17 @@ def _widget_input_names(cls: str, object_info: dict | None) -> list[str]:
         return []
     info = object_info.get(cls) or {}
     spec = info.get("input") or {}
+    input_order = info.get("input_order") or {}
     names: list[str] = []
     for bucket in ("required", "optional"):
         block = spec.get(bucket) or {}
         if not isinstance(block, dict):
             continue
-        for name, typ in block.items():
+        ordered = input_order.get(bucket) if isinstance(input_order, dict) else None
+        keys = list(ordered) if isinstance(ordered, list) else []
+        keys.extend(name for name in block if name not in keys)
+        for name in keys:
+            typ = block.get(name)
             if _is_widget_spec(typ):
                 names.append(name)
     return names

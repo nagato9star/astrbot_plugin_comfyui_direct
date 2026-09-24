@@ -92,6 +92,7 @@ from slot_mapping import (  # noqa: E402
     apply_slots,
     collect_trigger_words,
     detect_slots,
+    normalize_workflow,
     node_options_for_slot,
     parse_node_option,
     read_current_values,
@@ -940,6 +941,117 @@ def test_ui_to_api() -> None:
     print("  ui to api OK")
 
 
+def test_ui_to_api_retained_widgets_and_power_lora() -> None:
+    """Anima-style UI exports retain linked widget slots and rgthree presets."""
+    sampler_required = {
+        "model": ["MODEL"],
+        "add_noise": [["enable", "disable"]],
+        "noise_seed": ["INT", {"default": 0}],
+        "steps": ["INT", {"default": 20}],
+        "cfg": ["FLOAT", {"default": 8.0}],
+        "sampler": [["er_sde", "euler"]],
+        "scheduler": [["sgm_uniform", "simple"]],
+        "positive": ["CONDITIONING"],
+        "negative": ["CONDITIONING"],
+        "latent": ["LATENT"],
+        "start_at_step": ["INT", {"default": 0}],
+        "end_at_step": ["INT", {"default": 10000}],
+        "return_with_leftover_noise": [["enable", "disable"]],
+        "cleanup": [["不做任何清理"]],
+    }
+    object_info = {
+        "XB_ROCmKSamplerAdvanced": {
+            "input": {"required": sampler_required},
+            "input_order": {"required": list(sampler_required)},
+        },
+        "Power Lora Loader (rgthree)": {
+            "input": {"required": {"model": ["MODEL"], "clip": ["CLIP"]}}
+        },
+        "CR Prompt Text": {"input": {"required": {"prompt": ["STRING", {}]}}},
+    }
+    ui = {
+        "nodes": [
+            {
+                "id": 10,
+                "type": "XB_ROCmKSamplerAdvanced",
+                "inputs": [
+                    {"name": "model", "link": 1},
+                    {"name": "steps", "link": 2},
+                    {"name": "end_at_step", "link": 3},
+                ],
+                "widgets_values": [
+                    "enable", 123, "randomize", 20, 4.6, "er_sde",
+                    "sgm_uniform", 0, 10000, "enable", "不做任何清理",
+                ],
+            },
+            {
+                "id": 20,
+                "type": "Power Lora Loader (rgthree)",
+                "inputs": [{"name": "model", "link": 4}],
+                "widgets_values": [
+                    {}, {"type": "Power Lora Loader (rgthree)"},
+                    {"on": False, "lora": "optional.safetensors", "strength": 0.8, "strengthTwo": 0.8},
+                    {},
+                ],
+            },
+            {"id": 30, "type": "CR Prompt Text", "widgets_values": ["fixed"]},
+        ],
+        "links": [
+            [1, 1, 0, 10, 0, "MODEL"],
+            [2, 2, 0, 10, 1, "INT"],
+            [3, 3, 0, 10, 2, "INT"],
+            [4, 1, 0, 20, 0, "MODEL"],
+        ],
+    }
+    api = ui_to_api(ui, object_info)
+    sampler = api["10"]["inputs"]
+    assert sampler["steps"] == ["2", 0]
+    assert sampler["end_at_step"] == ["3", 0]
+    assert sampler["cfg"] == 4.6
+    assert sampler["sampler"] == "er_sde"
+    assert sampler["scheduler"] == "sgm_uniform"
+    assert sampler["return_with_leftover_noise"] == "enable"
+    assert sampler["cleanup"] == "不做任何清理"
+    assert api["20"]["inputs"]["lora_1"] == {
+        "on": False, "lora": "optional.safetensors", "strength": 0.8,
+    }
+    assert api["30"]["inputs"]["prompt"] == "fixed"
+
+    snapshot = api_to_ui(api, object_info)
+    rebuilt = next(node for node in snapshot["nodes"] if node["id"] == 10)
+    assert rebuilt["widgets_values"] == [
+        "enable", 123, "fixed", None, 4.6, "er_sde", "sgm_uniform",
+        0, None, "enable", "不做任何清理",
+    ]
+    print("  ui to api retained widgets / Power LoRA slots OK")
+
+
+def test_ui_import_prunes_unavailable_orphans() -> None:
+    object_info = {
+        "LoadImage": {"input": {"required": {"image": [["source.png"]]}}, "output": ["IMAGE"]},
+        "SaveImage": {"input": {"required": {"images": ["IMAGE"]}}, "output_node": True},
+    }
+    ui = {
+        "nodes": [
+            {"id": 1, "type": "LoadImage", "widgets_values": ["source.png"]},
+            {"id": 2, "type": "SaveImage", "inputs": [{"name": "images", "link": 1}]},
+            {"id": 9, "type": "MarkdownNote", "widgets_values": ["UI-only note"]},
+        ],
+        "links": [[1, 1, 0, 2, 0, "IMAGE"]],
+    }
+    wf = normalize_workflow(ui, object_info)
+    assert set(wf) == {"1", "2"}
+    ui["nodes"][1]["inputs"][0]["link"] = 2
+    ui["links"].append([2, 9, 0, 2, 0, "IMAGE"])
+    try:
+        normalize_workflow(ui, object_info)
+    except ValueError as e:
+        assert "9 (MarkdownNote)" in str(e)
+    else:
+        raise AssertionError("output-dependent missing nodes must be rejected")
+    print("  UI import orphan pruning / active missing-node guard OK")
+
+
 def test_api_to_ui_linked_widget_positions() -> None:
     """连线 widget 保留固定位置，后续值不得整体前移。"""
     sampler_inputs = {
@@ -1754,6 +1866,8 @@ def main() -> None:
     test_qwen_edit_graph_scoped_detection()
     test_split_family_config_dropdowns()
     test_ui_to_api()
+    test_ui_to_api_retained_widgets_and_power_lora()
+    test_ui_import_prunes_unavailable_orphans()
     test_api_to_ui_linked_widget_positions()
     test_xb_sampler_seed_control_snapshot()
     test_workflow_build()

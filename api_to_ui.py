@@ -94,9 +94,21 @@ def api_to_ui(api: dict, object_info: dict | None = None) -> dict:
         out_names = info.get("output_name", [])
 
         in_defs = {}
+        input_order = info.get("input_order") or {}
+        ordered_fields: list[str] = []
         for group in ("required", "optional"):
-            for k, v in (input_def.get(group) or {}).items():
+            block = input_def.get(group) or {}
+            declared = input_order.get(group) if isinstance(input_order, dict) else None
+            names = list(declared) if isinstance(declared, list) else []
+            names.extend(name for name in block if name not in names)
+            for k in names:
+                if k not in block:
+                    continue
+                v = block[k]
                 in_defs[k] = v
+                if k in (node.get("inputs") or {}):
+                    ordered_fields.append(k)
+        ordered_fields.extend(k for k in (node.get("inputs") or {}) if k not in ordered_fields)
 
         ui_inputs: list[dict] = []
         ui_outputs: list[dict] = []
@@ -115,7 +127,8 @@ def api_to_ui(api: dict, object_info: dict | None = None) -> dict:
                 }
             )
 
-        for field, value in node.get("inputs", {}).items():
+        for field in ordered_fields:
+            value = node["inputs"][field]
             if is_rgthree_pll and _LINK_RE.match(field) and isinstance(value, dict):
                 rgthree_loras.append(value)
                 continue

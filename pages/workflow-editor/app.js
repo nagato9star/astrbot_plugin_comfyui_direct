@@ -1,5 +1,6 @@
 const SLOT_FALLBACK = [
   { id: "prompt", label: "用户要画的内容", help: "必选", basic: true },
+  { id: "source_image", label: "编辑来源图片", help: "图片编辑工作流中的 LoadImage 节点", basic: false },
   { id: "model", label: "底模", help: "", basic: true },
   { id: "loras", label: "LoRA", help: "", basic: true },
   { id: "size", label: "画面大小", help: "", basic: true },
@@ -25,8 +26,15 @@ const state = {
   samplers: ["er_sde", "euler", "dpmpp_2m"],
   schedulers: ["normal", "karras", "simple"],
   recipe: emptyRecipe(),
+  activeMode: "workflow",
   activeWorkflow: "",
+  workflowSource: "",
+  workflowPurpose: "generate",
+  workflowFamily: "",
+  workflowJsonOriginal: "",
+  profileSlotsOriginal: "{}",
   profileSlots: {},
+  profileSource: "detected",
   profileDropNodes: [],
   history: [],
   runningPid: "",
@@ -43,6 +51,17 @@ function emptyRecipe() {
 }
 
 const $ = (sel) => document.querySelector(sel);
+
+function selectMode(mode) {
+  state.activeMode = mode === "recipe" ? "recipe" : "workflow";
+  const workflow = state.activeMode === "workflow";
+  $("#workflow-pane").hidden = !workflow;
+  $("#recipe-pane").hidden = workflow;
+  $("#rail-right").hidden = workflow;
+  $("#layout").classList.toggle("workflow-mode", workflow);
+  $("#tab-workflow").setAttribute("aria-selected", String(workflow));
+  $("#tab-recipe").setAttribute("aria-selected", String(!workflow));
+}
 
 function toast(msg, isErr = false) {
   const t = $("#toast");
@@ -105,6 +124,29 @@ function familyByName(name) {
   return state.families.find((item) => String(item.name || "").toLocaleLowerCase() === wanted) || null;
 }
 
+function renderWorkflowRouting() {
+  const active = state.activeWorkflow;
+  $("#workflow-active-name").textContent = active || "尚未选择";
+  $("#workflow-active-source").textContent = active ? (state.workflowSource === "custom" ? "已导入" : state.workflowSource) : "";
+  $("#workflow-purpose").value = state.workflowPurpose;
+  const bound = state.families.find((family) => (state.workflowPurpose === "edit" ? family.edit_workflow : family.workflow) === active);
+  if (!familyByName(state.workflowFamily) && bound) state.workflowFamily = bound.name;
+  fillSelect($("#workflow-family"), state.families.map((family) => family.name), state.workflowFamily, [""]);
+  const family = familyByName(state.workflowFamily);
+  const linked = family ? (state.workflowPurpose === "edit" ? family.edit_workflow : family.workflow) : "";
+  $("#workflow-bind-status").textContent = family
+    ? `${family.name} 的${state.workflowPurpose === "edit" ? "编辑图" : "生图"}工作流：${linked || "未绑定"}`
+    : "选择家族后绑定当前工作流；配方数据不会改变。";
+  $("#btn-bind-workflow").disabled = !active || !family;
+  $("#btn-unbind-edit").hidden = state.workflowPurpose !== "edit" || !family?.edit_workflow;
+  $("#btn-save-workflow-json").disabled = !active;
+}
+
+function workflowDraftDirty() {
+  return $("#workflow-json").value !== state.workflowJsonOriginal
+    || JSON.stringify(state.profileSlots) !== state.profileSlotsOriginal;
+}
+
 function slotNode(role) {
   const spec = state.profileSlots?.[role];
   if (!spec) return "";
@@ -126,20 +168,8 @@ function renderSlotSelect(role, parent) {
   sel.dataset.slot = role.id;
   const current = slotNode(role.id);
   const options = state.slotOptions[role.id] || [""];
-  fillSelect(sel, options, current, [""]);
-  if (current && ![...sel.options].some((o) => o.value === current || o.value.startsWith(`${current} `) || o.value.startsWith(`${current} —`))) {
-    const opt = document.createElement("option");
-    opt.value = current;
-    opt.textContent = prettyNode(current);
-    opt.selected = true;
-    sel.insertBefore(opt, sel.firstChild);
-  }
-  for (const o of sel.options) {
-    if (o.value === current || o.value.startsWith(`${current} —`) || o.value.startsWith(`${current} `)) {
-      o.selected = true;
-      break;
-    }
-  }
+  const selected = options.find((o) => o === current || o.startsWith(`${current} —`) || o.startsWith(`${current} `)) || current;
+  fillSelect(sel, options, selected, [""]);
   sel.addEventListener("change", () => {
     state.profileSlots = state.profileSlots || {};
     const v = sel.value;
@@ -238,7 +268,13 @@ function renderLists() {
     const li = document.createElement("li");
     li.className = t.name === state.activeWorkflow ? "active" : "";
     const src = t.source === "custom" ? "已导入" : (t.source || "");
-    li.innerHTML = `<strong>${escapeHtml(t.name)}</strong><span class="meta">${escapeHtml(src)} · ${t.node_count || "?"} 个格子</span>`;
+    const drawFamilies = state.families.filter((item) => item.workflow === t.name).map((item) => item.name);
+    const editFamilies = state.families.filter((item) => item.edit_workflow === t.name).map((item) => item.name);
+    const routes = [
+      drawFamilies.length ? `生图 ${drawFamilies.join("、")}` : "",
+      editFamilies.length ? `编辑 ${editFamilies.join("、")}` : "",
+    ].filter(Boolean).join(" · ");
+    li.innerHTML = `<strong>${escapeHtml(t.name)}</strong><span class="meta">${escapeHtml(src)} · ${t.node_count || "?"} 个节点${routes ? ` · ${escapeHtml(routes)}` : ""}</span>`;
     li.addEventListener("click", () => bindWorkflow(t.name));
     const del = document.createElement("button");
     del.className = "wf-del";
@@ -344,19 +380,15 @@ function numOrEmpty(v) {
   return Number.isFinite(n) ? n : undefined;
 }
 
-function applyRecipeToForm(recipe, resolved = {}) {
+function applyRecipeToForm(recipe) {
   state.recipe = {
     ...emptyRecipe(),
     ...recipe,
     defaults: { loras: [], ...(recipe.defaults || {}) },
   };
-  if (resolved.workflow !== undefined) state.activeWorkflow = resolved.workflow || "";
-  if (resolved.slots !== undefined) state.profileSlots = resolved.slots || {};
-  if (resolved.dropNodes !== undefined) state.profileDropNodes = resolved.dropNodes || [];
   $("#recipe-name").value = state.recipe.name || "";
   $("#recipe-desc").value = state.recipe.description || "";
   renderLists();
-  renderSlots();
   renderDefaults();
 }
 
@@ -382,6 +414,7 @@ async function refreshStatus() {
     $("#gpu-text").textContent = `显存 ${free}/${total}G`;
   }
   renderDefaults();
+  renderWorkflowRouting();
 }
 
 async function loadLists() {
@@ -413,7 +446,9 @@ async function setDefaultRecipe(name) {
   }
 }
 
-async function bindWorkflow(name) {
+async function bindWorkflow(name, force = false) {
+  if (!force && state.activeWorkflow && workflowDraftDirty()
+      && !confirm("当前工作流 JSON 或节点映射有未保存的修改，确定要放弃吗？")) return false;
   const res = await apiGet("workflow", { name });
   if (!res || !res.ok) {
     toast(res?.error || "加载工作流失败", true);
@@ -422,26 +457,24 @@ async function bindWorkflow(name) {
   state.slotOptions = res.slot_options || {};
   const switched = state.activeWorkflow !== name;
   state.activeWorkflow = name;
+  state.workflowSource = res.source || "";
   state.profileSlots = res.profile_slots || res.detected_slots || {};
+  state.profileSource = res.profile_source || "detected";
   state.profileDropNodes = res.drop_nodes || [];
-  const matchedFamily = state.families.find((item) => item.workflow === name);
-  if (!state.recipe.family && matchedFamily) state.recipe.family = matchedFamily.name;
+  state.workflowJsonOriginal = JSON.stringify(res.workflow || {}, null, 2);
+  state.profileSlotsOriginal = JSON.stringify(state.profileSlots);
+  $("#workflow-json").value = state.workflowJsonOriginal;
+  const editFamily = state.families.find((item) => item.edit_workflow === name);
+  const drawFamily = state.families.find((item) => item.workflow === name);
+  if (editFamily && !drawFamily) state.workflowPurpose = "edit";
+  else if (drawFamily) state.workflowPurpose = "generate";
+  if (editFamily || drawFamily) state.workflowFamily = (editFamily && !drawFamily ? editFamily : drawFamily).name;
   if (switched) toast(`已打开工作流「${name}」的共享槽位`);
-  if (switched) {
-    const detect = await apiPost("workflow/detect", { name });
-    if (detect && detect.ok && detect.values) {
-      const keepLoras = state.recipe.defaults.loras || [];
-      state.recipe.defaults = { loras: keepLoras, ...detect.values };
-    }
-  } else if (res.detected_slots) {
-    const detect = await apiPost("workflow/detect", { name });
-    if (detect && detect.ok && detect.values) {
-      state.recipe.defaults = { loras: [], ...detect.values, ...state.recipe.defaults };
-    }
-  }
   renderLists();
   renderSlots();
-  renderDefaults();
+  renderWorkflowRouting();
+  selectMode("workflow");
+  return true;
 }
 
 async function loadRecipe(name) {
@@ -450,15 +483,8 @@ async function loadRecipe(name) {
     toast(res?.error || "读取配方失败", true);
     return;
   }
-  if (res.template_missing) {
-    toast(`模型家族配置的工作流「${res.template_missing}」不存在，请检查配置`, true);
-  }
-  state.slotOptions = res.slot_options || {};
-  applyRecipeToForm(res.recipe, {
-    workflow: res.resolved_workflow || "",
-    slots: res.profile_slots || {},
-    dropNodes: res.drop_nodes || [],
-  });
+  applyRecipeToForm(res.recipe);
+  selectMode("recipe");
 }
 
 async function deleteTemplate(name) {
@@ -471,9 +497,14 @@ async function deleteTemplate(name) {
   toast(`模板「${name}」已删除`);
   if (state.activeWorkflow === name) {
     state.activeWorkflow = "";
+    state.workflowSource = "";
     state.profileSlots = {};
     state.slotOptions = {};
+    state.workflowJsonOriginal = "";
+    state.profileSlotsOriginal = "{}";
+    $("#workflow-json").value = "";
     renderSlots();
+    renderWorkflowRouting();
   }
   await loadLists();
 }
@@ -493,19 +524,9 @@ async function saveRecipe() {
     toast("当前家族没有配置，请重载插件配置", true);
     return false;
   }
-  if (!state.activeWorkflow || state.activeWorkflow !== family.workflow) {
-    toast(`当前家族应使用工作流「${family.workflow}」，请先确认该工作流`, true);
-    return false;
-  }
-  if (!slotNode("prompt") || !slotNode("sampler")) {
-    toast("请确认「用户要画的内容」和「出图采样」两个格子", true);
-    return false;
-  }
   const res = await apiPost("recipe/save", {
     ...state.recipe,
     family: family.name,
-    profile_slots: state.profileSlots,
-    drop_nodes: state.profileDropNodes,
   });
   if (!res || !res.ok) {
     toast(res?.error || "保存失败", true);
@@ -513,12 +534,42 @@ async function saveRecipe() {
   }
   toast("这套已经记住了");
   await loadLists();
-  applyRecipeToForm(res.recipe, {
+  applyRecipeToForm(res.recipe);
+  selectMode("recipe");
+  return true;
+}
+
+async function redetectSlots() {
+  if (!state.activeWorkflow) return toast("请先选择工作流", true);
+  const res = await apiPost("workflow/detect", { name: state.activeWorkflow });
+  if (!res || !res.ok) return toast(res?.error || "节点识别失败", true);
+  state.profileSlots = res.slots || {};
+  state.slotOptions = res.slot_options || state.slotOptions;
+  renderSlots();
+  const count = Object.keys(state.profileSlots).length;
+  const editFamily = state.families.find((item) => item.edit_workflow === state.activeWorkflow);
+  if (editFamily && !slotNode("source_image")) {
+    toast("编辑来源图片无法唯一识别，请手动选择 LoadImage 后保存映射", true);
+  } else {
+    toast(count ? `已加载 ${count} 个节点建议，核对后点「保存映射」` : "无法唯一识别节点，请手动选择后保存", !count);
+  }
+}
+
+async function saveWorkflowProfile() {
+  if (!state.activeWorkflow) return toast("请先选择工作流", true);
+  const res = await apiPost("workflow/profile", {
     workflow: state.activeWorkflow,
     slots: state.profileSlots,
-    dropNodes: state.profileDropNodes,
+    drop_nodes: state.profileDropNodes,
   });
-  return true;
+  if (!res || !res.ok) return toast(res?.error || "保存节点映射失败", true);
+  if (state.profileSource === "config") {
+    toast("映射已保存；配置页手动映射仍优先生效，请在配置页同步修改", true);
+  } else {
+    state.profileSource = "profile";
+    toast("工作流节点映射已保存");
+  }
+  state.profileSlotsOriginal = JSON.stringify(state.profileSlots);
 }
 
 async function importFile(file) {
@@ -537,26 +588,8 @@ async function importFile(file) {
     return;
   }
   toast(`已导入 ${name}`);
-  state.slotOptions = res.slot_options || {};
-  state.activeWorkflow = name;
-  state.profileSlots = res.profile_slots || res.detected_slots || {};
-  state.profileDropNodes = res.drop_nodes || [];
   await loadLists();
-  const detect = await apiPost("workflow/detect", { name });
-  if (detect && detect.ok) {
-    state.recipe.defaults = { loras: [], ...(detect.values || {}) };
-  }
-  if (!state.recipe.name) state.recipe.name = name;
-  const matchedFamily = state.families.find((item) => item.workflow === name);
-  if (matchedFamily) state.recipe.family = matchedFamily.name;
-  applyRecipeToForm(state.recipe, {
-    workflow: name,
-    slots: state.profileSlots,
-    dropNodes: state.profileDropNodes,
-  });
-  if (!matchedFamily) {
-    toast(`工作流已导入；请到插件配置添加模型家族并选择「${name}」，随后重载插件`, true);
-  }
+  await bindWorkflow(name);
 }
 
 async function importFromComfy() {
@@ -574,10 +607,6 @@ async function importFromComfy() {
   }
   toast("已从 ComfyUI 历史导入");
   await loadLists();
-  state.slotOptions = res.slot_options || {};
-  state.activeWorkflow = res.name;
-  state.profileSlots = res.profile_slots || res.detected_slots || {};
-  state.profileDropNodes = res.drop_nodes || [];
   await bindWorkflow(res.name);
 }
 
@@ -586,13 +615,8 @@ async function runGenerate() {
     toast("上一张还在跑，等等或点停止", true);
     return;
   }
-  readFormIntoRecipe();
-  if (!state.recipe.name) {
-    toast("先保存这套，再试画", true);
-    return;
-  }
-  const saved = await saveRecipe();
-  if (!saved) return;
+  const saved = state.recipes.find((row) => row.id === state.recipe.id || row.name === state.recipe.name);
+  if (!saved) return toast("先保存配方，再试画已保存的参数", true);
   const prompt = $("#test-prompt").value.trim();
   if (!prompt) {
     toast("先写一句要画什么", true);
@@ -601,7 +625,7 @@ async function runGenerate() {
   $("#preview").textContent = "排队中…";
   const res = await apiPost("generate", {
     prompt,
-    recipe: state.recipe.name,
+    recipe: saved.name,
     size: $("#test-size").value,
   });
   if (!res || !res.ok) {
@@ -650,16 +674,69 @@ async function newRecipe() {
   const recipe = emptyRecipe();
   const family = state.families[0] || null;
   if (family) recipe.family = family.name;
-  state.activeWorkflow = "";
-  state.profileSlots = {};
-  state.profileDropNodes = [];
   applyRecipeToForm(recipe);
-  if (family) await bindWorkflow(family.workflow);
+  selectMode("recipe");
+}
+
+async function saveWorkflowBinding(unbind = false) {
+  if (!state.activeWorkflow && !unbind) return toast("请先选择工作流", true);
+  const family = $("#workflow-family").value;
+  if (!family) return toast("请选择模型家族", true);
+  const mode = $("#workflow-purpose").value;
+  if (unbind && mode !== "edit") return;
+  const res = await apiPost("workflow/bind", {
+    family,
+    mode,
+    workflow: unbind ? "" : state.activeWorkflow,
+  });
+  if (!res || !res.ok) return toast(res?.error || "绑定工作流失败", true);
+  state.families = res.model_families || state.families;
+  state.workflowFamily = family;
+  state.workflowPurpose = mode;
+  renderLists();
+  renderWorkflowRouting();
+  const warning = (res.warnings || []).join("；");
+  toast(warning ? `已绑定；${warning}，请检查节点映射` : (unbind ? `已解除 ${family} 的编辑图绑定` : `已将「${state.activeWorkflow}」绑定到 ${family} 的${mode === "edit" ? "编辑图" : "生图"}入口`), !!warning);
+}
+
+async function saveWorkflowJson() {
+  if (!state.activeWorkflow) return toast("请先选择工作流", true);
+  if (JSON.stringify(state.profileSlots) !== state.profileSlotsOriginal) {
+    return toast("先保存节点映射，再修改工作流 JSON", true);
+  }
+  let workflow;
+  try {
+    workflow = JSON.parse($("#workflow-json").value);
+  } catch (e) {
+    return toast(`工作流 JSON 格式错误：${e.message}`, true);
+  }
+  const res = await apiPost("workflow/import", { name: state.activeWorkflow, workflow });
+  if (!res || !res.ok) return toast(res?.error || "保存工作流失败", true);
+  await loadLists();
+  await bindWorkflow(state.activeWorkflow, true);
+  toast(`工作流「${state.activeWorkflow}」已保存；请重新核对节点映射`);
 }
 
 function bindUi() {
   $("#btn-refresh").addEventListener("click", () => refreshStatus().catch((e) => toast(String(e), true)));
+  $("#tab-workflow").addEventListener("click", () => selectMode("workflow"));
+  $("#tab-recipe").addEventListener("click", () => selectMode("recipe"));
+  $("#btn-bind-workflow").addEventListener("click", () => saveWorkflowBinding().catch((e) => toast(String(e), true)));
+  $("#btn-unbind-edit").addEventListener("click", () => saveWorkflowBinding(true).catch((e) => toast(String(e), true)));
+  $("#btn-save-workflow-json").addEventListener("click", () => saveWorkflowJson().catch((e) => toast(String(e), true)));
+  $("#workflow-purpose").addEventListener("change", () => {
+    state.workflowPurpose = $("#workflow-purpose").value;
+    const bound = state.families.find((item) => (state.workflowPurpose === "edit" ? item.edit_workflow : item.workflow) === state.activeWorkflow);
+    if (bound) state.workflowFamily = bound.name;
+    renderWorkflowRouting();
+  });
+  $("#workflow-family").addEventListener("change", () => {
+    state.workflowFamily = $("#workflow-family").value;
+    renderWorkflowRouting();
+  });
   $("#btn-save").addEventListener("click", () => saveRecipe().catch((e) => toast(String(e), true)));
+  $("#btn-detect-slots").addEventListener("click", () => redetectSlots().catch((e) => toast(String(e), true)));
+  $("#btn-save-profile").addEventListener("click", () => saveWorkflowProfile().catch((e) => toast(String(e), true)));
   $("#btn-new-recipe").addEventListener("click", () => newRecipe().catch((e) => toast(String(e), true)));
   $("#btn-delete-recipe").addEventListener("click", async () => {
     if (!state.recipe.name) return;
@@ -698,9 +775,7 @@ function bindUi() {
   });
   $("#recipe-family").addEventListener("change", () => {
     state.recipe.family = $("#recipe-family").value;
-    const family = familyByName(state.recipe.family);
-    if (family) bindWorkflow(family.workflow).catch((e) => toast(String(e), true));
-    else renderLists();
+    renderLists();
   });
   document.querySelectorAll(".size-presets button").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -725,12 +800,13 @@ async function main() {
   }
   overlay.classList.add("hidden");
   bindUi();
+  selectMode("workflow");
   try {
     await refreshStatus();
     await loadLists();
-    if (state.recipes.length) await loadRecipe(state.recipes[0].id || state.recipes[0].name);
-    else if (state.families.length) await newRecipe();
-    else if (state.templates.length) await bindWorkflow(state.templates[0].name);
+    if (state.templates.length) await bindWorkflow(state.templates[0].name);
+    else if (state.recipes.length) await loadRecipe(state.recipes[0].id || state.recipes[0].name);
+    else await newRecipe();
   } catch (e) {
     toast(String(e), true);
   }

@@ -48,6 +48,7 @@ for _pkg_prefix in ("", "astrbot_plugin_comfyui_direct."):
         "model_families",
         "image_cache",
         "resource_catalog",
+        "config_options",
         "animadex",
         "api_to_ui",
     ):
@@ -56,6 +57,7 @@ for _pkg_prefix in ("", "astrbot_plugin_comfyui_direct."):
 try:
     from astrbot_plugin_comfyui_direct.animadex import AnimaDexClient
     from astrbot_plugin_comfyui_direct.comfy_client import ComfyUIClient
+    from astrbot_plugin_comfyui_direct.config_options import refresh_config_options
     from astrbot_plugin_comfyui_direct.external_search import (
         CivitaiClient,
         DanbooruClient,
@@ -82,6 +84,7 @@ try:
         ComfyuiUploadFileTool,
         ComfyuiValidateWorkflowTool,
         ComfyuiDrawTool,
+        ComfyuiEditTool,
         ComfyuiLookupTool,
     )
     from astrbot_plugin_comfyui_direct.workflow_builder import WorkflowBuilder
@@ -93,6 +96,7 @@ try:
 except ImportError:
     from animadex import AnimaDexClient
     from comfy_client import ComfyUIClient
+    from config_options import refresh_config_options
     from external_search import CivitaiClient, DanbooruClient, GelbooruClient
     from tools import (
         ComfyuiAnimadexTool,
@@ -115,6 +119,7 @@ except ImportError:
         ComfyuiUploadFileTool,
         ComfyuiValidateWorkflowTool,
         ComfyuiDrawTool,
+        ComfyuiEditTool,
         ComfyuiLookupTool,
     )
     from workflow_builder import WorkflowBuilder
@@ -130,7 +135,7 @@ DEFAULT_TIMEOUT = 300
 DEFAULT_CACHE_TTL = 600
 DEFAULT_WORKFLOW = "anima-v3"
 
-BASIC_LLM_TOOLS = {"comfyui_draw", "comfyui_recipe_draw", "comfyui_lookup"}
+BASIC_LLM_TOOLS = {"comfyui_draw", "comfyui_edit", "comfyui_recipe_draw", "comfyui_lookup"}
 # 这些工具可能读取任意本地文件、执行未经映射的自定义节点或影响其他任务，
 # 默认不交给模型；需要时由管理员显式打开配置。
 LLM_UNSAFE_TOOLS = {
@@ -254,7 +259,11 @@ class ComfyUIDirectPlugin(Star):
         node_slots_cfg = cfg.get("node_slots") if isinstance(cfg.get("node_slots"), dict) else {}
         self._node_slots_cfg = node_slots_cfg
         self._model_families_cfg = cfg.get("model_families") or []
-        self._families = ModelFamilyRegistry(self._model_families_cfg, default_workflow)
+        self._families = ModelFamilyRegistry(
+            self._model_families_cfg,
+            default_workflow,
+            edit_raw=cfg.get("edit_families") or [],
+        )
 
         self._client = ComfyUIClient(
             host=host,
@@ -282,6 +291,7 @@ class ComfyUIDirectPlugin(Star):
             node_slots_cfg,
             defaults,
         )
+        refresh_config_options(config, self._builder, self._store)
 
         shared: dict = {}
         self._danbooru = DanbooruClient(base_urls=danbooru_urls)
@@ -301,6 +311,18 @@ class ComfyUIDirectPlugin(Star):
             profiles=self._profiles,
         )
         self._draw_tool.refresh_schema()
+        self._edit_tool = ComfyuiEditTool(
+            client=self._client,
+            builder=self._builder,
+            store=self._store,
+            output_dir=self._output_dir,
+            shared=shared,
+            families=self._families,
+            profiles=self._profiles,
+        )
+        self._edit_tool.refresh_schema()
+        if not self._families.editable_names():
+            self._edit_tool.active = False
         self._recipe_draw_tool = ComfyuiRecipeDrawTool(
             draw_tool=self._draw_tool,
             store=self._store,
@@ -317,6 +339,7 @@ class ComfyUIDirectPlugin(Star):
 
         tools = [
             self._draw_tool,
+            self._edit_tool,
             self._recipe_draw_tool,
             self._lookup_tool,
             ComfyuiListModelsTool(client=self._client),
@@ -376,6 +399,7 @@ class ComfyUIDirectPlugin(Star):
                 shared,
                 self._draw_tool,
                 self._recipe_draw_tool,
+                self._edit_tool,
                 self._families,
                 self._profiles,
                 config_defaults=defaults,
@@ -438,7 +462,14 @@ class ComfyUIDirectPlugin(Star):
 
         first_family = self._families.first()
         wf = loaded.get(first_family.workflow)
-        if wf is not None:
+        has_legacy_slots = any(str(value or "").strip() for value in node_slots_cfg.values())
+        has_legacy_defaults = has_legacy_slots or any(
+            value not in (None, "", 0, 0.0, [], {})
+            for value in recipe_defaults.values()
+        )
+        if wf is not None and has_legacy_defaults:
+            # One-time migration for explicit old settings. Importing a workflow
+            # alone must not create or alter a static recipe.
             self._store.bootstrap(
                 workflow_name=first_family.workflow,
                 wf=wf,

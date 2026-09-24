@@ -25,13 +25,14 @@ from typing import Any
 
 from astrbot.api import FunctionTool, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
+from astrbot.api.message_components import Image, Reply
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.astr_agent_context import AstrAgentContext
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
 from animadex import AnimaDexClient
-from comfy_client import ComfyUIClient, execution_error_message
+from comfy_client import ComfyUIClient, execution_error_message, image_media_type
 from image_cache import save_image
 from external_search import CivitaiClient, DanbooruClient, GelbooruClient
 from model_families import ModelFamily, ModelFamilyRegistry, WorkflowProfileStore
@@ -164,6 +165,22 @@ def _remember_prompt_id(
 def _last_prompt_id(shared: dict, context: ContextWrapper[AstrAgentContext]) -> str:
     by_scope = shared.get("last_prompt_ids") or {}
     return str(by_scope.get(_event_scope(context)) or "")
+
+
+def _remember_image_path(shared: dict, context: ContextWrapper[AstrAgentContext], path: Path) -> None:
+    shared.setdefault("last_image_paths", {})[_event_scope(context)] = str(path)
+
+
+def _message_images(context: ContextWrapper[AstrAgentContext]) -> list[Image]:
+    event = getattr(getattr(context, "context", None), "event", None)
+    message = getattr(getattr(event, "message_obj", None), "message", None) or []
+    images: list[Image] = []
+    for component in message:
+        if isinstance(component, Image):
+            images.append(component)
+        elif isinstance(component, Reply):
+            images.extend(item for item in (component.chain or []) if isinstance(item, Image))
+    return images
 
 
 def _usage_tips_text(value: Any) -> str:
@@ -570,7 +587,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 display = str(recipe_data.get("name") or entry_name or "默认")
                 return (
                     f"生成失败：配方「{display}」还没指定主提示词节点，"
-                    "请主人在配方工作台或配置下拉框里选一下。"
+                    "请在 Workflow Studio 工作流页或配置下拉框中确认节点映射。"
                 )
             merged = dict(self._load_recipe(entry_name) or {})
             merged.pop("name", None)
@@ -766,6 +783,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
         except (OSError, ValueError) as e:
             logger.error(f"[ComfyUIDirect] 写入图片失败: {e}")
             return f"图片已生成但本地保存失败（{e}）。文件名: {filename}"
+        _remember_image_path(self.shared, context, local_path)
 
         try:
             event: AstrMessageEvent = context.context.event
@@ -1416,6 +1434,7 @@ class ComfyuiRunWorkflowTool(FunctionTool[AstrAgentContext]):
                     local_path = await asyncio.to_thread(save_image, self.output_dir, filename, content)
                 except (OSError, ValueError) as e:
                     return f"工作流执行完成但本地保存失败（{e}）。prompt_id: {pid}"
+                _remember_image_path(self.shared, context, local_path)
                 try:
                     event: AstrMessageEvent = context.context.event
                     await event.send(MessageChain().file_image(str(local_path)))
@@ -2008,10 +2027,10 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
 
 
 _DRAW_DESC = (
-    "按模型家族生成并发送图片；model_family、prompt 必填，提示词遵循家族 prompt_style。"
+    "从文字生成新图片并发送；需要修改现有图片时使用 comfyui_edit。model_family、prompt 必填，提示词遵循家族 prompt_style。"
     "省略可选参数沿用工作流。可按画风、角色、服饰或效果需求主动用 comfyui_lookup 查询并选用 LoRA；"
     "查询底模/LoRA 必须传同一 model_family，使用返回文件名和推荐权重，已知触发词填 trigger_words。"
-    "复用配方用 comfyui_recipe_draw。图片已直接发送，成功后无需再次发送。"
+    "复用配方用 comfyui_recipe_draw。成功回执包含图片本地保存路径；图片已直接发送，无需再次发送。"
 )
 
 
@@ -2249,7 +2268,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         if not slots.get("prompt"):
             return (
                 f"工作流「{workflow_name}」还没指定主提示词节点。"
-                "请主人在配方工作台确认这张工作流的槽位映射。"
+                "请在 Workflow Studio 工作流页确认这张工作流的槽位映射。"
             )
         if "model" in values and values.get("model") not in (None, "") and not slots.get("model"):
             return f"工作流「{workflow_name}」没有映射底模槽位，无法替换底模。"
@@ -2330,6 +2349,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             local_path = await asyncio.to_thread(save_image, self.output_dir, filename, content)
         except (OSError, ValueError) as e:
             return f"图片已生成但本地保存失败（{e}）。"
+        _remember_image_path(self.shared, context, local_path)
 
         actual = read_current_values(wf, slots)
         used = dict(actual)
@@ -2394,7 +2414,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             logger.error(f"[ComfyUIDirect] 图片发送失败: {e}")
             return f"图片已生成但发送失败（{e}）。路径: {local_path}"
 
-        return f"图片已发送。seed={seed} prompt_id={pid}.{saved_note}"
+        return f"图片已发送。本地路径: {local_path}\nseed={seed} prompt_id={pid}.{saved_note}"
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         prompt = str(kwargs.get("prompt") or "").strip()
@@ -2464,11 +2484,184 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         )
 
 
+_EDIT_DESC = (
+    "修改已有图片并直接发送结果。优先使用当前消息或引用消息中的图片；"
+    "没有附图时可使用本插件上次生成的图片，或在 image_path 填本插件此前返回的本地路径。"
+    "只填写修改要求和已配置的模型家族，不要猜测图片路径；成功回执包含新图片的本地保存路径。"
+)
+
+
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
+    """Upload an attached image and run a family's mapped edit workflow."""
+
+    name: str = "comfyui_edit"
+    description: str = _EDIT_DESC
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "model_family": {
+                    "type": "string",
+                    "description": "在编辑图家族中配置了工作流的家族，如 qwen",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "对来源图片的修改要求，必填",
+                },
+                "image_path": {
+                    "type": "string",
+                    "description": "可选；仅填本插件此前回执给出的本地保存路径。当前消息或引用消息附图时省略",
+                },
+                "image_index": {
+                    "type": "integer",
+                    "description": "当前或引用消息有多张图时，选择第几张（从 1 开始）",
+                },
+            },
+            "required": ["model_family", "prompt"],
+        }
+    )
+    client: ComfyUIClient | None = None
+    builder: WorkflowBuilder | None = None
+    store: RecipeStore | None = None
+    output_dir: Path | None = None
+    shared: dict = Field(default_factory=dict)
+    families: ModelFamilyRegistry | None = None
+    profiles: WorkflowProfileStore | None = None
+
+    def refresh_schema(self) -> None:
+        names = self.families.editable_names() if self.families else []
+        prop = self.parameters["properties"]["model_family"]
+        if names:
+            prop["enum"] = names
+            self.description = _EDIT_DESC + " 可编辑家族：" + "、".join(names) + "。"
+        else:
+            prop.pop("enum", None)
+            self.description = _EDIT_DESC + " 当前尚未配置编辑工作流。"
+
+    async def _source_path(self, context: ContextWrapper[AstrAgentContext], kwargs: dict) -> tuple[Path | None, str | None]:
+        requested = str(kwargs.get("image_path") or "").strip()
+        if requested:
+            try:
+                path = Path(requested).expanduser().resolve(strict=True)
+                path.relative_to(self.output_dir.resolve())
+            except (OSError, ValueError):
+                return None, "image_path 必须是本插件此前回执给出的有效本地保存路径。"
+            return (path, None) if path.is_file() else (None, "来源图片文件不存在。")
+
+        images = _message_images(context)
+        if images:
+            raw_index = kwargs.get("image_index")
+            if raw_index in (None, "") and len(images) > 1:
+                return None, f"当前消息有 {len(images)} 张图片，请用 image_index 指定其中一张。"
+            try:
+                index = int(raw_index) if raw_index not in (None, "") else 1
+            except (TypeError, ValueError):
+                return None, "image_index 必须是从 1 开始的整数。"
+            if not 1 <= index <= len(images):
+                return None, f"image_index 超出范围；当前有 {len(images)} 张图片。"
+            try:
+                path = Path(await images[index - 1].convert_to_file_path()).resolve(strict=True)
+            except Exception as e:  # noqa: BLE001 - platform media resolver may raise adapter errors
+                return None, f"无法读取消息中的图片（{e}）。"
+            return path, None
+
+        last = str((self.shared.get("last_image_paths") or {}).get(_event_scope(context)) or "")
+        if last:
+            path = Path(last)
+            if path.is_file():
+                return path, None
+        return None, "当前消息没有图片，且本会话没有可用的上次生成图片；请附图后重试。"
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        prompt = str(kwargs.get("prompt") or "").strip()
+        if not prompt:
+            return "编辑失败：prompt 不能为空。"
+        if not all((self.client, self.builder, self.store, self.output_dir, self.families)):
+            return "编辑失败：插件未初始化完成。"
+        family_name = str(kwargs.get("model_family") or "").strip()
+        family = self.families.get(family_name)
+        if family is None or not family.edit_workflow:
+            return f"编辑失败：家族「{family_name}」尚无编辑工作流；请在「编辑图家族与工作流」中选择。"
+        try:
+            wf = self.builder.load_template(family.edit_workflow)
+        except (FileNotFoundError, ValueError) as e:
+            return f"编辑失败：{e}"
+        profile = self.profiles.effective(family.edit_workflow, wf) if self.profiles else {"slots": detect_slots(wf), "drop_nodes": []}
+        slots = profile.get("slots") or {}
+        image_node = wf.get(str((slots.get("source_image") or {}).get("node") or ""))
+        if not isinstance(image_node, dict) or image_node.get("class_type") != "LoadImage":
+            return f"编辑失败：工作流「{family.edit_workflow}」缺少有效的来源图片 LoadImage 槽位映射。"
+        if not slots.get("prompt"):
+            return f"编辑失败：工作流「{family.edit_workflow}」缺少提示词槽位映射。"
+
+        source_path, source_error = await self._source_path(context, kwargs)
+        if source_error:
+            return f"编辑失败：{source_error}"
+        try:
+            if source_path.stat().st_size > 25 * 1024 * 1024:
+                return "编辑失败：来源图片超过 25 MiB。"
+            content = await asyncio.to_thread(source_path.read_bytes)
+        except OSError as e:
+            return f"编辑失败：读取来源图片失败（{e}）。"
+        suffixes = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
+        suffix = suffixes.get(image_media_type(content))
+        if not suffix:
+            return "编辑失败：来源文件需为 PNG、JPEG、WebP 或 GIF 图片。"
+        upload_name, upload_error = await self.client.upload_image(f"astrbot_edit_{uuid.uuid4().hex}{suffix}", content)
+        if upload_error or not upload_name:
+            return f"编辑失败：上传来源图片失败（{upload_error or 'ComfyUI 未返回文件名'}）。"
+
+        seed = random.randint(0, 2**31 - 1) if slots.get("sampler") or slots.get("sampler_2") else None
+        try:
+            apply_slots(
+                wf, slots, {"prompt": prompt, "source_image": upload_name, "seed": seed},
+                prefix=f"astrbot_edit_{uuid.uuid4().hex[:8]}",
+                drop_nodes=profile.get("drop_nodes") or [],
+            )
+        except (TypeError, ValueError) as e:
+            return f"编辑失败：工作流节点映射无效（{e}）。"
+        pid, submit_error = await self.client.submit_prompt_detail(wf)
+        if submit_error or not pid:
+            return f"编辑失败：{submit_error or '无法连接 ComfyUI'}"
+        _remember_prompt_id(self.shared, context, pid)
+        outputs, wait_error = await _wait_outputs(self.client, pid)
+        if wait_error:
+            return f"编辑失败：{wait_error}"
+        images = [img for output in (outputs or {}).values() for img in output.get("images", [])]
+        if not images:
+            return "编辑完成，但没有图片输出。"
+        image = next((img for img in images if img.get("type") == "output"), images[-1])
+        filename = str(image.get("filename") or "")
+        if not filename:
+            return "编辑完成，但输出图片缺少文件名。"
+        data = await self.client.download_image(filename, image.get("subfolder", ""), image_type=image.get("type", "output"))
+        if not data:
+            return f"编辑完成，但下载图片失败（{filename}）。"
+        try:
+            local_path = await asyncio.to_thread(save_image, self.output_dir, filename, data)
+        except (OSError, ValueError) as e:
+            return f"编辑完成，但保存图片失败（{e}）。"
+        _remember_image_path(self.shared, context, local_path)
+        self.store.save_history({
+            "prompt_id": pid, "entry": "edit", "family": family.name,
+            "workflow": family.edit_workflow, "prompt": prompt, "source_path": str(source_path),
+            "filename": filename, "local_path": str(local_path),
+        })
+        try:
+            event: AstrMessageEvent = context.context.event
+            await event.send(MessageChain().file_image(str(local_path)))
+        except Exception as e:
+            return f"图片已编辑但发送失败（{e}）。本地路径: {local_path}"
+        seed_note = f"seed={seed} " if seed is not None else ""
+        return f"图片已编辑并发送。本地路径: {local_path}\n{seed_note}prompt_id={pid}"
+
+
 _RECIPE_DRAW_DESC = (
-    "使用已经实验并保存好的配方快捷生图，完成后直接发送到当前会话。"
+    "使用已经实验并保存好的配方快捷生成新图片，完成后直接发送到当前会话；修改现有图片使用 comfyui_edit。"
     "prompt 必填，recipe 在用户点名配方时填写；省略 recipe 使用配置的默认配方。"
     "配方保存底模、LoRA、画幅和采样参数，并通过 model family 使用当前配置的工作流。"
-    "本工具用于复用固定方案；需要自由选择底模、LoRA 或采样参数时调用 comfyui_draw。"
+    "本工具用于复用固定方案；需要自由选择底模、LoRA 或采样参数时调用 comfyui_draw。成功回执包含本地保存路径。"
 )
 
 
@@ -2518,7 +2711,7 @@ class ComfyuiRecipeDrawTool(FunctionTool[AstrAgentContext]):
             prop["description"] = "用户点名时从 enum 选择；省略用默认配方"
         else:
             prop.pop("enum", None)
-            prop["description"] = "当前没有配方，请先在配方工作台保存"
+            prop["description"] = "当前没有配方，请先在 Workflow Studio 静态配方页保存"
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         prompt = str(kwargs.get("prompt") or "").strip()
@@ -2532,7 +2725,7 @@ class ComfyuiRecipeDrawTool(FunctionTool[AstrAgentContext]):
         if recipe is None:
             if recipe_name:
                 return f"生成失败：配方「{recipe_name}」不存在。"
-            return "生成失败：还没有可用配方，请先在配方工作台保存一套。"
+            return "生成失败：还没有可用配方，请先在 Workflow Studio 静态配方页保存一套。"
 
         family = self.families.resolve_recipe(recipe)
         explicit_family = str(recipe.get("family") or "").strip()
@@ -2555,7 +2748,7 @@ class ComfyuiRecipeDrawTool(FunctionTool[AstrAgentContext]):
             if not legacy_workflow:
                 return (
                     f"生成失败：配方「{recipe.get('name')}」没有模型家族。"
-                    "请在配方工作台为它选择家族后重新保存。"
+                    "请在 Workflow Studio 静态配方页为它选择家族后重新保存。"
                 )
 
         seed = kwargs.get("seed")

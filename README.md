@@ -18,7 +18,7 @@
 
 ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的生图插件。
 
-先在配方工作台导入 ComfyUI 工作流，再到插件配置添加“模型家族”并为它选择工作流。LLM 调用 `comfyui_draw` 时填写模型家族，插件便会走对应工作流自由生图。
+先在 Workflow Studio 工作流页导入 ComfyUI 工作流，再为已有模型家族绑定生图或编辑图用途。LLM 调用 `comfyui_draw` 时填写模型家族，插件便会走对应工作流自由生图。
 
 调试出满意的底模、LoRA、画幅和采样参数后，可以另存为配方。`comfyui_recipe_draw` 只需配方名和本次提示词，即可快捷复用整套参数。配方引用模型家族；工作流选择和节点槽位由家族及工作流档案统一管理，因此更换家族工作流无需逐份修改配方。
 
@@ -30,7 +30,7 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 |:---|:---|
 | **按模型家族自由生图** | LLM 填写家族名，插件自动选择工作流；底模、LoRA、画幅和采样参数可自由调整 |
 | **配方快捷生图** | 输入配方名和本次提示词，复用实验好的模型、LoRA 和采样参数 |
-| **配方工作台** | 导入工作流、保存共享槽位映射、编辑配方并试画 |
+| **Workflow Studio** | 分别管理工作流 JSON、家族绑定与节点映射，以及静态配方和试画 |
 | **查一下再画** | 角色、画师、底模、LoRA 不确定时先查短列表；LoRA 支持 style / character 等分类 |
 
 ## 图片缓存与清理
@@ -47,7 +47,7 @@ Bot 生图、原始工作流执行、输出下载和工作台试画统一将原�
 
 ## 生图上下文与工作流适配
 
-默认 `llm_tool_mode=basic` 只启用自由生图、配方生图和查询三个工具。工具描述去除重复的配方目录与枚举说明；家族目录始终提供 `prompt_style` 并限制用途说明长度。生成成功仅回传发送状态、种子和任务 ID，完整参数继续保存到生成历史。配方生图只需提示词及可选配方名，可减少重复生成模型、LoRA 和采样参数。
+默认 `llm_tool_mode=basic` 启用自由生图、配方生图和查询；配置编辑工作流后也启用图片编辑。家族目录提供 `prompt_style`。生成与编辑成功回执包含发送状态、本地保存路径和任务 ID，完整参数继续保存到生成历史。配方生图只需提示词及可选配方名。
 
 已配置或保存的工作流映射直接使用，自动检测仅作为无映射时的回退。主提示词节点失效时会提示重新确认映射，避免消耗一次无效生成。图片返回优先选择最终 output；仅有 PreviewImage 等预览输出时使用其真实 type 与 subfolder 下载。
 
@@ -65,22 +65,24 @@ Bot 生图、原始工作流执行、输出下载和工作台试画统一将原�
 
 ### 3. 添加模型家族
 
-先在「配方工作台」导入工作流 JSON。随后打开插件配置，在“模型家族与工作流”中添加一条记录：
+先在 Workflow Studio 导入工作流 JSON。随后在插件配置的“生图家族与工作流”中添加家族：
 
 - `name`：暴露给 LLM 的家族名，例如 `anima`、`krea2`、`flux`
 - `workflow`：这个家族使用的工作流
 - `prompt_style`：`danbooru`、`natural` 或 `auto`
 - `description`：适用画面或用途，会随家族清单提供给 LLM
 
-保存配置并重载插件。每个家族名必须唯一；多个家族可以选择同一张工作流。
+需要图片编辑时，在“编辑图家族与工作流”添加记录，从已有生图家族和已导入的编辑工作流中分别选择。已有家族也可以直接在 Workflow Studio 的工作流页绑定生图或编辑图工作流、修改 API JSON、独立保存节点映射。工作流、家族和默认配方等选择框由本地插件数据填充；配置页仍保留按工作流的节点下拉与通用手填条目。在工作台导入新工作流后重新打开配置页即可看到新选项。若生图家族也是刚添加的，先保存并重载插件，再到编辑图家族下拉框选择它。每个生图家族名必须唯一；多个家族可以选择同一张工作流。
 
-### 4. 确认槽位并保存配方
+Qwen 图片编辑：先在 Workflow Studio 工作流页从 ComfyUI 成功任务的历史导入编辑工作流（API 格式），再绑定家族 `qwen` 与导入的模板。智能识别会沿最终编辑分支选提示词、采样、模型及来源图片；多条编辑分支或多个来源图片无法唯一判定时留空。旧档案可点「重新识别」查看新建议，核对后点「保存映射」；配置页手动映射始终优先。确认「用户要画的内容」指向 `TextEncodeQwenImageEdit`，「编辑来源图片」指向该分支的 `LoadImage`。当前消息或引用消息附图时，`comfyui_edit` 会自动上传图片并替换 `LoadImage.image`；也可以使用本插件此前回执中的本地图片路径。图片和文字生成分别使用 `comfyui_edit` 与 `comfyui_draw`。旧配置中保留的 `model_families[].edit_workflow` 仍可用，新“编辑图家族”记录优先。
 
-打开插件页面「配方工作台」：
+### 4. 分别保存工作流与配方
 
-1. 选择模型家族，确认该家族工作流的 **用户要画的内容**、**出图采样** 等槽位。槽位属于工作流，同一工作流的所有配方共用。
-2. 填写实验好的底模、LoRA、画幅和采样参数，起一个配方名并保存。配方文件只记录家族与参数。
-3. 在右侧输入本次提示词试画。每次生成会使用新种子，除非明确指定。
+打开插件页面 Workflow Studio：
+
+1. 在**工作流**页选择模板和生图/编辑图用途，绑定已有家族；需要时修改 API JSON。确认 **用户要画的内容**、**编辑来源图片**、**出图采样** 等槽位，点「保存映射」。槽位归工作流所有。
+2. 在**静态配方**页选择家族，填写底模、LoRA、画幅和采样参数，起名并保存。配方文件只记录家族与参数；导入、编辑、绑定工作流及保存节点映射均不会改写配方。只有显式旧版默认参数的首次迁移可能自动创建一条兼容配方。
+3. 在右侧使用已保存的配方试画。表单有新修改时先保存配方，再试画已保存的参数。
 
 然后就可以对机器人说：
 
@@ -105,12 +107,13 @@ Bot 生图、原始工作流执行、输出下载和工作台试画统一将原�
 | `comfyui_timeout` | `300` | 生成等待超时（秒） |
 | `model_cache_ttl` | `600` | 模型清单缓存刷新间隔（秒），0 表示每次强制同步 |
 | `lora_manager_enabled` | `true` | 复用 ComfyUI LoRA Manager 的分类、标签、用途说明、推荐权重和触发词；未安装时自动跳过 |
-| `model_families` | `anima → anima-v3` | 可重复添加的家族配置；包含家族名、工作流、提示词风格和说明 |
+| `model_families` | `anima → anima-v3` | 生图家族配置；工作流可从本地已导入模板下拉选择 |
+| `edit_families` | 空 | 编辑图家族配置；选择已有家族和本地编辑工作流，配置后启用 `comfyui_edit` |
 | `workflow_node_mappings` | 空 | 可重复添加的工作流节点映射；填写各槽位的节点 ID，优先于 Workflow Studio 档案和自动检测 |
 | `default_recipe` | `默认` | 用户只说「画一张」时用的配方；在工作台配方列表点「设为默认」自动写入，也可直接填配方名 |
-| `llm_tool_mode` | `basic` | `basic` 暴露自由生图、配方生图和查询；`full` 打开诊断工具 |
+| `llm_tool_mode` | `basic` | `basic` 暴露自由生图、图片编辑（已配置时）、配方生图和查询；`full` 打开诊断工具 |
 | `allow_llm_unsafe_tools` | `false` | 是否允许 LLM 执行任意工作流、读取本地图片上传、释放显存和删除配方；默认关闭 |
-| `default_workflow` / `node_slots` | 旧版兼容 | `model_families` 为空时使用；新版槽位在配方工作台按工作流保存 |
+| `default_workflow` / `node_slots` | 旧版兼容 | `model_families` 为空时使用；新版槽位在 Workflow Studio 工作流页按工作流保存 |
 | `danbooru_base_url` | `https://danbooru.donmai.us` | danbooru 接口地址（国内可换镜像） |
 | `gelbooru_base_url` | `https://gelbooru.com` | gelbooru DAPI 地址（镜像可换） |
 | `civitai_api_key` | 空 | civitai API Key（可选，以你的身份调用） |
@@ -137,11 +140,12 @@ Bot 生图、原始工作流执行、输出下载和工作台试画统一将原�
 
 ## 🤖 LLM 工具
 
-默认 `llm_tool_mode=basic` 启用以下三个工具：
+默认 `llm_tool_mode=basic` 启用以下工具；`comfyui_edit` 仅在至少一个家族配置 `edit_workflow` 后启用：
 
 | 工具 | 说明 |
 |:---|:---|
 | `comfyui_draw` | 自由生图；必填 `model_family` 和 `prompt`，按家族选择工作流，可自由填写底模、LoRA、尺寸与采样参数，并可另存配方 |
+| `comfyui_edit` | 修改当前或引用消息中的图片；无附图时可用本插件上次生成的图片，成功回执给出本地保存路径 |
 | `comfyui_recipe_draw` | 快捷配方生图；填写本次 `prompt`，可选 `recipe`、`size` 和 `seed`，其余参数来自配方 |
 | `comfyui_lookup` | 查询角色 / 画师规范词，以及底模 / LoRA 文件名；支持按 LoRA 分类、标签、用途挑选，并返回用途说明、推荐权重和触发词 |
 
@@ -195,16 +199,16 @@ LoRA 查询同时支持文件名、分类、标签和用途关键词。在线元
 
 ## 🖥️ WebUI：Workflow Studio
 
-AstrBot Dashboard → 插件页 → **Workflow Studio**，复刻 ComfyUI 风格的节点画布：
+AstrBot Dashboard → 插件页 → **Workflow Studio**，分为工作流与静态配方两页：
 
-- 导入和管理工作流模板，并按工作流保存共享槽位映射
-- 从已配置的模型家族中选择配方适用范围
-- 编辑底模、LoRA、画幅与采样参数，直接试跑并从历史另存配方
+- 工作流页导入、编辑 API JSON、绑定生图/编辑图家族，并独立保存共享槽位映射
+- 配方页只保存家族与底模、LoRA、画幅、采样等静态参数
+- 从已保存配方试跑，并从历史另存新配方
 - 配方列表一键「设为默认」，机器人只说「画一张」时即用这套
 - 模型选择：UNET / LoRA / CLIP / VAE 下拉来自自动同步清单
-- 连接状态灯 + 模型清单侧栏 + 「▶ 试跑」：直接提交画布生成，结果内联预览，可一键中断
+- 连接状态灯 + 「配方试画」：按已保存配方生成，结果内联预览，可一键中断
 
-后端接口（`webapi.py`）：`workflows` / `workflow` / `workflow/profile` / `workflow/delete` / `recipes` / `recipe/save` / `status` / `generate`。
+后端接口（`webapi.py`）：`workflows` / `workflow` / `workflow/import` / `workflow/profile` / `workflow/bind` / `workflow/delete` / `recipes` / `recipe/save` / `status` / `generate`。
 
 ## ⚠️ 注意事项
 

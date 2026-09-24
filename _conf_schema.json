@@ -70,7 +70,7 @@
             "type": "string",
             "default": "",
             "invisible": true,
-            "hint": "旧配置兼容；新配置请使用下方的编辑图家族列表"
+            "hint": "旧配置兼容；新配置请使用独立编辑工作流路由"
           },
           "prompt_style": {
             "type": "string",
@@ -105,10 +105,43 @@
       }
     ]
   },
+  "edit_workflows": {
+    "type": "template_list",
+    "description": "独立编辑工作流路由",
+    "hint": "编辑工作流独立于生图家族。每条记录为 LLM 提供一个 edit_workflow 名称，并选择本地导入的工作流；也可在 Workflow Studio 的工作流页创建和绑定。",
+    "obvious_hint": true,
+    "templates": {
+      "edit_workflow": {
+        "name": "编辑工作流",
+        "items": {
+          "name": {
+            "type": "string",
+            "description": "编辑路由名",
+            "default": "",
+            "hint": "暴露给 LLM 的独立编辑路由名，例如 qwen-edit；无需在生图家族中创建同名项"
+          },
+          "workflow": {
+            "type": "string",
+            "description": "编辑工作流",
+            "default": "",
+            "hint": "从本地已导入工作流中选择；需包含来源图片 LoadImage 和编辑提示词节点"
+          },
+          "description": {
+            "type": "string",
+            "description": "路由说明",
+            "default": "",
+            "hint": "说明这条编辑工作流适合哪些编辑任务，帮助 LLM 在多个路由中选择"
+          }
+        }
+      }
+    },
+    "default": []
+  },
   "edit_families": {
     "type": "template_list",
-    "description": "编辑图家族与工作流",
-    "hint": "为上方已有的生图家族选择图片编辑工作流。先在 Workflow Studio 工作流页导入成功的编辑工作流，再在这里选择；修改后重载插件生效。",
+    "description": "旧版编辑图家族配置（兼容）",
+    "invisible": true,
+    "hint": "旧版配置兼容项。新配置请使用独立编辑工作流路由。",
     "obvious_hint": true,
     "templates": {
       "edit_family": {
@@ -241,7 +274,7 @@
       "基础（画图 + 查词）",
       "完整（开放诊断工具）"
     ],
-    "hint": "basic 暴露 comfyui_draw / comfyui_recipe_draw / comfyui_lookup；配置编辑图家族后还会暴露 comfyui_edit。full 额外开放队列、任务、模型信息等诊断工具，其中高风险工具仍需打开下方开关"
+    "hint": "basic 暴露 comfyui_draw / comfyui_recipe_draw / comfyui_lookup；配置独立编辑工作流后还会暴露 comfyui_edit。full 额外开放队列、任务、模型信息等诊断工具，其中高风险工具仍需打开下方开关"
   },
   "allow_llm_unsafe_tools": {
     "type": "bool",

@@ -42,14 +42,22 @@ def refresh_config_options(config: Any, builder: Any, store: Any) -> None:
     workflows = sorted({str(row.get("name") or "") for row in templates if row.get("name")})
     generation = _rows(config.get("model_families"))
     editing = _rows(config.get("edit_families"))
+    edit_workflows = _rows(config.get("edit_workflows"))
     mappings = _rows(config.get("workflow_node_mappings"))
     family_names = sorted({str(row.get("name") or "").strip() for row in generation if row.get("name")})
 
     family_items = schema["model_families"]["templates"]["family"]["items"]
     edit_items = schema["edit_families"]["templates"]["edit_family"]["items"]
+    edit_workflow_items = schema["edit_workflows"]["templates"]["edit_workflow"]["items"]
     mapping_items = schema["workflow_node_mappings"]["templates"]["mapping"]["items"]
     _select_options(family_items["workflow"], workflows, [r.get("workflow") for r in generation])
     _select_options(edit_items["workflow"], workflows, [r.get("workflow") for r in editing], optional=True)
+    _select_options(
+        edit_workflow_items["workflow"],
+        workflows,
+        [r.get("workflow") for r in edit_workflows],
+        optional=True,
+    )
     _select_options(mapping_items["workflow"], workflows, [r.get("workflow") for r in mappings])
 
     mapping_templates = schema["workflow_node_mappings"]["templates"]

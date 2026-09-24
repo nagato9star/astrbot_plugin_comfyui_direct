@@ -84,7 +84,7 @@ h3 { font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: 
 .workflow-title > span:first-child { color: var(--dim); font-size: 11px; letter-spacing: .08em; }
 .workflow-title strong { font-size: 16px; letter-spacing: .02em; }
 .workflow-source { color: var(--accent-2); font-size: 11px; }
-.workflow-routing { display: grid; grid-template-columns: minmax(120px, 150px) minmax(180px, 1fr) auto auto; gap: 8px; align-items: end; }
+.workflow-routing { display: grid; grid-template-columns: minmax(120px, 150px) minmax(160px, 1fr) minmax(160px, 1fr) auto auto; gap: 8px; align-items: end; }
 .workflow-routing button { min-height: 30px; }
 .workflow-card .hint { margin-bottom: 0; }
 .workflow-json-editor { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }

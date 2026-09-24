@@ -1184,6 +1184,104 @@ def test_api_to_ui_linked_widget_positions() -> None:
     print("  api to ui linked widget positions OK")
 
 
+def test_api_to_ui_composite_node_ids() -> None:
+    api = {
+        "13": {"class_type": "ResolutionSelector", "inputs": {"aspect_ratio": "1:1 (Square)"}},
+        "459:470": {"class_type": "LoadImage", "inputs": {"image": "source.png"}},
+        "459:474": {"class_type": "TextEncodeQwenImage21", "inputs": {"images.image_1": ["459:470", 0]}},
+        "461": {"class_type": "SaveImageAdvanced", "inputs": {"images": ["459:474", 0]}},
+    }
+    snapshot = api_to_ui(api)
+    nodes = snapshot["nodes"]
+    node_ids = {node["id"] for node in nodes}
+    assert len(nodes) == len(api)
+    assert len(node_ids) == len(api) and all(isinstance(node_id, int) for node_id in node_ids)
+    by_type = {node["type"]: node for node in nodes}
+    assert set(by_type) == {"ResolutionSelector", "LoadImage", "TextEncodeQwenImage21", "SaveImageAdvanced"}
+    assert len(snapshot["links"]) == 2
+    assert {link[1] for link in snapshot["links"]}.issubset(node_ids)
+    assert {link[3] for link in snapshot["links"]}.issubset(node_ids)
+    type_by_id = {node["id"]: node["type"] for node in nodes}
+    assert {(type_by_id[link[1]], type_by_id[link[3]]) for link in snapshot["links"]} == {
+        ("LoadImage", "TextEncodeQwenImage21"),
+        ("TextEncodeQwenImage21", "SaveImageAdvanced"),
+    }
+    print("  api to ui retained composite subgraph nodes / links OK")
+
+
+def test_api_to_ui_qwen_combined_prompt_outputs() -> None:
+    api = {
+        "459:11": {"class_type": "LoadImage", "inputs": {"image": "source.png"}},
+        "459:19": {
+            "class_type": "TextEncodeQwenImage21",
+            "inputs": {
+                "prompt": "positive prompt",
+                "negative_prompt": "negative prompt",
+                "images.image_1": ["459:11", 0],
+            },
+        },
+        "6": {
+            "class_type": "XB_ROCmKSampler",
+            "inputs": {
+                "positive": ["459:19", 0],
+                "negative": ["459:19", 1],
+                "latent": ["459:19", 2],
+            },
+        },
+        "8": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0]}},
+        "18": {"class_type": "SaveImage", "inputs": {"images": ["8", 0]}},
+    }
+    object_info = {
+        "LoadImage": {
+            "input": {"required": {"image": [["source.png"]]}},
+            "output": ["IMAGE"],
+            "output_name": ["IMAGE"],
+        },
+        "TextEncodeQwenImage21": {
+            "input": {
+                "required": {
+                    "prompt": ["STRING", {}],
+                    "negative_prompt": ["STRING", {}],
+                    "images.image_1": ["IMAGE"],
+                }
+            },
+            "input_order": {"required": ["prompt", "negative_prompt", "images.image_1"]},
+            "output": ["CONDITIONING", "CONDITIONING", "LATENT"],
+            "output_name": ["positive", "negative", "latent"],
+        },
+        "XB_ROCmKSampler": {
+            "input": {"required": {
+                "positive": ["CONDITIONING"],
+                "negative": ["CONDITIONING"],
+                "latent": ["LATENT"],
+            }},
+            "input_order": {"required": ["positive", "negative", "latent"]},
+            "output": ["LATENT"],
+            "output_name": ["LATENT"],
+        },
+        "VAEDecode": {
+            "input": {"required": {"samples": ["LATENT"]}},
+            "output": ["IMAGE"],
+            "output_name": ["IMAGE"],
+        },
+        "SaveImage": {"input": {"required": {"images": ["IMAGE"]}}},
+    }
+    snapshot = api_to_ui(api, object_info)
+    by_type = {node["type"]: node for node in snapshot["nodes"]}
+    encoder = by_type["TextEncodeQwenImage21"]
+    assert encoder["widgets_values"] == ["positive prompt", "negative prompt"]
+    assert [output["name"] for output in encoder["outputs"]] == ["positive", "negative", "latent"]
+    assert sum(node["type"] == "TextEncodeQwenImage21" for node in snapshot["nodes"]) == 1
+
+    sampler = by_type["XB_ROCmKSampler"]
+    links_by_id = {link[0]: link for link in snapshot["links"]}
+    for field, output_index in (("positive", 0), ("negative", 1)):
+        sampler_input = next(item for item in sampler["inputs"] if item["name"] == field)
+        link = links_by_id[sampler_input["link"]]
+        assert link[1] == encoder["id"] and link[2] == output_index
+    print("  api to ui retained combined Qwen prompt fields / outputs OK")
+
+
 def test_xb_sampler_seed_control_snapshot() -> None:
     """XB legacy aliases need a seed-control widget absent from /object_info."""
     normal_inputs = {
@@ -2022,6 +2120,8 @@ def main() -> None:
     test_ui_to_api_retained_widgets_and_power_lora()
     test_ui_import_prunes_unavailable_orphans()
     test_api_to_ui_linked_widget_positions()
+    test_api_to_ui_composite_node_ids()
+    test_api_to_ui_qwen_combined_prompt_outputs()
     test_xb_sampler_seed_control_snapshot()
     test_workflow_build()
     test_defaults_precedence()

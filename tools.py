@@ -222,31 +222,6 @@ def _message_images(context: ContextWrapper[AstrAgentContext]) -> list[Image]:
     return images
 
 
-def _context_message_images(context: ContextWrapper[AstrAgentContext]) -> list[Image]:
-    """Recover images already resolved into the current Agent user message."""
-    for message in reversed(getattr(context, "messages", None) or []):
-        role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
-        if role != "user":
-            continue
-        content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
-        images: list[Image] = []
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict):
-                    part_type = part.get("type")
-                    image_url = part.get("image_url")
-                else:
-                    part_type = getattr(part, "type", None)
-                    image_url = getattr(part, "image_url", None)
-                if part_type != "image_url":
-                    continue
-                url = image_url.get("url") if isinstance(image_url, dict) else getattr(image_url, "url", None)
-                if isinstance(url, str) and url:
-                    images.append(Image(file=url))
-        return images
-    return []
-
-
 def _usage_tips_text(value: Any) -> str:
     if isinstance(value, str):
         try:
@@ -2731,7 +2706,7 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         if raw_paths:
             return resolve_allowed_paths(raw_paths)
 
-        images = _message_images(context) or _context_message_images(context)
+        images = _message_images(context)
         if images:
             raw_indices = kwargs.get("image_indices")
             raw_index = kwargs.get("image_index")

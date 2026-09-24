@@ -57,6 +57,7 @@ from slot_mapping import (
     parse_lora,
     read_current_values,
     resolve_size,
+    source_image_slots,
 )
 from resource_catalog import (
     canonical_family, exact_matches, family_summary, filter_family, metadata_for,
@@ -161,7 +162,10 @@ def _custom_edit_canvas_dimensions(
             width = int(round(height * source_width / source_height / 8) * 8)
         if height is None:
             height = int(round(width * source_height / source_width / 8) * 8)
-    return max(8, int(round(width / 8) * 8)), max(8, int(round(height / 8) * 8))
+    width, height = max(8, int(round(width / 8) * 8)), max(8, int(round(height / 8) * 8))
+    if not (64 <= width <= 8192 and 64 <= height <= 8192):
+        raise ValueError("推算后的画布宽高需在 64 到 8192 之间，请同时指定 width 和 height")
+    return width, height
 
 
 def _event_scope(context: ContextWrapper[AstrAgentContext]) -> str:
@@ -216,6 +220,31 @@ def _message_images(context: ContextWrapper[AstrAgentContext]) -> list[Image]:
         elif isinstance(component, Reply):
             images.extend(item for item in (component.chain or []) if isinstance(item, Image))
     return images
+
+
+def _context_message_images(context: ContextWrapper[AstrAgentContext]) -> list[Image]:
+    """Recover images already resolved into the current Agent user message."""
+    for message in reversed(getattr(context, "messages", None) or []):
+        role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+        if role != "user":
+            continue
+        content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+        images: list[Image] = []
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    part_type = part.get("type")
+                    image_url = part.get("image_url")
+                else:
+                    part_type = getattr(part, "type", None)
+                    image_url = getattr(part, "image_url", None)
+                if part_type != "image_url":
+                    continue
+                url = image_url.get("url") if isinstance(image_url, dict) else getattr(image_url, "url", None)
+                if isinstance(url, str) and url:
+                    images.append(Image(file=url))
+        return images
+    return []
 
 
 def _usage_tips_text(value: Any) -> str:
@@ -2665,6 +2694,8 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
             raw_paths = [path.strip() for path in requested_many if path.strip()]
         elif requested_single:
             raw_paths = [requested_single]
+        if requested_many is not None and not raw_paths:
+            return None, "image_paths 不能为空，请提供明确图片路径。"
 
         def resolve_allowed_paths(values: list[str]) -> tuple[list[Path] | None, str | None]:
             resolved: list[Path] = []
@@ -2679,7 +2710,7 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
                 try:
                     path = Path(value).expanduser().resolve(strict=True)
                 except (OSError, ValueError):
-                    return None, "来源路径无法读取；请确认它是插件输出或 AstrBot 临时媒体目录中的图片。"
+                    return None, "image_path/image_paths 无法读取；请确认路径有效。"
                 allowed = False
                 for root in roots:
                     try:
@@ -2689,7 +2720,7 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
                     except ValueError:
                         continue
                 if not allowed:
-                    return None, "来源路径仅支持本插件输出目录或 AstrBot data/temp 中的文件。"
+                    return None, "image_path/image_paths 仅支持本插件输出目录或 AstrBot data/temp 中的文件。"
                 if not path.is_file():
                     return None, "来源图片文件不存在。"
                 resolved.append(path)
@@ -2700,7 +2731,7 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         if raw_paths:
             return resolve_allowed_paths(raw_paths)
 
-        images = _message_images(context)
+        images = _message_images(context) or _context_message_images(context)
         if images:
             raw_indices = kwargs.get("image_indices")
             raw_index = kwargs.get("image_index")
@@ -2711,17 +2742,21 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
                 if not isinstance(raw_indices, list) or not raw_indices:
                     return None, "image_indices 必须是非空的 1-based 图片序号数组。"
                 try:
-                    indices = [int(index) for index in raw_indices]
+                    if any(isinstance(index, bool) for index in raw_indices):
+                        raise ValueError("boolean index")
+                    indices = [int(_number(index, "image_indices", integer=True, minimum=1)) for index in raw_indices]
                 except (TypeError, ValueError):
                     return None, "image_indices 必须只包含整数。"
             elif raw_index not in (None, ""):
                 try:
-                    indices = [int(raw_index)]
+                    if isinstance(raw_index, bool):
+                        raise ValueError("boolean index")
+                    indices = [int(_number(raw_index, "image_index", integer=True, minimum=1))]
                 except (TypeError, ValueError):
                     return None, "image_index 必须是从 1 开始的整数。"
             else:
                 if len(images) > max_inputs:
-                    return None, f"当前消息有 {len(images)} 张图片，但工作流只有 {max_inputs} 个参考图输入；请用 image_indices 选择。"
+                    return None, f"当前消息有 {len(images)} 张图片，但工作流只有 {max_inputs} 个参考图输入；请用 image_index 或 image_indices 选择。"
                 indices = list(range(1, len(images) + 1))
 
             if len(indices) > max_inputs:
@@ -2737,6 +2772,8 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
                     return None, f"无法读取第 {index} 张消息图片（{e}）。"
             return paths, None
 
+        if kwargs.get("image_index") is not None or kwargs.get("image_indices") is not None:
+            return None, "当前消息及引用消息没有可读取图片，image_index/image_indices 无法选择；请使用 image_path/image_paths。"
         last = str((self.shared.get("last_image_paths") or {}).get(_event_scope(context)) or "")
         if last and Path(last).is_file():
             return [Path(last)], None
@@ -2774,24 +2811,21 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
             return f"编辑失败：{e}"
         profile = self.profiles.effective(edit_route.workflow, wf) if self.profiles else {"slots": detect_slots(wf), "drop_nodes": []}
         slots = profile.get("slots") or {}
-        source_specs = [
-            dict(spec) for spec in (slots.get("source_images") or []) if isinstance(spec, dict)
-        ]
-        single_source = slots.get("source_image")
-        if isinstance(single_source, dict):
-            if source_specs:
-                source_specs[0] = dict(single_source)
-            else:
-                source_specs = [dict(single_source)]
-        source_specs = [
-            spec for spec in source_specs
-            if isinstance(wf.get(str(spec.get("node") or "")), dict)
-            and wf[str(spec.get("node"))].get("class_type") == "LoadImage"
-        ]
+        try:
+            source_specs = source_image_slots(wf, slots)
+        except ValueError as e:
+            return f"编辑失败：{e}。"
         if not source_specs:
             return f"编辑失败：工作流「{edit_route.workflow}」缺少有效的来源图片 LoadImage 槽位映射。"
         if not slots.get("prompt"):
             return f"编辑失败：工作流「{edit_route.workflow}」缺少提示词槽位映射。"
+        size_node = wf.get(str((slots.get("size") or {}).get("node") or ""))
+        size_inputs = (size_node or {}).get("inputs") or {}
+        size_has_dimensions = (
+            isinstance(size_node, dict)
+            and "width" in size_inputs
+            and "height" in size_inputs
+        )
 
         resolution = kwargs.get("resolution")
         resolution_provided = resolution not in (None, "")
@@ -2807,6 +2841,8 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         width, height = kwargs.get("width"), kwargs.get("height")
         width_provided = width not in (None, "")
         height_provided = height not in (None, "")
+        width = width if width_provided else None
+        height = height if height_provided else None
         if width_provided:
             if isinstance(width, bool):
                 return "编辑失败：width 必须是 64 到 8192 之间的整数。"
@@ -2824,9 +2860,9 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         dimensions_provided = width_provided or height_provided
         if resolution_provided and dimensions_provided:
             return "编辑失败：resolution 与 width/height 是两种画布设置方式，请只选一种。"
-        if resolution_provided and not slots.get("resolution") and not slots.get("size"):
+        if resolution_provided and not slots.get("resolution") and not size_has_dimensions:
             return "编辑失败：此工作流尚未映射 resolution 输入或画面大小节点；请映射 resolution 或 EmptyLatentImage.width/height。"
-        if dimensions_provided and not slots.get("size"):
+        if dimensions_provided and not size_has_dimensions:
             return "编辑失败：此工作流尚未映射画面大小节点，无法写入 width/height。"
         custom_size = kwargs.get("custom_size")
         if custom_size is not None:
@@ -2856,22 +2892,18 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
             suffix = suffixes.get(image_media_type(content))
             if not suffix:
                 return "编辑失败：来源文件需为 PNG、JPEG、WebP 或 GIF 图片。"
-            upload_name, upload_error = await self.client.upload_image(
-                f"astrbot_edit_{index}_{uuid.uuid4().hex}{suffix}", content,
-            )
-            if upload_error or not upload_name:
-                return f"编辑失败：上传第 {index} 张来源图片失败（{upload_error or 'ComfyUI 未返回文件名'}）。"
-            uploads.append(upload_name)
+            uploads.append(f"astrbot_edit_{index}_{uuid.uuid4().hex}{suffix}")
         if resolution_provided:
             effective_resolution = resolution
         elif dimensions_provided:
             effective_resolution = 0
-        elif custom_size is True:
-            effective_resolution = 1024
         else:
             effective_resolution = 0
         canvas_dimensions = None
-        if slots.get("size"):
+        needs_canvas = dimensions_provided or (
+            resolution_provided and (custom_size is True or not slots.get("resolution"))
+        ) or not (slots.get("resolution") or slots.get("custom_size"))
+        if size_has_dimensions and needs_canvas:
             source_dimensions = image_dimensions(contents[0])
             if dimensions_provided:
                 try:
@@ -2885,7 +2917,10 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
                     return "编辑失败：无法读取来源图片宽高，不能按参考图比例设置画布。"
                 canvas_dimensions = _edit_canvas_dimensions(*source_dimensions, int(effective_resolution))
         effective_custom_size = custom_size
-        if dimensions_provided and effective_custom_size is None and slots.get("custom_size"):
+        if (
+            effective_custom_size is None and slots.get("custom_size")
+            and (dimensions_provided or (resolution_provided and not slots.get("resolution")))
+        ):
             effective_custom_size = True
         seed = random.randint(0, 2**31 - 1) if slots.get("sampler") or slots.get("sampler_2") else None
         apply_values = {"prompt": prompt, "seed": seed}
@@ -2909,6 +2944,12 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
             )
         except (TypeError, ValueError) as e:
             return f"编辑失败：工作流节点映射无效（{e}）。"
+        for index, (filename, content) in enumerate(zip(uploads, contents)):
+            upload_name, upload_error = await self.client.upload_image(filename, content)
+            if upload_error or not upload_name:
+                return f"编辑失败：上传第 {index + 1} 张来源图片失败（{upload_error or 'ComfyUI 未返回文件名'}）。"
+            uploads[index] = upload_name
+        apply_slots(wf, slots, {"source_images": uploads})
         pid, submit_error = await self.client.submit_prompt_detail(wf)
         if submit_error or not pid:
             return f"编辑失败：{submit_error or '无法连接 ComfyUI'}"
@@ -2944,7 +2985,12 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         except Exception as e:
             return f"图片已编辑但发送失败（{e}）。本地路径: {local_path}"
         seed_note = f"seed={seed} " if seed is not None else ""
-        image_note = f" 使用参考图 {len(uploads)} 张。" if len(uploads) > 1 else ""
+        image_note = ""
+        if len(source_specs) > 1:
+            image_note = (
+                f" 已填入 {len(uploads)}/{len(source_specs)} 个参考图输入；"
+                "其余输入沿用工作流默认值。"
+            )
         return f"图片已编辑并发送。本地路径: {local_path}\n{seed_note}prompt_id={pid}.{image_note}"
 
 

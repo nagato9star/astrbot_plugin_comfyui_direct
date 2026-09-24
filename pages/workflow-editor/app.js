@@ -1,7 +1,7 @@
 const SLOT_FALLBACK = [
   { id: "prompt", label: "用户要画的内容", help: "必选", basic: true },
   { id: "source_image", label: "编辑来源图片", help: "图片编辑工作流中的 LoadImage 节点", basic: false },
-  { id: "source_images", label: "编辑参考图输入（多选）", help: "多选 LoadImage 节点，按列表顺序对应 images.image_1、images.image_2 等输入", basic: false },
+  { id: "source_images", label: "编辑参考图输入（多选）", help: "按节点列表顺序填入所选图片；行内标记显示节点连接的 Qwen 输入口，可用上/下调整图片对应关系", basic: false },
   { id: "resolution", label: "编辑输出分辨率", help: "Qwen Image 2.1 编辑 resolution 输入；0 保留参考图尺寸", basic: false },
   { id: "custom_size", label: "编辑自定义画布", help: "custom_size 开关；启用后使用分辨率选择器画布", basic: false },
   { id: "model", label: "底模", help: "", basic: true },
@@ -193,25 +193,72 @@ function renderSlotSelect(role, parent) {
   const current = slotNode(role.id);
   const options = state.slotOptions[role.id] || [""];
   if (role.id === "source_images") {
-    const selectedNodes = Array.isArray(current) ? current : [];
-    sel.multiple = true;
-    sel.size = Math.min(5, Math.max(2, options.length - 1));
-    sel.innerHTML = options.filter(Boolean).map((option) => {
-      const isSelected = selectedNodes.some((node) => option === node || option.startsWith(`${node} —`) || option.startsWith(`${node} `));
-      return `<option value="${escapeAttr(option)}"${isSelected ? " selected" : ""}>${escapeHtml(prettyNode(option))}</option>`;
-    }).join("");
-    sel.addEventListener("change", () => {
-      state.profileSlots = state.profileSlots || {};
-      const selected = [...sel.selectedOptions].map((option) => option.value);
-      if (!selected.length) {
-        delete state.profileSlots.source_images;
-        delete state.profileSlots.source_image;
-        return;
+    const specs = (state.profileSlots.source_images || []).map((item) => typeof item === "string" ? { node: item } : { ...item });
+    const save = () => {
+      state.profileSlots.source_images = specs;
+      if (specs.length) state.profileSlots.source_image = { ...specs[0] };
+      else delete state.profileSlots.source_image;
+      renderSlots();
+    };
+    label.append(span);
+    specs.forEach((spec, index) => {
+      const row = document.createElement("div");
+      row.className = "source-image-row";
+      const number = document.createElement("span");
+      number.textContent = spec.input_field || `images.image_${index + 1}`;
+      const select = document.createElement("select");
+      select.setAttribute("aria-label", `${number.textContent} 节点`);
+      const selected = options.find((option) => option === spec.node || option.startsWith(`${spec.node} —`)) || spec.node || "";
+      const chosenElsewhere = new Set(specs
+        .filter((_, otherIndex) => otherIndex !== index)
+        .map((item) => String(item.node || "").split(" — ", 1)[0])
+        .filter(Boolean));
+      const available = options.filter((option) => {
+        const nodeId = String(option).split(" — ", 1)[0];
+        return !nodeId || !chosenElsewhere.has(nodeId);
+      });
+      fillSelect(select, available, selected);
+      select.addEventListener("change", () => {
+        specs[index] = {
+          ...spec,
+          node: select.value,
+          field: "image",
+          mode: "replace",
+          input_field: spec.input_field || `images.image_${index + 1}`,
+        };
+        save();
+      });
+      row.append(number, select);
+      for (const [title, offset] of [["上移", -1], ["下移", 1], ["删除", 0]]) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = title;
+        button.setAttribute("aria-label", `${title}参考图 ${index + 1}`);
+        button.disabled = offset !== 0 && (index + offset < 0 || index + offset >= specs.length);
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          if (offset === 0) specs.splice(index, 1);
+          else [specs[index], specs[index + offset]] = [specs[index + offset], specs[index]];
+          save();
+        });
+        row.append(button);
       }
-      state.profileSlots.source_images = selected.map((node) => ({ node, field: "image", mode: "replace" }));
-      state.profileSlots.source_image = { node: selected[0], field: "image", mode: "replace" };
+      label.append(row);
     });
-    label.append(span, sel);
+    const add = document.createElement("button");
+    add.type = "button";
+    add.textContent = "添加参考图输入";
+    add.addEventListener("click", (event) => {
+      event.preventDefault();
+      specs.push({
+        node: "",
+        field: "image",
+        mode: "replace",
+        input_field: `images.image_${specs.length + 1}`,
+      });
+      save();
+    });
+    label.append(add);
     parent.appendChild(label);
     return;
   }
@@ -233,6 +280,8 @@ function renderSlots() {
   basic.innerHTML = "";
   if (extra) extra.innerHTML = "";
   for (const role of state.slotRoles) {
+    if (role.id === "source_image" && Array.isArray(state.profileSlots.source_images)
+        && state.profileSlots.source_images.length) continue;
     renderSlotSelect(role, role.basic === false ? extra || basic : basic);
   }
   const guide = $("#empty-guide");
@@ -604,7 +653,11 @@ async function redetectSlots() {
   renderSlots();
   const count = Object.keys(state.profileSlots).length;
   const editRoute = state.editWorkflows.find((item) => item.workflow === state.activeWorkflow && item.workflow);
-  if ((editRoute || state.workflowPurpose === "edit") && !slotNode("source_image")) {
+  const mappedImages = slotNode("source_images");
+  const hasSourceImageMapping = Array.isArray(mappedImages)
+    ? mappedImages.some(Boolean) || !!slotNode("source_image")
+    : !!mappedImages || !!slotNode("source_image");
+  if ((editRoute || state.workflowPurpose === "edit") && !hasSourceImageMapping) {
     toast("编辑来源图片无法唯一识别，请手动选择 LoadImage 后保存映射", true);
   } else {
     toast(count ? `已加载 ${count} 个节点建议，核对后点「保存映射」` : "无法唯一识别节点，请手动选择后保存", !count);

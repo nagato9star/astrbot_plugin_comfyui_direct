@@ -37,6 +37,7 @@ from slot_mapping import (
     normalize_workflow,
     read_current_values,
     resolve_size,
+    source_image_slots,
     ANIMA_DROP_NODES,
 )
 from workflow_builder import WorkflowBuilder
@@ -365,6 +366,8 @@ class StudioApi:
         if not isinstance(slots, dict):
             return _json({"ok": False, "error": "slots 必须是对象"})
         try:
+            if "source_images" in slots or "source_image" in slots:
+                source_image_slots(wf, self.profiles._normalize_slots(slots))
             saved = self.profiles.save(
                 name,
                 slots,
@@ -411,7 +414,7 @@ class StudioApi:
             if prompt_node not in workflow_data:
                 warnings.append("主提示词节点尚未有效映射")
             if mode == "edit":
-                image_node = str((slots.get("source_image") or {}).get("node") or "")
+                image_node = _mapped_node_id(slots.get("source_images") or slots.get("source_image"))
                 if (workflow_data.get(image_node) or {}).get("class_type") != "LoadImage":
                     warnings.append("编辑来源图片尚未映射到 LoadImage")
 

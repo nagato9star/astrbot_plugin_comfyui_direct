@@ -13,6 +13,7 @@
   --mono: "IBM Plex Mono", "Cascadia Mono", ui-monospace, monospace;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   font-family: var(--font);
@@ -62,6 +63,7 @@ button.danger { color: #f3c2bc; border-color: #6a3a34; }
   grid-template-columns: 260px minmax(0, 1fr) 300px;
   min-height: 0;
 }
+#layout.workflow-mode { grid-template-columns: 260px minmax(0, 1fr); }
 .rail, #editor {
   overflow: auto;
   padding: 14px;
@@ -73,6 +75,21 @@ h3 { font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: 
 .sec-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
 .sec-head h3 { margin: 0; }
 .sec-actions { display: flex; gap: 6px; }
+.editor-tabs { display: flex; gap: 4px; margin: -14px -14px 18px; padding: 10px 14px 0; border-bottom: 1px solid var(--line); background: var(--bg2); }
+.editor-tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 9px 17px; background: transparent; color: var(--dim); font-weight: 650; }
+.editor-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+.editor-tabs button:focus-visible { outline: 2px solid var(--accent-2); outline-offset: -2px; }
+.workflow-card { padding: 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg2); margin-bottom: 18px; }
+.workflow-title { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; margin-bottom: 12px; }
+.workflow-title > span:first-child { color: var(--dim); font-size: 11px; letter-spacing: .08em; }
+.workflow-title strong { font-size: 16px; letter-spacing: .02em; }
+.workflow-source { color: var(--accent-2); font-size: 11px; }
+.workflow-routing { display: grid; grid-template-columns: minmax(120px, 150px) minmax(180px, 1fr) auto auto; gap: 8px; align-items: end; }
+.workflow-routing button { min-height: 30px; }
+.workflow-card .hint { margin-bottom: 0; }
+.workflow-json-editor { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
+.workflow-json-editor summary { color: var(--accent-2); font-weight: 600; cursor: pointer; }
+#workflow-json { min-height: 320px; font-family: var(--mono); font-size: 12px; line-height: 1.5; tab-size: 2; white-space: pre; }
 .hint { color: var(--dim); font-size: 12px; line-height: 1.45; margin: 8px 0 12px; }
 .callout {
   background: rgba(215, 161, 92, 0.1);
@@ -186,6 +203,15 @@ textarea { resize: vertical; min-height: 90px; }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (max-width: 1100px) {
-  #layout { grid-template-columns: 1fr; }
-  .rail, #editor { border: 0; border-bottom: 1px solid var(--line); }
+  html, body { height: auto; min-height: 100%; }
+  body { display: block; min-height: 100vh; }
+  #topbar { height: auto; min-height: 48px; flex-wrap: wrap; padding: 8px 12px; }
+  #conn-text { overflow-wrap: anywhere; }
+  #layout, #layout.workflow-mode { display: block; min-height: 0; }
+  .rail, #editor { overflow: visible; border: 0; border-bottom: 1px solid var(--line); }
+}
+@media (max-width: 650px) {
+  .workflow-routing { grid-template-columns: 1fr; }
+  .workflow-routing button { width: 100%; }
+  .editor-tabs button { flex: 1; }
 }

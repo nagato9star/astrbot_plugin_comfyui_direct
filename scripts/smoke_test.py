@@ -885,7 +885,7 @@ def test_split_family_config_dropdowns() -> None:
         gen_items = schema["model_families"]["templates"]["family"]["items"]
         edit_items = schema["edit_families"]["templates"]["edit_family"]["items"]
         assert gen_items["workflow"]["options"] == ["qwen-edit", "qwen-generate"]
-        assert edit_items["workflow"]["options"] == ["qwen-edit", "qwen-generate"]
+        assert edit_items["workflow"]["options"] == ["", "qwen-edit", "qwen-generate"]
         assert edit_items["model_family"]["options"] == ["qwen"]
         assert schema["workflow_node_mappings"]["templates"]["mapping"]["items"]["workflow"]["options"] == ["qwen-edit", "qwen-generate"]
         assert schema["default_recipe"]["options"] == ["日常"]
@@ -1680,6 +1680,159 @@ def test_webapi_original_output_and_interrupt_guard() -> None:
     print("  webapi original output / interrupt guard OK")
 
 
+def test_studio_recipe_workflow_independence() -> None:
+    import webapi as webapi_module
+    from unittest.mock import patch
+
+    class FakeConfig(dict):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.saved = 0
+            self.fail = False
+            self.schema = json.loads((_PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8"))
+
+        def save_config(self):
+            if self.fail:
+                raise OSError("disk unavailable")
+            self.saved += 1
+
+    class FakeTool:
+        active = True
+
+        def __init__(self):
+            self.refreshes = 0
+
+        def refresh_schema(self):
+            self.refreshes += 1
+
+    async def run():
+        body = {}
+        old_body, old_json, old_query = (
+            webapi_module._body, webapi_module._json, webapi_module._query,
+        )
+
+        async def fake_body():
+            return dict(body)
+
+        def fake_json(data, status=200):
+            return {**data, "_status": status}
+
+        webapi_module._body, webapi_module._json = fake_body, fake_json
+        webapi_module._query = lambda key, default="": default
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                builder = WorkflowBuilder(plugin_dir=PLUGIN, custom_dir=root / "workflows")
+                for name in ("gen-a", "gen-b", "edit-a", "edit-b"):
+                    builder.save_template(name, _load_fixture("mini_workflow.json"))
+                store = RecipeStore(root)
+                profiles = WorkflowProfileStore(root)
+                profiles.save("gen-a", {"prompt": {"node": "2"}}, [])
+                config = FakeConfig({
+                    "model_families": [{"__template_key": "family", "name": "qwen", "workflow": "gen-a"}],
+                    "edit_families": [{"__template_key": "edit_family", "model_family": "qwen", "workflow": "edit-a"}],
+                    "workflow_node_mappings": [],
+                })
+                families = ModelFamilyRegistry(config["model_families"], edit_raw=config["edit_families"])
+                draw_tool, recipe_tool, edit_tool = FakeTool(), FakeTool(), FakeTool()
+                api = webapi_module.StudioApi(
+                    None, builder, store, root / "output", {},
+                    draw_tool, recipe_tool, edit_tool, families, profiles,
+                    plugin_config=config,
+                )
+                routes = []
+
+                class FakeContext:
+                    def register_web_api(self, path, handler, methods, description):
+                        routes.append(path)
+
+                webapi_module.register_web_apis(
+                    FakeContext(), None, builder, store, root / "output", {},
+                    draw_tool, recipe_tool, edit_tool, families, profiles,
+                    plugin_config=config,
+                )
+                assert "/astrbot_plugin_comfyui_direct/workflow/bind" in routes
+
+                body.update({
+                    "name": "静态配方", "family": "qwen", "defaults": {"steps": 18},
+                    "profile_slots": {"prompt": {"node": "999"}},
+                    "drop_nodes": ["2"],
+                })
+                saved = await api.save_recipe()
+                assert saved["ok"] is True
+                assert store.get("静态配方")["defaults"]["steps"] == 18
+                recipe_path = store.path_for(saved["recipe"]["id"])
+                assert "slots" not in json.loads(recipe_path.read_text(encoding="utf-8"))
+                assert profiles.get("gen-a")["slots"]["prompt"]["node"] == "2"
+                original_recipe = store.get("静态配方")
+                with patch.object(builder, "load_template", side_effect=AssertionError("recipe read touched workflow")):
+                    loaded = await api.get_recipe()
+                assert loaded["ok"] is True and loaded["recipe"]["name"] == "静态配方"
+
+                body.clear()
+                updated_workflow = _load_fixture("mini_workflow.json")
+                updated_workflow["2"]["inputs"]["text"] = "updated workflow prompt"
+                body.update({"name": "gen-a", "workflow": updated_workflow})
+                imported = await api.import_workflow()
+                assert imported["ok"] is True
+                assert builder.load_template("gen-a")["2"]["inputs"]["text"] == "updated workflow prompt"
+                assert store.get("静态配方") == original_recipe
+                assert profiles.get("gen-a")["slots"]["prompt"]["node"] == "2"
+
+                body.clear()
+                body.update({
+                    "workflow": "gen-a",
+                    "slots": {"prompt": {"node": "2"}, "sampler": {"node": "5"}},
+                    "drop_nodes": [],
+                })
+                mapped = await api.save_workflow_profile()
+                assert mapped["ok"] is True
+                assert profiles.get("gen-a")["slots"]["sampler"]["node"] == "5"
+                assert store.get("静态配方") == original_recipe
+
+                body.clear()
+                body.update({"mode": "generate", "family": "qwen", "workflow": "gen-b"})
+                bound = await api.save_workflow_binding()
+                assert bound["ok"] is True
+                assert families.get("qwen").workflow == "gen-b"
+                assert builder.default_workflow == "gen-b"
+                assert store.get("静态配方") == original_recipe
+                assert profiles.get("gen-a")["slots"]["prompt"]["node"] == "2"
+
+                body["mode"], body["workflow"] = "edit", "edit-b"
+                bound_edit = await api.save_workflow_binding()
+                assert bound_edit["ok"] is True
+                assert any("LoadImage" in warning for warning in bound_edit["warnings"])
+                assert families.get("qwen").edit_workflow == "edit-b"
+                assert edit_tool.active is True
+                assert config.saved == 2
+                assert store.get("静态配方") == original_recipe
+
+                body["workflow"] = ""
+                unbound = await api.save_workflow_binding()
+                assert unbound["ok"] is True
+                assert families.get("qwen").edit_workflow == ""
+                assert edit_tool.active is False
+                assert store.get("静态配方") == original_recipe
+
+                body["workflow"] = "missing"
+                rejected = await api.save_workflow_binding()
+                assert rejected["ok"] is False and config.saved == 3
+
+                config.fail = True
+                body["workflow"] = "edit-a"
+                failed_save = await api.save_workflow_binding()
+                assert failed_save["ok"] is False and config.saved == 3
+                assert families.get("qwen").edit_workflow == ""
+                assert config["edit_families"][0]["workflow"] == ""
+        finally:
+            webapi_module._body, webapi_module._json = old_body, old_json
+            webapi_module._query = old_query
+
+    asyncio.run(run())
+    print("  studio recipe/workflow independence and routing OK")
+
+
 def test_cache_atomic() -> None:
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "models.json"
@@ -1881,6 +2034,7 @@ def main() -> None:
     test_submit_error_parse()
     test_execution_status_and_image_media_type()
     test_webapi_original_output_and_interrupt_guard()
+    test_studio_recipe_workflow_independence()
     test_cache_atomic()
     test_image_cache_lifecycle()
     test_manual_profile_skips_detection()

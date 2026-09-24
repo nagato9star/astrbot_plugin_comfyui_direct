@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>ComfyUI Direct · 配方工作台</title>
+<title>ComfyUI Direct · 工作流与配方</title>
 <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
@@ -11,7 +11,7 @@
     <div class="brand">
       <span class="mark">◆</span>
       ComfyUI Direct
-      <span class="sub">配方工作台</span>
+      <span class="sub">工作流 / 配方</span>
     </div>
     <span id="conn-dot" class="dot wait"></span>
     <span id="conn-text">检测中…</span>
@@ -35,18 +35,18 @@
       </section>
       <section>
         <div class="sec-head">
-          <h2>1. 工作流图</h2>
+          <h2>工作流图</h2>
           <div class="sec-actions">
             <label class="file-btn">导入图<input id="file-import" type="file" accept=".json,application/json" /></label>
             <button id="btn-from-comfy" type="button" title="把 ComfyUI 最近画过的那张图拿过来">刚画过的</button>
           </div>
         </div>
         <ul id="wf-list" class="pick-list"></ul>
-        <p class="hint">在 ComfyUI 菜单里选 Save (API Format)，把 JSON 导进来。普通 Save 的文件可能对不上。</p>
+        <p class="hint">支持 ComfyUI API JSON；连接 ComfyUI 后也可导入前端工作流 JSON，插件会按节点信息转换。</p>
       </section>
       <section>
         <div class="sec-head">
-          <h2>2. 配方套装</h2>
+          <h2>静态配方</h2>
           <button id="btn-new-recipe" type="button">新建一套</button>
         </div>
         <ul id="recipe-list" class="pick-list"></ul>
@@ -54,43 +54,47 @@
     </aside>
 
     <section id="editor">
-      <p id="empty-guide" class="callout">先导入工作流，再到插件配置的「模型家族与工作流」中添加家族并选择这张图。重载插件后，在这里确认共享槽位并保存配方参数。</p>
-
-      <div class="editor-head">
-        <label class="field grow">
-          <span>这套叫什么</span>
-          <input id="recipe-name" placeholder="立绘、日常、横版场景…" />
-        </label>
-        <label class="field grow">
-          <span>什么时候用（说给机器人听）</span>
-          <input id="recipe-desc" placeholder="画角色全身或半身时用" />
-        </label>
-        <button id="btn-save" class="primary" type="button">保存这套</button>
-        <button id="btn-delete-recipe" class="danger" type="button">删除</button>
+      <div class="editor-tabs" role="tablist" aria-label="工作台区域">
+        <button id="tab-workflow" type="button" role="tab" aria-controls="workflow-pane" aria-selected="true">工作流</button>
+        <button id="tab-recipe" type="button" role="tab" aria-controls="recipe-pane" aria-selected="false">静态配方</button>
       </div>
 
-      <label class="field">
-        <span>适用哪个模型家族</span>
-        <select id="recipe-family"></select>
-        <small id="family-workflow-hint" class="hint"></small>
-      </label>
-
-      <div class="sec-head">
-        <h3>3. 这张工作流的共享槽位</h3>
-        <div class="sec-actions">
-          <button id="btn-detect-slots" type="button">重新识别</button>
-          <button id="btn-save-profile" type="button">保存映射</button>
+      <div id="workflow-pane" role="tabpanel" aria-labelledby="tab-workflow">
+        <p id="empty-guide" class="callout">先导入工作流，再选择生图或编辑图用途及模型家族，核对节点映射并分别保存。</p>
+        <div class="workflow-card">
+          <div class="workflow-title"><span>当前工作流</span><strong id="workflow-active-name">尚未选择</strong><span id="workflow-active-source" class="workflow-source"></span></div>
+          <div class="workflow-routing">
+            <label class="field"><span>用途</span><select id="workflow-purpose"><option value="generate">生图</option><option value="edit">编辑图</option></select></label>
+            <label class="field grow"><span>模型家族</span><select id="workflow-family"></select></label>
+            <button id="btn-bind-workflow" class="primary" type="button">绑定当前工作流</button>
+            <button id="btn-unbind-edit" type="button" hidden>解除编辑绑定</button>
+          </div>
+          <p id="workflow-bind-status" class="hint">工作流绑定属于家族路由，不会修改任何配方。</p>
         </div>
-      </div>
-      <p class="hint">槽位跟随工作流。重新识别只更新页面上的建议，核对后点「保存映射」；配置页的手动映射始终优先。</p>
-      <div id="slot-grid" class="slot-grid"></div>
-      <details id="slot-extra" class="extra">
-        <summary>更多格子（编辑来源图片 / 画师 / 负向 / 触发词）</summary>
-        <div id="slot-grid-extra" class="slot-grid"></div>
-      </details>
 
-      <h3>4. 配方参数</h3>
-      <p class="hint">这里保存实验好的底模、LoRA、画幅和采样参数。快捷配方生图只替换本次提示词；自由生图入口不会套用这些值。</p>
+        <div class="sec-head"><h3>节点映射</h3><div class="sec-actions"><button id="btn-detect-slots" type="button">重新识别</button><button id="btn-save-profile" type="button">保存映射</button></div></div>
+        <p class="hint">映射属于当前工作流。重新识别只更新页面建议；核对后保存。配置页手动映射仍优先。</p>
+        <div id="slot-grid" class="slot-grid"></div>
+        <details id="slot-extra" class="extra"><summary>更多节点（来源图片 / 画师 / 负向 / 触发词）</summary><div id="slot-grid-extra" class="slot-grid"></div></details>
+
+        <details id="workflow-json-editor" class="workflow-json-editor">
+          <summary>编辑工作流 API JSON</summary>
+          <p class="hint">直接修改当前模板的 API JSON。保存后请重新核对节点映射；已有配方内容保持独立。</p>
+          <textarea id="workflow-json" spellcheck="false" aria-label="工作流 API JSON"></textarea>
+          <div class="row-actions"><button id="btn-save-workflow-json" type="button">保存工作流 JSON</button></div>
+        </details>
+      </div>
+
+      <div id="recipe-pane" role="tabpanel" aria-labelledby="tab-recipe" hidden>
+        <div class="editor-head">
+          <label class="field grow"><span>配方名称</span><input id="recipe-name" placeholder="立绘、日常、横版场景…" /></label>
+          <label class="field grow"><span>用途说明</span><input id="recipe-desc" placeholder="画角色全身或半身时用" /></label>
+          <button id="btn-save" class="primary" type="button">保存配方</button>
+          <button id="btn-delete-recipe" class="danger" type="button">删除</button>
+        </div>
+        <label class="field"><span>模型家族</span><select id="recipe-family"></select><small id="family-workflow-hint" class="hint"></small></label>
+        <h3>静态生成参数</h3>
+        <p class="hint">这里仅保存底模、LoRA、画幅和采样参数。家族工作流与节点映射由“工作流”页管理。</p>
       <div class="size-presets">
         <span>常用画幅</span>
         <button type="button" data-size="832,1216">竖图 832×1216</button>
@@ -143,11 +147,12 @@
           <textarea id="def-trigger-words" rows="2" placeholder="选 LoRA 后自动填入触发词"></textarea>
         </label>
       </div>
+      </div>
     </section>
 
     <aside class="rail" id="rail-right">
       <section>
-        <h2>试一张</h2>
+        <h2>配方试画</h2>
         <textarea id="test-prompt" rows="5" placeholder="1girl, solo, standing, full body, street"></textarea>
         <div class="row-actions">
           <select id="test-size">

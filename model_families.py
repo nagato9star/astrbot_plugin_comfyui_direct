@@ -79,9 +79,9 @@ class ModelFamilyRegistry:
         seen_edits: set[str] = set()
         for row in self._rows(edit_raw):
             name = str(row.get("model_family") or row.get("family") or row.get("name") or "").strip()
-            workflow = str(row.get("workflow") or "").strip()
-            if not name or not workflow:
+            if not name or "workflow" not in row:
                 continue
+            workflow = str(row.get("workflow") or "").strip()
             key = name.casefold()
             if key in seen_edits:
                 logger.warning(f"[ComfyUIDirect] 编辑图家族重复，保留第一条: {name}")
@@ -120,6 +120,11 @@ class ModelFamilyRegistry:
 
     def editable_names(self) -> list[str]:
         return [item.name for item in self._items.values() if item.edit_workflow]
+
+    def reconfigure(self, raw: Any, default_workflow: str, edit_raw: Any = None) -> None:
+        """Refresh the same registry object held by Bot tools and Workflow Studio."""
+        updated = ModelFamilyRegistry(raw, default_workflow, edit_raw)
+        self._items = updated._items
 
     def first(self) -> ModelFamily:
         return next(iter(self._items.values()))

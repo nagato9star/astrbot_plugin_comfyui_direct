@@ -399,6 +399,7 @@ class ComfyUIDirectPlugin(Star):
                 shared,
                 self._draw_tool,
                 self._recipe_draw_tool,
+                self._edit_tool,
                 self._families,
                 self._profiles,
                 config_defaults=defaults,
@@ -461,7 +462,14 @@ class ComfyUIDirectPlugin(Star):
 
         first_family = self._families.first()
         wf = loaded.get(first_family.workflow)
-        if wf is not None:
+        has_legacy_slots = any(str(value or "").strip() for value in node_slots_cfg.values())
+        has_legacy_defaults = has_legacy_slots or any(
+            value not in (None, "", 0, 0.0, [], {})
+            for value in recipe_defaults.values()
+        )
+        if wf is not None and has_legacy_defaults:
+            # One-time migration for explicit old settings. Importing a workflow
+            # alone must not create or alter a static recipe.
             self._store.bootstrap(
                 workflow_name=first_family.workflow,
                 wf=wf,

@@ -587,7 +587,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 display = str(recipe_data.get("name") or entry_name or "默认")
                 return (
                     f"生成失败：配方「{display}」还没指定主提示词节点，"
-                    "请主人在配方工作台或配置下拉框里选一下。"
+                    "请在 Workflow Studio 工作流页或配置下拉框中确认节点映射。"
                 )
             merged = dict(self._load_recipe(entry_name) or {})
             merged.pop("name", None)
@@ -2268,7 +2268,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         if not slots.get("prompt"):
             return (
                 f"工作流「{workflow_name}」还没指定主提示词节点。"
-                "请主人在配方工作台确认这张工作流的槽位映射。"
+                "请在 Workflow Studio 工作流页确认这张工作流的槽位映射。"
             )
         if "model" in values and values.get("model") not in (None, "") and not slots.get("model"):
             return f"工作流「{workflow_name}」没有映射底模槽位，无法替换底模。"
@@ -2711,7 +2711,7 @@ class ComfyuiRecipeDrawTool(FunctionTool[AstrAgentContext]):
             prop["description"] = "用户点名时从 enum 选择；省略用默认配方"
         else:
             prop.pop("enum", None)
-            prop["description"] = "当前没有配方，请先在配方工作台保存"
+            prop["description"] = "当前没有配方，请先在 Workflow Studio 静态配方页保存"
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         prompt = str(kwargs.get("prompt") or "").strip()
@@ -2725,7 +2725,7 @@ class ComfyuiRecipeDrawTool(FunctionTool[AstrAgentContext]):
         if recipe is None:
             if recipe_name:
                 return f"生成失败：配方「{recipe_name}」不存在。"
-            return "生成失败：还没有可用配方，请先在配方工作台保存一套。"
+            return "生成失败：还没有可用配方，请先在 Workflow Studio 静态配方页保存一套。"
 
         family = self.families.resolve_recipe(recipe)
         explicit_family = str(recipe.get("family") or "").strip()
@@ -2748,7 +2748,7 @@ class ComfyuiRecipeDrawTool(FunctionTool[AstrAgentContext]):
             if not legacy_workflow:
                 return (
                     f"生成失败：配方「{recipe.get('name')}」没有模型家族。"
-                    "请在配方工作台为它选择家族后重新保存。"
+                    "请在 Workflow Studio 静态配方页为它选择家族后重新保存。"
                 )
 
         seed = kwargs.get("seed")

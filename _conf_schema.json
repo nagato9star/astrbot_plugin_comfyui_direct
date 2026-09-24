@@ -48,7 +48,7 @@
   "model_families": {
     "type": "template_list",
     "description": "生图家族与工作流",
-    "hint": "先在配方工作台导入生图工作流，再给每个家族选择工作流。家族名是暴露给 LLM 的稳定路由名；修改后重载插件生效。",
+    "hint": "先在 Workflow Studio 工作流页导入生图工作流，再给每个家族选择工作流。家族名是暴露给 LLM 的稳定路由名；修改后重载插件生效。",
     "obvious_hint": true,
     "templates": {
       "family": {
@@ -108,7 +108,7 @@
   "edit_families": {
     "type": "template_list",
     "description": "编辑图家族与工作流",
-    "hint": "为上方已有的生图家族选择图片编辑工作流。先在配方工作台导入成功的编辑工作流，再在这里选择；修改后重载插件生效。",
+    "hint": "为上方已有的生图家族选择图片编辑工作流。先在 Workflow Studio 工作流页导入成功的编辑工作流，再在这里选择；修改后重载插件生效。",
     "obvious_hint": true,
     "templates": {
       "edit_family": {
@@ -223,7 +223,7 @@
   "default_recipe": {
     "type": "string",
     "default": "默认",
-    "hint": "用户只说「画一张」时 comfyui_recipe_draw / comfyui_generate 用的配方名；在配方工作台点「设为默认」自动写入，也可直接填配方名"
+    "hint": "用户只说「画一张」时 comfyui_recipe_draw / comfyui_generate 用的配方名；在 Workflow Studio 静态配方列表点「设为默认」自动写入，也可直接填配方名"
   },
   "_tool_section": {
     "description": "=== LLM 工具 ===",

@@ -49,7 +49,7 @@ def refresh_config_options(config: Any, builder: Any, store: Any) -> None:
     edit_items = schema["edit_families"]["templates"]["edit_family"]["items"]
     mapping_items = schema["workflow_node_mappings"]["templates"]["mapping"]["items"]
     _select_options(family_items["workflow"], workflows, [r.get("workflow") for r in generation])
-    _select_options(edit_items["workflow"], workflows, [r.get("workflow") for r in editing])
+    _select_options(edit_items["workflow"], workflows, [r.get("workflow") for r in editing], optional=True)
     _select_options(mapping_items["workflow"], workflows, [r.get("workflow") for r in mappings])
 
     mapping_templates = schema["workflow_node_mappings"]["templates"]

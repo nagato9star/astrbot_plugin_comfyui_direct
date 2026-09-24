@@ -47,6 +47,21 @@ if "astrbot" not in sys.modules:
         pass
 
     _api.FunctionTool = _FunctionTool
+    _components = types.ModuleType("astrbot.api.message_components")
+
+    class _Image:
+        def __init__(self, path):
+            self.path = path
+
+        async def convert_to_file_path(self):
+            return str(self.path)
+
+    class _Reply:
+        def __init__(self, chain=None):
+            self.chain = chain or []
+
+    _components.Image = _Image
+    _components.Reply = _Reply
     _event = types.ModuleType("astrbot.api.event")
     _event.AstrMessageEvent = object
     _event.MessageChain = _MessageChain
@@ -58,6 +73,7 @@ if "astrbot" not in sys.modules:
     _astr_context.AstrAgentContext = object
     sys.modules["astrbot"] = _astrbot
     sys.modules["astrbot.api"] = _api
+    sys.modules["astrbot.api.message_components"] = _components
     sys.modules["astrbot.api.event"] = _event
     sys.modules["astrbot.core"] = _core
     sys.modules["astrbot.core.agent"] = _agent
@@ -86,10 +102,13 @@ from slot_mapping import (  # noqa: E402
 from workflow_builder import WorkflowBuilder  # noqa: E402
 from tools import (  # noqa: E402
     ComfyuiDrawTool,
+    ComfyuiEditTool,
     ComfyuiGenerateTool,
     ComfyuiRecipeDrawTool,
     ComfyuiRecipeTool,
 )
+from config_options import refresh_config_options  # noqa: E402
+from astrbot.api.message_components import Image, Reply  # noqa: E402
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 
@@ -608,6 +627,7 @@ def test_family_and_recipe_generation_paths() -> None:
                 save_as="柔光",
             )
             assert "图片已发送" in result
+            assert "本地路径:" in result
             assert store.list_history(1)[0]["family"] == "demo"
             assert client.submitted[-1]["2"]["inputs"]["text"] == "a silver cat"
             assert client.submitted[-1]["1"]["inputs"]["unet_name"] == "other.safetensors"
@@ -623,6 +643,7 @@ def test_family_and_recipe_generation_paths() -> None:
             )
             result2 = await recipe_draw.call(context, recipe="柔光", prompt="a blue bird", seed=8)
             assert "图片已发送" in result2
+            assert "本地路径:" in result2
             assert store.list_history(1)[0]["recipe"] == "柔光"
             assert client.submitted[-1]["2"]["inputs"]["text"] == "a blue bird"
             assert client.submitted[-1]["1"]["inputs"]["unet_name"] == "other.safetensors"
@@ -661,6 +682,240 @@ def test_family_and_recipe_generation_paths() -> None:
 
     asyncio.run(run())
     print("  family / recipe generation paths OK")
+
+
+def test_qwen_edit_upload_and_output_path() -> None:
+    import copy
+    import types
+
+    png = b"\x89PNG\r\n\x1a\nqwen-edit-input"
+    edited_png = b"\x89PNG\r\n\x1a\nqwen-edit-output"
+    workflow = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": "old.png"}},
+        "2": {
+            "class_type": "TextEncodeQwenImageEdit",
+            "inputs": {"prompt": "old prompt", "image": ["1", 0]},
+        },
+        "3": {"class_type": "SaveImage", "inputs": {"images": ["2", 0]}},
+    }
+
+    class FakeClient(ComfyUIClient):
+        def __init__(self):
+            self.uploads = []
+            self.submitted = []
+            self.timeout = 1
+
+        async def upload_image(self, filename, content):
+            self.uploads.append((filename, content))
+            return filename, None
+
+        async def submit_prompt_detail(self, submitted):
+            self.submitted.append(copy.deepcopy(submitted))
+            return f"edit-{len(self.submitted)}", None
+
+        async def get_history_entry(self, prompt_id):
+            return {
+                "status": {"status_str": "success"},
+                "outputs": {"3": {"images": [{"filename": "edited.png", "type": "output"}]}},
+            }
+
+        async def download_image(self, *args, **kwargs):
+            return edited_png
+
+    class FakeEvent:
+        unified_msg_origin = "test:qwen-edit"
+
+        def __init__(self, images):
+            self.message_obj = types.SimpleNamespace(message=images)
+            self.sent = 0
+
+        async def send(self, chain):
+            self.sent += 1
+
+    async def run():
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.png"
+            source.write_bytes(png)
+            builder = WorkflowBuilder(plugin_dir=PLUGIN, custom_dir=root / "workflows")
+            builder.save_template("qwen-edit", workflow)
+            families = ModelFamilyRegistry([
+                {"name": "qwen", "workflow": "qwen-generate", "edit_workflow": "qwen-edit"}
+            ])
+            assert families.editable_names() == ["qwen"]
+            profiles = WorkflowProfileStore(root)
+            profile = profiles.ensure("qwen-edit", builder.load_template("qwen-edit"))
+            assert profile["slots"]["prompt"]["node"] == "2"
+            assert profile["slots"]["source_image"]["node"] == "1"
+            client = FakeClient()
+            event = FakeEvent([Image(source)])
+            context = types.SimpleNamespace(context=types.SimpleNamespace(event=event))
+            tool = ComfyuiEditTool(
+                client=client, builder=builder, store=RecipeStore(root),
+                output_dir=root / "output", shared={}, families=families, profiles=profiles,
+            )
+            tool.refresh_schema()
+            assert tool.parameters["properties"]["model_family"]["enum"] == ["qwen"]
+            result = await tool.call(context, model_family="qwen", prompt="make the sky blue")
+            assert "图片已编辑并发送" in result and "本地路径:" in result
+            assert client.uploads[0][1] == png
+            assert client.submitted[0]["1"]["inputs"]["image"] == client.uploads[0][0]
+            assert client.submitted[0]["2"]["inputs"]["prompt"] == "make the sky blue"
+            assert workflow["1"]["inputs"]["image"] == "old.png"
+            assert event.sent == 1
+            saved = tool.store.list_history(1)[0]
+            assert saved["entry"] == "edit" and saved["local_path"] in result
+
+            event.message_obj.message = []
+            second = await tool.call(
+                context, model_family="qwen", prompt="add stars", image_path=saved["local_path"]
+            )
+            assert "图片已编辑并发送" in second and client.uploads[-1][1] == edited_png
+            assert event.sent == 2
+
+            third = await tool.call(context, model_family="qwen", prompt="make it warmer")
+            assert "图片已编辑并发送" in third and client.uploads[-1][1] == edited_png
+            event.message_obj.message = [Reply([Image(source)])]
+            fourth = await tool.call(context, model_family="qwen", prompt="restore colors")
+            assert "图片已编辑并发送" in fourth and client.uploads[-1][1] == png
+            assert event.sent == 4
+
+            event.message_obj.message = [Image(source), Image(source)]
+            before = len(client.uploads)
+            ambiguous = await tool.call(context, model_family="qwen", prompt="change color")
+            assert "image_index" in ambiguous and len(client.uploads) == before
+            rejected = await tool.call(
+                context, model_family="qwen", prompt="change color", image_path=str(source)
+            )
+            assert "image_path" in rejected and len(client.uploads) == before
+
+    asyncio.run(run())
+    print("  Qwen edit upload / mapped nodes / output path OK")
+
+
+def test_qwen_edit_graph_scoped_detection() -> None:
+    import copy
+
+    wf = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "old.safetensors"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "old prompt"}},
+        "3": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "positive": ["2", 0], "latent_image": ["4", 0], "steps": 30}},
+        "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024}},
+        "5": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0]}},
+        "6": {"class_type": "SaveImage", "inputs": {"images": ["5", 0]}},
+        "10": {"class_type": "LoadImage", "inputs": {"image": "orphan.png"}},
+        "11": {"class_type": "TextEncodeQwenImageEdit", "inputs": {"prompt": "orphan", "image": ["10", 0]}},
+        "12": {"class_type": "LoadImage", "inputs": {"image": "source.png"}},
+        "13": {"class_type": "ImageScale", "inputs": {"image": ["12", 0]}},
+        "14": {"class_type": "TextEncodeQwenImageEdit", "inputs": {"prompt": "edit", "image": ["13", 0], "clip": ["15", 0], "vae": ["16", 0]}},
+        "15": {"class_type": "CLIPLoader", "inputs": {"clip_name": "edit-clip.safetensors"}},
+        "16": {"class_type": "VAELoader", "inputs": {"vae_name": "edit-vae.safetensors"}},
+        "17": {"class_type": "UNETLoader", "inputs": {"unet_name": "edit.safetensors"}},
+        "18": {"class_type": "EmptyLatentImage", "inputs": {"width": 832, "height": 1216}},
+        "19": {"class_type": "KSampler", "inputs": {"model": ["17", 0], "positive": ["14", 0], "latent_image": ["18", 0], "steps": 20}},
+        "20": {"class_type": "VAEDecode", "inputs": {"samples": ["19", 0], "vae": ["16", 0]}},
+        "21": {"class_type": "SaveImage", "inputs": {"images": ["20", 0]}},
+    }
+    slots = detect_slots(wf)
+    assert {role: spec["node"] for role, spec in slots.items() if role in {
+        "prompt", "source_image", "sampler", "model", "clip", "vae", "size"
+    }} == {
+        "prompt": "14", "source_image": "12", "sampler": "19", "model": "17",
+        "clip": "15", "vae": "16", "size": "18",
+    }
+
+    linked_prompt = copy.deepcopy(wf)
+    linked_prompt["22"] = {"class_type": "CR Prompt Text", "inputs": {"prompt": "linked edit"}}
+    linked_prompt["14"]["inputs"]["prompt"] = ["22", 0]
+    assert detect_slots(linked_prompt)["prompt"]["node"] == "22"
+
+    ambiguous_source = copy.deepcopy(wf)
+    ambiguous_source["13"]["inputs"]["second_image"] = ["10", 0]
+    slots = detect_slots(ambiguous_source)
+    assert slots["prompt"]["node"] == "14" and "source_image" not in slots
+
+    ambiguous_branch = copy.deepcopy(wf)
+    ambiguous_branch["30"] = {"class_type": "LoadImage", "inputs": {"image": "other.png"}}
+    ambiguous_branch["31"] = {"class_type": "TextEncodeQwenImageEdit", "inputs": {"prompt": "edit two", "image": ["30", 0]}}
+    ambiguous_branch["32"] = {"class_type": "KSampler", "inputs": {"model": ["17", 0], "positive": ["31", 0], "latent_image": ["18", 0]}}
+    ambiguous_branch["33"] = {"class_type": "SaveImage", "inputs": {"images": ["32", 0]}}
+    assert detect_slots(ambiguous_branch) == {}
+    with tempfile.TemporaryDirectory() as td:
+        profiles = WorkflowProfileStore(
+            Path(td), configured=[{"workflow": "qwen-edit", "prompt": "31", "source_image": "30"}]
+        )
+        manual = profiles.effective("qwen-edit", ambiguous_branch)
+        assert manual["source"] == "config"
+        assert manual["slots"]["prompt"]["node"] == "31"
+        assert manual["slots"]["source_image"]["node"] == "30"
+    print("  Qwen edit graph-scoped and ambiguous detection OK")
+
+
+def test_split_family_config_dropdowns() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        builder = WorkflowBuilder(plugin_dir=PLUGIN, custom_dir=root / "workflows")
+        wf = _load_fixture("mini_workflow.json")
+        builder.save_template("qwen-generate", wf)
+        builder.save_template("qwen-edit", {
+            "1": {"class_type": "LoadImage", "inputs": {"image": "source.png"}},
+            "2": {"class_type": "TextEncodeQwenImageEdit", "inputs": {"prompt": "edit", "image": ["1", 0]}},
+        })
+        store = RecipeStore(root)
+        store.save({"name": "日常", "family": "qwen", "defaults": {}})
+
+        schema = json.loads((_PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8"))
+        class FakeConfig(dict):
+            pass
+
+        config = FakeConfig({
+            "model_families": [
+                {"__template_key": "family", "name": "qwen", "workflow": "qwen-generate", "edit_workflow": "legacy-edit"}
+            ],
+            "edit_families": [
+                {"__template_key": "edit_family", "model_family": "qwen", "workflow": "qwen-edit"}
+            ],
+            "workflow_node_mappings": [{"workflow": "qwen-edit"}],
+            "default_workflow": "qwen-generate",
+            "default_recipe": "日常",
+        })
+        config.schema = schema
+        refresh_config_options(config, builder, store)
+        gen_items = schema["model_families"]["templates"]["family"]["items"]
+        edit_items = schema["edit_families"]["templates"]["edit_family"]["items"]
+        assert gen_items["workflow"]["options"] == ["qwen-edit", "qwen-generate"]
+        assert edit_items["workflow"]["options"] == ["qwen-edit", "qwen-generate"]
+        assert edit_items["model_family"]["options"] == ["qwen"]
+        assert schema["workflow_node_mappings"]["templates"]["mapping"]["items"]["workflow"]["options"] == ["qwen-edit", "qwen-generate"]
+        assert schema["default_recipe"]["options"] == ["日常"]
+        assert config["model_families"][0]["workflow"] == "qwen-generate"
+        dynamic = next(
+            template for template in schema["workflow_node_mappings"]["templates"].values()
+            if template["name"] == "qwen-edit 的节点映射"
+        )
+        assert dynamic["items"]["workflow"]["default"] == "qwen-edit"
+        prompt_choice = next(x for x in dynamic["items"]["prompt"]["options"] if "TextEncodeQwenImageEdit" in x)
+        image_choice = next(x for x in dynamic["items"]["source_image"]["options"] if "LoadImage" in x)
+        assert len(dynamic["items"]["source_image"]["options"]) == 2
+        parsed = slots_from_config({"prompt": prompt_choice, "source_image": image_choice})
+        assert parsed["prompt"]["node"] == "2" and parsed["source_image"]["node"] == "1"
+
+        registry = ModelFamilyRegistry(config["model_families"], edit_raw=config["edit_families"])
+        assert registry.get("qwen").workflow == "qwen-generate"
+        assert registry.get("qwen").edit_workflow == "qwen-edit"
+        assert registry.editable_names() == ["qwen"]
+        legacy = ModelFamilyRegistry(config["model_families"])
+        assert legacy.get("qwen").edit_workflow == "legacy-edit"
+
+        builder.save_template("new-local", wf)
+        refresh_config_options(config, builder, store)
+        assert "new-local" in gen_items["workflow"]["options"]
+        config["model_families"][0]["workflow"] = "legacy-missing"
+        refresh_config_options(config, builder, store)
+        assert "legacy-missing" in gen_items["workflow"]["options"]
+        assert any("legacy-missing" in label and "未找到" in label for label in gen_items["workflow"]["labels"])
+
+    print("  split family config / live local dropdowns / legacy route OK")
 
 
 def test_ui_to_api() -> None:
@@ -1415,6 +1670,9 @@ def main() -> None:
     test_workflow_profile_store()
     test_llm_entry_schemas()
     test_family_and_recipe_generation_paths()
+    test_qwen_edit_upload_and_output_path()
+    test_qwen_edit_graph_scoped_detection()
+    test_split_family_config_dropdowns()
     test_ui_to_api()
     test_api_to_ui_linked_widget_positions()
     test_workflow_build()

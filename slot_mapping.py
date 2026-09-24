@@ -22,6 +22,7 @@ NEGATIVE_MARKERS = ("lowres", "worst quality")
 # 配置/WebUI 下拉框的槽位角色。值写入配方 defaults，节点 id 写入配方 slots。
 SLOT_ROLES: tuple[tuple[str, str], ...] = (
     ("prompt", "用户要画的内容"),
+    ("source_image", "编辑来源图片"),
     ("model", "底模"),
     ("loras", "LoRA"),
     ("size", "画面大小"),
@@ -38,6 +39,7 @@ SLOT_ROLES: tuple[tuple[str, str], ...] = (
 SLOT_BASIC = ("prompt", "model", "loras", "size", "sampler")
 SLOT_HELP: dict[str, str] = {
     "prompt": "机器人会把用户的描述写到这里。必选。",
+    "source_image": "图片编辑工作流中的 LoadImage 节点。上传后的图片文件名写到这里。",
     "model": "这套默认用哪颗底模。用户说换模型时也写到这里。",
     "loras": "这套默认挂哪些 LoRA。用户点名 LoRA 时覆盖这里。",
     "size": "宽和高写到这里。竖图/横图也靠它。",
@@ -53,7 +55,9 @@ SLOT_HELP: dict[str, str] = {
 }
 
 SLOT_CLASS_HINTS: dict[str, tuple[str, ...]] = {
+    "source_image": ("LoadImage",),
     "prompt": (
+        "TextEncodeQwenImageEdit",
         "CR Prompt Text",
         "CLIPTextEncode",
         "DanbooruText",
@@ -100,6 +104,7 @@ SLOT_CLASS_HINTS: dict[str, tuple[str, ...]] = {
     "sampler": (
         "KSampler",
         "KSamplerAdvanced",
+        "XB_ROCmKSampler",
         "XB_ROCmKSamplerAdvanced",
         "KSamplerSelect",
         "SamplerCustom",
@@ -108,6 +113,7 @@ SLOT_CLASS_HINTS: dict[str, tuple[str, ...]] = {
     "sampler_2": (
         "KSampler",
         "KSamplerAdvanced",
+        "XB_ROCmKSampler",
         "XB_ROCmKSamplerAdvanced",
         "KSamplerSelect",
         "SamplerCustom",
@@ -471,14 +477,143 @@ def node_options_for_slot(wf: dict, slot: str, selected: str = "") -> list[str]:
     return options
 
 
+def _linked_node_id(wf: dict, value: Any) -> str | None:
+    if not isinstance(value, list) or len(value) < 2 or not isinstance(value[1], int):
+        return None
+    nid = str(value[0])
+    return nid if nid in wf else None
+
+
+def _upstream_ids(wf: dict, roots: list[str]) -> set[str]:
+    """Walk API-format input links without treating widget arrays as edges."""
+    found: set[str] = set()
+    pending = list(roots)
+    while pending:
+        nid = pending.pop()
+        if nid in found or not isinstance(wf.get(nid), dict):
+            continue
+        found.add(nid)
+        for value in (wf[nid].get("inputs") or {}).values():
+            linked = _linked_node_id(wf, value)
+            if linked is not None and linked not in found:
+                pending.append(linked)
+    return found
+
+
+def _unique_class_on_path(wf: dict, roots: list[str], classes: tuple[str, ...]) -> str | None:
+    matches = [
+        nid for nid in _upstream_ids(wf, roots)
+        if wf[nid].get("class_type") in classes
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _edit_branch_slots(wf: dict) -> dict[str, dict] | None:
+    """Map only the Qwen edit branch that reaches an image output.
+
+    None means there is no active Qwen edit branch. An empty result means the
+    branch is ambiguous, so the user must provide a workflow profile/config.
+    """
+    output_ids = [
+        str(nid) for nid, node in wf.items()
+        if isinstance(node, dict) and node.get("class_type") in
+        {"SaveImage", "SaveImageWithAlpha", "PreviewImage"}
+    ]
+    active = _upstream_ids(wf, output_ids) if output_ids else set(wf)
+    edit_ids = [
+        str(nid) for nid, node in wf.items()
+        if str(nid) in active and isinstance(node, dict)
+        and node.get("class_type") == "TextEncodeQwenImageEdit"
+    ]
+    if not edit_ids:
+        return None
+    if len(edit_ids) != 1:
+        logger.warning("[slot_mapping] 多条 Qwen 图片编辑分支，需手动指定节点映射")
+        return {}
+
+    edit_id = edit_ids[0]
+    edit_node = wf[edit_id]
+    edit_inputs = edit_node.get("inputs") or {}
+    slots: dict[str, dict] = {}
+    prompt_link = _linked_node_id(wf, edit_inputs.get("prompt"))
+    if prompt_link:
+        prompt_id = _unique_class_on_path(
+            wf, [prompt_link], ("CR Prompt Text", "String Literal", "PrimitiveStringMultiline")
+        )
+        if prompt_id:
+            slots["prompt"] = _slot(prompt_id, wf, "prompt")
+    elif isinstance(edit_inputs.get("prompt"), str):
+        slots["prompt"] = _slot(edit_id, wf, "prompt")
+
+    image_link = _linked_node_id(wf, edit_inputs.get("image"))
+    if image_link:
+        source_id = _unique_class_on_path(wf, [image_link], ("LoadImage",))
+        if source_id:
+            slots["source_image"] = _slot(source_id, wf, "source_image")
+
+    sampler_ids = [
+        nid for nid in _rank_sampler_ids(wf)
+        if nid in active and edit_id in _upstream_ids(wf, [nid])
+    ]
+    if sampler_ids:
+        slots["sampler"] = _slot(sampler_ids[0], wf, "sampler")
+        if len(sampler_ids) > 1:
+            slots["sampler_2"] = _slot(sampler_ids[1], wf, "sampler")
+
+    for role in ("clip", "vae"):
+        root = _linked_node_id(wf, edit_inputs.get(role))
+        found = _unique_class_on_path(wf, [root], SLOT_CLASS_HINTS[role]) if root else None
+        if found:
+            slots[role] = _slot(found, wf, role)
+
+    model_roots: list[str] = []
+    latent_roots: list[str] = []
+    negative_roots: list[str] = []
+    for sid in sampler_ids:
+        inputs = wf[sid].get("inputs") or {}
+        for key, target in (("model", model_roots), ("negative", negative_roots)):
+            root = _linked_node_id(wf, inputs.get(key))
+            if root:
+                target.append(root)
+        for key in ("latent_image", "latent"):
+            root = _linked_node_id(wf, inputs.get(key))
+            if root:
+                latent_roots.append(root)
+    for role, roots, classes in (
+        ("model", model_roots, SLOT_CLASS_HINTS["model"]),
+        ("loras", model_roots, (POWER_LORA_CLASS,)),
+        ("size", latent_roots, SLOT_CLASS_HINTS["size"]),
+        ("negative", negative_roots, SLOT_CLASS_HINTS["negative"]),
+    ):
+        found = _unique_class_on_path(wf, roots, classes) if roots else None
+        if found:
+            slots[role] = _slot(found, wf, role, mode="append" if role == "negative" else "replace")
+    return slots
+
+
 def detect_slots(wf: dict) -> dict[str, dict]:
     """自动建议槽位。结果必须给人确认后写入配方，运行时不再调用。"""
+    edit_slots = _edit_branch_slots(wf)
+    if edit_slots is not None:
+        return edit_slots
     slots: dict[str, dict] = {}
     roles = _find_prompt_roles(wf)
     if roles.get("main"):
         slots["prompt"] = _slot(roles["main"], wf, "prompt")
     elif roles.get("main_alt"):
         slots["prompt"] = _slot(roles["main_alt"], wf, "prompt")
+    active = _upstream_ids(
+        wf,
+        [str(nid) for nid, node in wf.items() if isinstance(node, dict)
+         and node.get("class_type") in {"SaveImage", "SaveImageWithAlpha", "PreviewImage"}],
+    )
+    source_image_ids = [
+        str(nid) for nid, node in wf.items()
+        if isinstance(node, dict) and node.get("class_type") == "LoadImage"
+        and (not active or str(nid) in active)
+    ]
+    if len(source_image_ids) == 1:
+        slots["source_image"] = _slot(source_image_ids[0], wf, "source_image")
     if roles.get("artist"):
         slots["artist"] = _slot(roles["artist"], wf, "artist")
     if roles.get("quality"):
@@ -543,6 +678,8 @@ def _slot(nid: str, wf: dict, role: str, mode: str = "replace") -> dict:
 def infer_field(node: dict, role: str) -> str:
     ins = node.get("inputs") or {}
     cls = str(node.get("class_type") or "")
+    if role == "source_image":
+        return "image"
     if role in ("prompt", "artist", "quality", "trigger_words"):
         if "prompt" in ins:
             return "prompt"
@@ -933,6 +1070,14 @@ def apply_slots(
     prompt = values.get("prompt")
     if prompt is not None and slots.get("prompt"):
         _write_text(wf, slots["prompt"], str(prompt), role="prompt")
+
+    source_image = values.get("source_image")
+    if source_image is not None and slots.get("source_image"):
+        spec = slots["source_image"]
+        node = wf.get(str(spec["node"]))
+        if node is not None:
+            field = spec.get("field") or infer_field(node, "source_image")
+            node.setdefault("inputs", {})[field] = str(source_image)
 
     for role in ("artist", "trigger_words"):
         val = values.get(role)

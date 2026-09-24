@@ -71,6 +71,7 @@ button.danger { color: #f3c2bc; border-color: #6a3a34; }
 h2 { font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent-2); margin-bottom: 8px; }
 h3 { font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim); margin: 18px 0 8px; }
 .sec-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.sec-head h3 { margin: 0; }
 .sec-actions { display: flex; gap: 6px; }
 .hint { color: var(--dim); font-size: 12px; line-height: 1.45; margin: 8px 0 12px; }
 .callout {

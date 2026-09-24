@@ -1,5 +1,6 @@
 const SLOT_FALLBACK = [
   { id: "prompt", label: "用户要画的内容", help: "必选", basic: true },
+  { id: "source_image", label: "编辑来源图片", help: "图片编辑工作流中的 LoadImage 节点", basic: false },
   { id: "model", label: "底模", help: "", basic: true },
   { id: "loras", label: "LoRA", help: "", basic: true },
   { id: "size", label: "画面大小", help: "", basic: true },
@@ -27,6 +28,7 @@ const state = {
   recipe: emptyRecipe(),
   activeWorkflow: "",
   profileSlots: {},
+  profileSource: "detected",
   profileDropNodes: [],
   history: [],
   runningPid: "",
@@ -423,6 +425,7 @@ async function bindWorkflow(name) {
   const switched = state.activeWorkflow !== name;
   state.activeWorkflow = name;
   state.profileSlots = res.profile_slots || res.detected_slots || {};
+  state.profileSource = res.profile_source || "detected";
   state.profileDropNodes = res.drop_nodes || [];
   const matchedFamily = state.families.find((item) => item.workflow === name);
   if (!state.recipe.family && matchedFamily) state.recipe.family = matchedFamily.name;
@@ -521,6 +524,38 @@ async function saveRecipe() {
   return true;
 }
 
+async function redetectSlots() {
+  if (!state.activeWorkflow) return toast("请先选择工作流", true);
+  const res = await apiPost("workflow/detect", { name: state.activeWorkflow });
+  if (!res || !res.ok) return toast(res?.error || "节点识别失败", true);
+  state.profileSlots = res.slots || {};
+  state.slotOptions = res.slot_options || state.slotOptions;
+  renderSlots();
+  const count = Object.keys(state.profileSlots).length;
+  const editFamily = state.families.find((item) => item.edit_workflow === state.activeWorkflow);
+  if (editFamily && !slotNode("source_image")) {
+    toast("编辑来源图片无法唯一识别，请手动选择 LoadImage 后保存映射", true);
+  } else {
+    toast(count ? `已加载 ${count} 个节点建议，核对后点「保存映射」` : "无法唯一识别节点，请手动选择后保存", !count);
+  }
+}
+
+async function saveWorkflowProfile() {
+  if (!state.activeWorkflow) return toast("请先选择工作流", true);
+  const res = await apiPost("workflow/profile", {
+    workflow: state.activeWorkflow,
+    slots: state.profileSlots,
+    drop_nodes: state.profileDropNodes,
+  });
+  if (!res || !res.ok) return toast(res?.error || "保存节点映射失败", true);
+  if (state.profileSource === "config") {
+    toast("映射已保存；配置页手动映射仍优先生效，请在配置页同步修改", true);
+  } else {
+    state.profileSource = "profile";
+    toast("工作流节点映射已保存");
+  }
+}
+
 async function importFile(file) {
   const text = await file.text();
   let data;
@@ -540,6 +575,7 @@ async function importFile(file) {
   state.slotOptions = res.slot_options || {};
   state.activeWorkflow = name;
   state.profileSlots = res.profile_slots || res.detected_slots || {};
+  state.profileSource = res.profile_source || "detected";
   state.profileDropNodes = res.drop_nodes || [];
   await loadLists();
   const detect = await apiPost("workflow/detect", { name });
@@ -577,6 +613,7 @@ async function importFromComfy() {
   state.slotOptions = res.slot_options || {};
   state.activeWorkflow = res.name;
   state.profileSlots = res.profile_slots || res.detected_slots || {};
+  state.profileSource = res.profile_source || "detected";
   state.profileDropNodes = res.drop_nodes || [];
   await bindWorkflow(res.name);
 }
@@ -660,6 +697,8 @@ async function newRecipe() {
 function bindUi() {
   $("#btn-refresh").addEventListener("click", () => refreshStatus().catch((e) => toast(String(e), true)));
   $("#btn-save").addEventListener("click", () => saveRecipe().catch((e) => toast(String(e), true)));
+  $("#btn-detect-slots").addEventListener("click", () => redetectSlots().catch((e) => toast(String(e), true)));
+  $("#btn-save-profile").addEventListener("click", () => saveWorkflowProfile().catch((e) => toast(String(e), true)));
   $("#btn-new-recipe").addEventListener("click", () => newRecipe().catch((e) => toast(String(e), true)));
   $("#btn-delete-recipe").addEventListener("click", async () => {
     if (!state.recipe.name) return;

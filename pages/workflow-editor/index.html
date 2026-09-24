@@ -75,11 +75,17 @@
         <small id="family-workflow-hint" class="hint"></small>
       </label>
 
-      <h3>3. 这张工作流的共享槽位</h3>
-      <p class="hint">槽位跟随模型家族所选的工作流，同一工作流的所有配方共用。保存任意配方时会一并保存这份映射。</p>
+      <div class="sec-head">
+        <h3>3. 这张工作流的共享槽位</h3>
+        <div class="sec-actions">
+          <button id="btn-detect-slots" type="button">重新识别</button>
+          <button id="btn-save-profile" type="button">保存映射</button>
+        </div>
+      </div>
+      <p class="hint">槽位跟随工作流。重新识别只更新页面上的建议，核对后点「保存映射」；配置页的手动映射始终优先。</p>
       <div id="slot-grid" class="slot-grid"></div>
       <details id="slot-extra" class="extra">
-        <summary>更多格子（画师 / 负向 / 触发词，没有就不用管）</summary>
+        <summary>更多格子（编辑来源图片 / 画师 / 负向 / 触发词）</summary>
         <div id="slot-grid-extra" class="slot-grid"></div>
       </details>
 

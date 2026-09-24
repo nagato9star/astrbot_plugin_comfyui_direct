@@ -41,28 +41,36 @@
     "hint": "复用 ComfyUI LoRA Manager 的分类、标签、用途说明、推荐权重和触发词；未安装时自动跳过"
   },
   "_family_section": {
-    "description": "=== 模型家族与配方 ===",
+    "description": "=== 生图、编辑图与配方 ===",
     "type": "text",
     "invisible": true
   },
   "model_families": {
     "type": "template_list",
-    "description": "模型家族与工作流",
-    "hint": "可添加任意家族，家族名是暴露给 LLM 的稳定路由名。先在配方工作台导入工作流，再在这里为每个家族选择工作流；修改后重载插件生效。",
+    "description": "生图家族与工作流",
+    "hint": "先在配方工作台导入生图工作流，再给每个家族选择工作流。家族名是暴露给 LLM 的稳定路由名；修改后重载插件生效。",
     "obvious_hint": true,
     "templates": {
       "family": {
-        "name": "模型家族",
+        "name": "生图家族",
         "items": {
           "name": {
             "type": "string",
-            "default": "anima",
+            "description": "生图家族名",
+            "default": "",
             "hint": "暴露给 LLM 的稳定名称，例如 anima、krea2、flux；须唯一，重复时保留第一条"
           },
           "workflow": {
             "type": "string",
-            "default": "anima-v3",
-            "hint": "这个家族使用的工作流：填配方工作台里导入的模板名。多个家族可以共用同一张工作流"
+            "description": "生图工作流",
+            "default": "",
+            "hint": "从插件数据目录已导入的工作流中选择；多个家族可以共用一张工作流。导入新工作流后重新打开此配置页"
+          },
+          "edit_workflow": {
+            "type": "string",
+            "default": "",
+            "invisible": true,
+            "hint": "旧配置兼容；新配置请使用下方的编辑图家族列表"
           },
           "prompt_style": {
             "type": "string",
@@ -97,6 +105,32 @@
       }
     ]
   },
+  "edit_families": {
+    "type": "template_list",
+    "description": "编辑图家族与工作流",
+    "hint": "为上方已有的生图家族选择图片编辑工作流。先在配方工作台导入成功的编辑工作流，再在这里选择；修改后重载插件生效。",
+    "obvious_hint": true,
+    "templates": {
+      "edit_family": {
+        "name": "编辑图家族",
+        "items": {
+          "model_family": {
+            "type": "string",
+            "description": "对应生图家族",
+            "default": "",
+            "hint": "选择上方已配置的家族，例如 qwen；新添加生图家族后先保存并重载插件，才能在这里的下拉框中选择"
+          },
+          "workflow": {
+            "type": "string",
+            "description": "编辑图工作流",
+            "default": "",
+            "hint": "选择已导入的图片编辑工作流；应包含 LoadImage 与编辑提示词节点"
+          }
+        }
+      }
+    },
+    "default": []
+  },
   "workflow_node_mappings": {
     "type": "template_list",
     "description": "工作流节点映射（配置优先）",
@@ -115,6 +149,11 @@
             "type": "string",
             "default": "",
             "hint": "主提示词节点 ID（必填）"
+          },
+          "source_image": {
+            "type": "string",
+            "default": "",
+            "hint": "编辑来源图片的 LoadImage 节点 ID；使用编辑工作流时必填"
           },
           "model": {
             "type": "string",
@@ -202,7 +241,7 @@
       "基础（画图 + 查词）",
       "完整（开放诊断工具）"
     ],
-    "hint": "basic 只暴露 comfyui_draw / comfyui_recipe_draw / comfyui_lookup；full 额外开放队列、任务、模型信息等诊断工具，其中高风险工具仍需打开下方开关"
+    "hint": "basic 暴露 comfyui_draw / comfyui_recipe_draw / comfyui_lookup；配置编辑图家族后还会暴露 comfyui_edit。full 额外开放队列、任务、模型信息等诊断工具，其中高风险工具仍需打开下方开关"
   },
   "allow_llm_unsafe_tools": {
     "type": "bool",

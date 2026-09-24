@@ -20,6 +20,7 @@ from comfy_client import (
 from image_cache import save_image
 from resource_catalog import selection_error
 from model_families import ModelFamilyRegistry, WorkflowProfileStore
+from config_options import refresh_config_options
 from recipe_store import RecipeStore, materialize_values, recipe_template
 from slot_mapping import (
     SLOT_BASIC,
@@ -125,6 +126,7 @@ class StudioApi:
         self.plugin_config = plugin_config if isinstance(plugin_config, dict) else {}
 
     def _refresh_draw_schema(self) -> None:
+        refresh_config_options(self.plugin_config, self.builder, self.store)
         if self.draw_tool is not None and hasattr(self.draw_tool, "refresh_schema"):
             self.draw_tool.refresh_schema()
         if self.recipe_draw_tool is not None and hasattr(self.recipe_draw_tool, "refresh_schema"):
@@ -169,6 +171,7 @@ class StudioApi:
         return _json({"ok": True, "templates": self.builder.list_templates()})
 
     def _workflow_payload(self, name: str, wf: dict) -> dict:
+        refresh_config_options(self.plugin_config, self.builder, self.store)
         detected = detect_slots(wf)
         profile = (
             self.profiles.effective(name, wf)
@@ -184,6 +187,7 @@ class StudioApi:
             "nodes": list_nodes(wf),
             "detected_slots": detected,
             "profile_slots": selected,
+            "profile_source": profile.get("source", "detected"),
             "drop_nodes": profile.get("drop_nodes") or [],
             "slot_options": {
                 role: node_options_for_slot(wf, role, str((selected.get(role) or {}).get("node") or ""))
@@ -299,6 +303,7 @@ class StudioApi:
             return _json({"ok": False, "error": str(e)})
         if self.profiles is not None:
             self.profiles.delete(name)
+        refresh_config_options(self.plugin_config, self.builder, self.store)
         return _json({"ok": True, "name": name})
 
     async def detect(self) -> Any:

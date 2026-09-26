@@ -60,8 +60,9 @@ from slot_mapping import (
     source_image_slots,
 )
 from resource_catalog import (
-    canonical_family, exact_matches, family_summary, filter_family, metadata_for,
-    page_number, resource_family, selection_error,
+    canonical_family, exact_matches, explicitly_named, family_summary,
+    filename_matches, filter_family, metadata_for, page_number, resource_family,
+    selection_error,
 )
 from workflow_builder import WorkflowBuilder
 
@@ -307,7 +308,7 @@ def _match_lora_resources(
 
 
 _RESOURCE_QUERY_PROPERTIES = {
-    "model_family": {"type": "string", "description": "资源家族，如 anima/krea2/sdxl/flux/illustrious；unknown 查未识别项。底模和 LoRA 按生图家族查询"},
+    "model_family": {"type": "string", "description": "资源家族，如 anima/krea2/sdxl/flux/illustrious；unknown 查未识别项。按名称搜索时可省略，按 LoRA 用途挑选时请填写生图家族"},
     "limit": {"type": "integer", "description": "每页数量，默认 5，最多 10"},
     "offset": {"type": "integer", "description": "分页偏移，默认 0；使用返回的 next_offset"},
     "include_unknown": {"type": "boolean", "description": "同时显示家族未知项，默认 false；未知项需核实兼容性"},
@@ -320,31 +321,92 @@ def _resource_page(client, resources, kind, query="", family="", limit=5, offset
     meta = metadata_for(resources, kind)
     rules = getattr(client, "resource_family_rules", [])
     title = "LoRA" if kind == "lora" else "底模"
-    if not family:
-        return f"【{title}家族摘要】" + family_summary(names, meta, rules, kind) + "。请指定 model_family 后查询文件；query 可省略。"
-    names = filter_family(names, meta, family, rules, kind, include_unknown)
-    if query:
-        exact = exact_matches(names, query)
-        if exact:
-            names = exact
-        elif kind == "lora":
-            names = _match_lora_resources(names, meta, query, limit=len(names))
-        else:
-            names = [n for n in names if query.casefold() in n.casefold()]
+    if not family and not query:
+        return f"【{title}家族摘要】" + family_summary(names, meta, rules, kind) + "。指定 model_family 可浏览文件；填写 query 可跨家族按名称搜索。"
+    matches = _resource_matches(client, resources, kind, query, family, include_unknown)
     limit = max(1, page_number(limit, 5, 10))
     offset = page_number(offset)
-    shown = names[offset:offset + limit]
-    lines = [f"【{title} {canonical_family(family)}】共 {len(names)} 项，显示 {offset + 1 if shown else 0}-{offset + len(shown)}"]
-    for name in shown:
+    shown = matches[offset:offset + limit]
+    scope = canonical_family(family) if family else f"名称搜索：{query}"
+    lines = [f"【{title} {scope}】共 {len(matches)} 项，显示 {offset + 1 if shown else 0}-{offset + len(shown)}"]
+    for name, mode, _ in shown:
         found, source = resource_family(name, meta.get(name), rules, kind)
-        lines.append(f"{name} [家族={found or 'unknown'}；{source}]")
+        near_note = "；近似名称，请核对" if mode == "near" else ""
+        lines.append(f"{name} [家族={found or 'unknown'}；{source}{near_note}]")
         if kind == "lora":
             lines.extend("  " + line[:240] for line in _lora_info_summary(meta.get(name) or {}, detailed=True))
-    if offset + limit < len(names):
+    if offset + limit < len(matches):
         lines.append(f"next_offset={offset + limit}；可进一步用 query 缩小范围。")
     if not shown:
         lines.append("无匹配项；检查家族/关键词，或用 model_family=unknown 查看未识别资源并配置归类规则。")
-    if include_unknown or canonical_family(family) == "unknown":
+        if kind == "lora" and not family:
+            lines.append("按 LoRA 用途、类别或标签查询时，请同时填写生图工作流的 model_family。")
+    if include_unknown or canonical_family(family) == "unknown" or any(
+        not resource_family(name, meta.get(name), rules, kind)[0] for name, _, _ in shown
+    ):
+        lines.append("unknown 项未确认兼容性，请核实元数据或配置归类后选用。")
+    return "\n".join(lines)
+
+
+def _resource_matches(client, resources, kind, query, family="", include_unknown=False):
+    names = resources.get("lora_name" if kind == "lora" else "unet_name") or []
+    meta = metadata_for(resources, kind)
+    rules = getattr(client, "resource_family_rules", [])
+    if family:
+        names = filter_family(names, meta, family, rules, kind, include_unknown)
+    else:
+        names = sorted(set(names), key=str.casefold)
+        if not include_unknown:
+            names = [name for name in names if resource_family(name, meta.get(name), rules, kind)[0]
+                     or (query and explicitly_named(name, query))]
+    if not query:
+        return [(name, "list", 1.0) for name in names]
+    exact = exact_matches(names, query)
+    if exact:
+        return [(name, "exact", 1.0) for name in exact]
+    if kind == "lora" and family:
+        semantic = _match_lora_resources(names, meta, query, limit=len(names))
+        if semantic:
+            return [(name, "keyword", 1.0) for name in semantic]
+    return filename_matches(names, query)
+
+
+def _all_resource_search(client, resources, query, family="", limit=5, offset=0,
+                         include_unknown=False) -> str:
+    rows = []
+    for kind, title in (("model", "底模"), ("lora", "LoRA")):
+        for name, mode, score in _resource_matches(client, resources, kind, query, family, include_unknown):
+            meta = metadata_for(resources, kind)
+            found, source = resource_family(name, meta.get(name),
+                                            getattr(client, "resource_family_rules", []), kind)
+            rows.append((title, name, found or "unknown", source, mode, score))
+    if not family:
+        for field, title in (("clip_name", "CLIP"), ("vae_name", "VAE"),
+                             ("embeddings", "Embedding")):
+            rows.extend((title, name, "", "", mode, score)
+                        for name, mode, score in filename_matches(resources.get(field) or [], query))
+    priority = {"exact": 0, "name": 1, "keyword": 2, "near": 3}
+    rows.sort(key=lambda row: (priority[row[4]], -row[5], row[0] != "底模", row[1].casefold()))
+    limit = max(1, page_number(limit, 5, 10))
+    offset = page_number(offset)
+    shown = rows[offset:offset + limit]
+    lines = [f"【资源名称搜索：{query}】共 {len(rows)} 项，显示 {offset + 1 if shown else 0}-{offset + len(shown)}"]
+    for title, name, found, source, mode, _ in shown:
+        family_note = f" [家族={found}；{source}]" if found else ""
+        near_note = "（近似名称，请核对）" if mode == "near" else ""
+        lines.append(f"{title}: {name}{family_note}{near_note}")
+        if title == "LoRA":
+            info = (resources.get("lora_meta") or {}).get(name) or {}
+            lines.extend("  " + line[:240] for line in _lora_info_summary(info, detailed=True))
+    if offset + limit < len(rows):
+        lines.append(f"next_offset={offset + limit}")
+    if not shown:
+        lines.append("无匹配项；可换用文件名片段，或显式查询 model_family=unknown / include_unknown=true。")
+        if not family:
+            lines.append("按 LoRA 用途、类别或标签查询时，请指定 kind=lora 和生图工作流的 model_family。")
+    if include_unknown or canonical_family(family) == "unknown" or any(
+        found == "unknown" for _, _, found, _, _, _ in shown
+    ):
         lines.append("unknown 项未确认兼容性，请核实元数据或配置归类后选用。")
     return "\n".join(lines)
 
@@ -356,6 +418,7 @@ class ComfyuiListModelsTool(FunctionTool[AstrAgentContext]):
     name: str = "comfyui_list_models"
     description: str = (
         "查询本机上ComfyUI可用的UNET底模、LoRA、CLIP、VAE、Embedding列表。"
+        "给出 query 可按模型名称跨家族搜索；缺少 kind 时同时搜索各类资源，结果标注家族。"
         "LoRA 会附带触发词，以及 LoRA Manager/Civitai 的 style、character 等类别、标签和使用建议。"
         "清单会自动同步并本地缓存，ComfyUI离线时返回最近一次同步结果。"
         "用户询问可用资源，或绘图时需要按画风、角色、服饰、效果挑选已安装 LoRA 时使用。"
@@ -375,7 +438,7 @@ class ComfyuiListModelsTool(FunctionTool[AstrAgentContext]):
                 },
                 "query": {
                     "type": "string",
-                    "description": "按文件名、LoRA 类别或标签过滤；可选",
+                    "description": "模型名或文件名片段支持跨家族近似搜索；LoRA 类别/标签搜索需指定 model_family",
                 },
                 "limit": {
                     "type": "number",
@@ -405,9 +468,13 @@ class ComfyuiListModelsTool(FunctionTool[AstrAgentContext]):
         family = str(kwargs.get("model_family") or "").strip()
         query = str(kwargs.get("query") or "").strip()
         if kind == "all":
+            if query:
+                return _all_resource_search(self.client, resources, query, family,
+                                            kwargs.get("limit", 5), kwargs.get("offset", 0),
+                                            _as_bool(kwargs.get("include_unknown")))
             return "【资源数量摘要】\n" + "\n".join(
                 f"{title}: {len(resources.get(field) or [])}" for field, title in field_titles.values()
-            ) + "\n请指定 kind 和 model_family 查询底模或 LoRA。"
+            ) + "\n填写 query 可跨类别按名称搜索；指定 kind 和 model_family 可浏览底模或 LoRA。"
         if kind in {"unet", "lora"}:
             return _resource_page(self.client, resources, "model" if kind == "unet" else "lora",
                                   query, family, kwargs.get("limit", 5), kwargs.get("offset", 0),
@@ -1889,7 +1956,7 @@ class ComfyuiModelsSearchTool(FunctionTool[AstrAgentContext]):
                 },
                 "query": {
                     "type": "string",
-                    "description": "文件名关键词过滤（可选）",
+                    "description": "文件名或模型名称；支持跨家族近似搜索（可选）",
                 },
                 **_RESOURCE_QUERY_PROPERTIES,
             },
@@ -3092,7 +3159,8 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
 
     name: str = "comfyui_lookup"
     description: str = (
-        "查询角色/画师规范词和已安装底模/LoRA。model/lora 请传与生图一致的 model_family；省略仅返回家族数量。"
+        "查询角色/画师规范词和已安装底模/LoRA。model/lora 指定 query 可跨家族按名称搜索；"
+        "浏览清单时传与生图一致的 model_family，两个参数都省略时返回家族数量。"
         "绘图需要某种画风、角色、服饰或效果时，可主动查询匹配的 LoRA，用户无需点名 LoRA 或提供文件名。"
         "character/artist：把触发词写进 prompt 或 artist。"
         "model/lora：选择符合需求的结果，把实际文件名填进 comfyui_draw 的 model/lora。LoRA 的 query 支持 LoRA Manager/Civitai "
@@ -3111,7 +3179,7 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
                 },
                 "query": {
                     "type": "string",
-                    "description": "角色/画师名、模型文件名或关键词；type=lora 还可填画风、服饰、效果等用途标签或 style/character/concept 分类。支持中文、日文、罗马音",
+                    "description": "角色/画师名或模型名称；模型名可跨家族近似搜索。LoRA 用途标签或 style/character/concept 分类需指定 model_family。支持中文、日文、罗马音",
                 },
                 "limit": {
                     "type": "number",

@@ -180,17 +180,19 @@ Qwen Image 2.1 可分别配置 T2I 与编辑工作流：生图家族 `qwen` 绑�
 comfyui_lookup(type="lora", model_family="anima", query="style")
 comfyui_lookup(type="lora", model_family="krea2", query="水彩")
 comfyui_lookup(type="model", model_family="sdxl")
+comfyui_lookup(type="model", query="miao miao harem")
 comfyui_list_models(kind="lora", model_family="anima", limit=5, offset=0)
 comfyui_list_models(kind="model", model_family="sdxl", limit=5)
+comfyui_list_models(query="miaomao")
 ```
 
-默认每页 5 项，最多 10 项；有后续结果时返回 `next_offset`。省略家族时先给出各家族数量，`kind=all` 仅给资源数量摘要。`kind=model` 与 `kind=unet` 都表示底模。查询底模/LoRA 时可以省略 `query`，角色/画师查询仍需关键词。`comfyui_models_search` 和 `comfyui_model_info` 也支持家族参数；底模元数据用 `types="Checkpoint"`，LoRA 用 `types="LORA"`。
+默认每页 5 项，最多 10 项；有后续结果时返回 `next_offset`。省略家族和 `query` 时给出家族数量，`kind=all` 给资源数量摘要。填写 `query` 后可省略家族按文件名跨家族搜索；`kind=all` 会跨资源类别搜索。名称搜索忽略大小写与常见分隔符，找不到直接命中时返回少量近似名称并提示核对。搜索结果标明家族；选用底模或 LoRA 时仍需匹配生图工作流家族。`kind=model` 与 `kind=unet` 都表示底模。查询底模/LoRA 时可以省略 `query`，角色/画师查询仍需关键词。`comfyui_models_search` 和 `comfyui_model_info` 也支持家族参数；底模元数据用 `types="Checkpoint"`，LoRA 用 `types="LORA"`。
 
 归类优先级：插件配置中的 `resource_family_rules` → 基础模型元数据 → 目录/文件名推断。配置规则支持大小写及斜杠归一化，例如 `kind=lora, family=anima, pattern=Anima/*`；无特征的底模可用完整文件名配置。家族名应与生图路由一致，自定义路由需添加对应规则。SDXL、Pony、Illustrious 分别列出；FLUX Krea 与 Krea2 分开归类。
 
-默认结果排除未知家族，使用 `model_family="unknown"` 或 `include_unknown=true` 可查看，并明确标记兼容性未确认。未知资源不会通过模糊关键词自动选用；核实后仍可显式填写完整文件名。生图与配方提交会拦截已知家族冲突，同名文件要求明确目录。规则和文件名推断依赖标注准确性，不构成模型张量结构验证。固定在工作流中的加速 LoRA 保持原设置。
+默认浏览结果排除未知家族；名称查询准确命中文件名或去扩展名的名称时会显示未知资源，并提示兼容性未确认。使用 `model_family="unknown"` 或 `include_unknown=true` 可查看其他未知项。未知资源不会通过近似名称自动推荐；核实后仍可显式填写完整文件名。生图与配方提交会拦截已知家族冲突，同名文件要求明确目录。规则和文件名推断依赖标注准确性，不构成模型张量结构验证。固定在工作流中的加速 LoRA 保持原设置。
 
-LoRA 查询同时支持文件名、分类、标签和用途关键词。在线元数据回退只接受文件名匹配的版本，避免直接套用搜索结果首项。升级后资源缓存会重新同步，原有离线缓存仍可回退。
+LoRA 名称可跨家族查询；按分类、标签和用途关键词挑选 LoRA 时需指定 `model_family`。在线元数据回退只接受文件名匹配的版本，避免直接套用搜索结果首项。升级后资源缓存会重新同步，原有离线缓存仍可回退。
 
 
 `comfyui_draw` 的 `lora` 是字符串：可填文件名、唯一关键词，多个用逗号分隔；指定权重时传 JSON 数组字符串，例如 `"[{\"name\":\"style.safetensors\",\"strength\":0.6}]"`，其中示例文件名需替换成查询结果。传入列表会覆盖工作流映射的 Power Loader 占位槽或旧版明确映射的可选 LoRA 链；独立加速 LoRA 始终保持工作流原值。省略时沿用可选 LoRA 原值，传 `"[]"` 或 `"none"` 只关闭映射槽位。

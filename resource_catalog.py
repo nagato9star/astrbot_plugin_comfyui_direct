@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import re
 from collections import Counter
+from difflib import SequenceMatcher
 
 
 def canonical_family(value: str) -> str:
@@ -81,6 +82,60 @@ def exact_matches(names: list[str], query: str) -> list[str]:
     if full:
         return full
     return [n for n in names if n.replace("\\", "/").rsplit("/", 1)[-1].casefold() == q]
+
+
+def _name_key(value: str) -> str:
+    text = str(value).replace("\\", "/").casefold()
+    text = re.sub(r"\.(?:safetensors|ckpt|pt|pth|bin)$", "", text)
+    return re.sub(r"[\W_]+", "", text)
+
+
+def explicitly_named(name: str, query: str) -> bool:
+    """Allow an unclassified file only when its full name or stem was named."""
+    key = _name_key(query)
+    basename = str(name).replace("\\", "/").rsplit("/", 1)[-1]
+    return bool(key) and key in {_name_key(name), _name_key(basename)}
+
+
+def _near_name_score(query: str, name: str) -> float:
+    """Compare a possibly abbreviated query with the closest part of a filename."""
+    if len(query) < 5:
+        return 0.0
+    base = _name_key(name.replace("\\", "/").rsplit("/", 1)[-1])
+    if not base:
+        return 0.0
+    matcher = SequenceMatcher(None, query, base)
+    block = max(matcher.get_matching_blocks(), key=lambda item: item.size)
+    if block.size < max(3, len(query) // 2):
+        return 0.0
+    center = max(0, block.b - block.a)
+    scores = [matcher.ratio()]
+    for start in range(max(0, center - 2), min(len(base), center + 3)):
+        for length in range(max(1, len(query) - 2), len(query) + 3):
+            scores.append(SequenceMatcher(None, query, base[start:start + length]).ratio())
+    return max(scores)
+
+
+def filename_matches(names: list[str], query: str) -> list[tuple[str, str, float]]:
+    """Rank exact, normalized-substring, then conservative approximate filename hits."""
+    names = sorted(set(names), key=str.casefold)
+    exact = exact_matches(names, query)
+    if exact:
+        return [(name, "exact", 1.0) for name in exact]
+    normalized_query = _name_key(query)
+    if not normalized_query:
+        return []
+    raw_query = str(query).replace("\\", "/").casefold()
+    contained = [name for name in names if raw_query in name.replace("\\", "/").casefold()
+                 or normalized_query in _name_key(name)]
+    if contained:
+        return [(name, "name", 1.0) for name in sorted(
+            contained, key=lambda item: (len(_name_key(item)), item.casefold())
+        )]
+    near = [(name, score) for name in names
+            if (score := _near_name_score(normalized_query, name)) >= 0.82]
+    near.sort(key=lambda item: (-item[1], item[0].casefold()))
+    return [(name, "near", score) for name, score in near[:20]]
 
 
 def page_number(value, default=0, maximum=100000) -> int:

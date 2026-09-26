@@ -2001,16 +2001,22 @@ def test_manual_profile_skips_detection() -> None:
 
 
 def test_resource_family_queries() -> None:
-    from resource_catalog import filter_family, resource_family, selection_error
+    from resource_catalog import filename_matches, filter_family, resource_family, selection_error
     from tools import ComfyuiLookupTool, ComfyuiListModelsTool, ComfyuiModelsSearchTool, _match_resource
 
     resources = {
-        "unet_name": ["Anima/base.safetensors", "SDXL/base.safetensors", "mystery.safetensors"],
+        "unet_name": [
+            "Anima/base.safetensors", "SDXL/base.safetensors", "mystery.safetensors",
+            "Anima/miao_miaoHarem_anima16.safetensors",
+        ],
         "lora_name": [f"Anima/style{i:02}.safetensors" for i in range(16)] + [
             "Krea2/style.safetensors", "SDXL/style.safetensors", "unknown.safetensors",
             "Anima/wrong.safetensors",
         ],
-        "lora_meta": {"Anima/wrong.safetensors": {"base_model": "SDXL 1.0"}},
+        "lora_meta": {
+            "Anima/wrong.safetensors": {"base_model": "SDXL 1.0"},
+            "Anima/style00.safetensors": {"categories": ["watercolor"]},
+        },
     }
     class Client(ComfyUIClient):
         resource_family_rules = []
@@ -2030,6 +2036,9 @@ def test_resource_family_queries() -> None:
     assert resource_family("mystery.safetensors", rules=rule, kind="model")[0] == "krea2"
     assert resource_family("mystery.safetensors", rules=rule, kind="lora")[0] == ""
     assert len(_match_resource(resources["unet_name"], "base.safetensors")) == 2
+    assert filename_matches(["Anima/miao_miaoHarem_anima16.safetensors"], "miao miao harem")[0][1] == "name"
+    assert filename_matches(["Anima/miao_miaoHarem_anima16.safetensors"], "miaomao")[0][1] == "near"
+    assert not filename_matches(["Anima/base.safetensors"], "xy")
     assert "unknown.safetensors" not in filter_family(resources["lora_name"], {}, "anima")
     assert selection_error(resources, {"loras": [{"name": "SDXL/style.safetensors"}]}, "anima")
     assert selection_error(resources, {"model": "SDXL/base.safetensors"}, "anima")
@@ -2046,14 +2055,38 @@ def test_resource_family_queries() -> None:
         assert "style10" in second and "style00" not in second
         models = await lookup.call(None, type="model", model_family="sdxl")
         assert "SDXL/base" in models and "Anima/base" not in models
+        named = await lookup.call(None, type="model", query="miao miao harem")
+        assert "Anima/miao_miaoHarem" in named and "家族=anima" in named
+        approximate = await lookup.call(None, type="model", query="miaomao")
+        assert "Anima/miao_miaoHarem" in approximate and "近似名称" in approximate
+        scoped_approximate = await lookup.call(None, type="model", model_family="anima", query="miaomao")
+        assert "Anima/miao_miaoHarem" in scoped_approximate
+        scoped_miss = await lookup.call(None, type="model", model_family="sdxl", query="miaomao")
+        assert "Anima/miao_miaoHarem" not in scoped_miss and "无匹配项" in scoped_miss
+        exact_unknown = await lookup.call(None, type="model", query="mystery")
+        assert "mystery.safetensors" in exact_unknown and "未确认兼容性" in exact_unknown
+        assert "mystery.safetensors" not in await lookup.call(None, type="model", query="mysteri")
         unknown = await lookup.call(None, type="lora", model_family="unknown")
         assert "unknown.safetensors" in unknown and "未确认兼容性" in unknown
         listing = await ComfyuiListModelsTool(client=client).call(None, kind="lora", model_family="krea2")
         assert "Krea2/style" in listing and "SDXL/style" not in listing
         model_listing = await ComfyuiListModelsTool(client=client).call(None, kind="model", model_family="sdxl")
         assert "SDXL/base" in model_listing and "Anima/base" not in model_listing
+        by_name = await ComfyuiListModelsTool(client=client).call(None, query="miaomao")
+        assert "底模: Anima/miao_miaoHarem" in by_name and "近似名称" in by_name
+        assert "SDXL/base" not in by_name
+        direct_name = await ComfyuiListModelsTool(client=client).call(None, kind="model", query="miao-miao")
+        assert "Anima/miao_miaoHarem" in direct_name and "近似名称" not in direct_name
+        lora_name = await ComfyuiListModelsTool(client=client).call(None, kind="lora", query="stile00")
+        assert "Anima/style00" in lora_name and "近似名称" in lora_name
+        purpose_without_family = await lookup.call(None, type="lora", query="watercolor")
+        assert "Anima/style00" not in purpose_without_family
+        purpose_with_family = await lookup.call(None, type="lora", model_family="anima", query="watercolor")
+        assert "Anima/style00" in purpose_with_family
         folder = await ComfyuiModelsSearchTool(client=client).call(None, folder="unet", model_family="anima")
         assert "Anima/base" in folder and "SDXL/base" not in folder
+        folder_name = await ComfyuiModelsSearchTool(client=client).call(None, folder="unet", query="miaomao")
+        assert "Anima/miao_miaoHarem" in folder_name and "近似名称" in folder_name
         draw = ComfyuiDrawTool(client=client)
         name, error = await draw._resolve_model("base", "anima")
         assert name == "Anima/base.safetensors" and error is None

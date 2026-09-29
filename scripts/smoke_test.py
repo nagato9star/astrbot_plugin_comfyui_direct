@@ -101,6 +101,7 @@ from slot_mapping import (  # noqa: E402
     ui_to_api,
 )
 from workflow_builder import WorkflowBuilder  # noqa: E402
+from workflow_graph import validate_api_workflow, validate_ui_snapshot  # noqa: E402
 from tools import (  # noqa: E402
     ComfyuiDrawTool,
     ComfyuiEditTool,
@@ -516,6 +517,7 @@ def test_llm_entry_schemas() -> None:
     assert draw.name == "comfyui_draw"
     assert draw.parameters["required"] == ["model_family", "prompt"]
     assert draw.parameters["properties"]["model_family"]["enum"] == ["anima", "krea2"]
+    assert draw.parameters["properties"]["lora"]["type"] == "array"
 
     with tempfile.TemporaryDirectory() as td:
         store = RecipeStore(Path(td), preferred_default="柔光")
@@ -532,12 +534,23 @@ def test_llm_entry_schemas() -> None:
         assert recipe_draw.name == "comfyui_recipe_draw"
         assert recipe_draw.parameters["required"] == ["prompt"]
         assert recipe_draw.parameters["properties"]["recipe"]["enum"] == ["柔光"]
-        assert ComfyuiGenerateTool(
+        advanced = ComfyuiGenerateTool(
             store=store,
             families=registry,
             profiles=profiles,
-        ).name == "comfyui_generate"
-        assert ComfyuiRecipeTool(store=store, families=registry).name == "comfyui_recipe"
+        )
+        assert advanced.name == "comfyui_generate"
+        assert advanced.parameters["properties"]["lora"]["type"] == "array"
+        recipe_tool = ComfyuiRecipeTool(store=store, families=registry)
+        recipe_tool.refresh_schema()
+        assert recipe_tool.parameters["required"] == ["action"]
+        assert recipe_tool.parameters["properties"]["model_family"]["enum"] == ["anima", "krea2"]
+        assert recipe_tool.parameters["properties"]["lora"]["type"] == "array"
+        assert "description" in recipe_tool.parameters["properties"]
+        assert "delete" not in recipe_tool.parameters["properties"]["action"]["enum"]
+        recipe_tool.allow_delete = True
+        recipe_tool.refresh_schema()
+        assert "delete" in recipe_tool.parameters["properties"]["action"]["enum"]
     print("  llm entry schemas OK")
 
 
@@ -1552,6 +1565,115 @@ def test_template_management() -> None:
     print("  template management OK")
 
 
+def test_graph_workflow_validation() -> None:
+    wf = {
+        "445": {"class_type": "LoadImage", "inputs": {"image": "reference.png"}},
+        "446": {"class_type": "SaveImage", "inputs": {"images": ["445", 0]}},
+        "447": {"class_type": "CLIPTextEncode", "inputs": {"text": "original prompt"}},
+    }
+    ui = {
+        "nodes": [
+            {"id": 445, "type": "LoadImage", "outputs": [{"name": "IMAGE"}]},
+            {"id": 446, "type": "SaveImage"},
+            {"id": 447, "type": "CLIPTextEncode"},
+        ],
+        "links": [[1, 445, 0, 446, 0, "IMAGE"]],
+    }
+    assert set(validate_api_workflow(wf)) == {"445", "446", "447"}
+    assert validate_ui_snapshot(ui, wf) is ui
+    with tempfile.TemporaryDirectory() as td:
+        builder = WorkflowBuilder(plugin_dir=PLUGIN, custom_dir=Path(td))
+        builder.save_template("standard", wf)
+        builder.save_ui_template("standard", ui)
+        loaded = builder.load_template("standard")
+        assert set(loaded) == {"445", "446", "447"}
+        profiles = WorkflowProfileStore(Path(td) / "profiles")
+        assert profiles.effective("standard", loaded)["drop_nodes"] == []
+        apply_slots(loaded, {"prompt": {"node": "447", "field": "text"}}, {"prompt": "new prompt"}, drop_nodes=[])
+        assert loaded["447"]["inputs"]["text"] == "new prompt"
+        assert set(loaded) == {"445", "446", "447"}
+        assert builder.load_ui_template("standard") == ui
+        builder.delete_template("standard")
+        assert builder.load_ui_template("standard") is None
+    invalid = json.loads(json.dumps(wf))
+    invalid["446"]["inputs"]["images"] = ["445", 1]
+    try:
+        validate_ui_snapshot(ui, invalid)
+    except ValueError as e:
+        assert "输出端口" in str(e)
+    else:
+        raise AssertionError("missing output port was accepted")
+    print("  graph API/UI validation and standard node IDs OK")
+
+
+def test_graph_webapi_submission() -> None:
+    import webapi as webapi_module
+
+    wf = {
+        "445": {"class_type": "LoadImage", "inputs": {"image": "reference.png"}},
+        "446": {"class_type": "SaveImage", "inputs": {"images": ["445", 0]}},
+    }
+    ui = {
+        "nodes": [
+            {"id": 445, "type": "LoadImage", "outputs": [{"name": "IMAGE"}]},
+            {"id": 446, "type": "SaveImage"},
+        ],
+        "links": [[1, 445, 0, 446, 0, "IMAGE"]],
+    }
+
+    class FakeClient:
+        def __init__(self):
+            self.submitted = []
+
+        async def submit_prompt_detail(self, workflow, ui_workflow=None):
+            self.submitted.append((workflow, ui_workflow))
+            return "graph-pid", None
+
+        async def get_history_entry(self, prompt_id):
+            assert prompt_id == "graph-pid"
+            return {"status": {"status_str": "success"}, "outputs": {
+                "446": {"images": [{"filename": "graph.png", "type": "output"}]}
+            }}
+
+        async def download_image(self, filename, subfolder="", image_type="output"):
+            assert filename == "graph.png" and image_type == "output"
+            return b"\x89PNG\r\n\x1a\nimage-data"
+
+    async def run():
+        body = {"name": "standard", "workflow": wf, "ui_workflow": ui}
+
+        async def fake_body():
+            return body
+
+        old_body, old_json, old_query = webapi_module._body, webapi_module._json, webapi_module._query
+        webapi_module._body = fake_body
+        webapi_module._json = lambda data, status=200: {**data, "_status": status}
+        webapi_module._query = lambda key, default="": "graph-pid" if key == "pid" else default
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                builder = WorkflowBuilder(plugin_dir=PLUGIN, custom_dir=root / "workflows")
+                store = RecipeStore(root / "recipes")
+                client = FakeClient()
+                shared = {}
+                api = webapi_module.StudioApi(client, builder, store, root / "output", shared)
+                saved = await api.save_graph()
+                assert saved["ok"] and builder.load_ui_template("standard") == ui
+                submitted = await api.run_graph()
+                assert submitted["prompt_id"] == "graph-pid"
+                assert client.submitted == [(wf, ui)]
+                assert shared["web_pending_runs"]["graph-pid"]["entry"] == "graph"
+                result = await api.generate_poll()
+                assert result["done"] and result["data_url"].startswith("data:image/png;base64,")
+                history = store.list_history(1)[0]
+                assert history["entry"] == "graph" and history["workflow"] == "standard"
+        finally:
+            webapi_module._body, webapi_module._json, webapi_module._query = old_body, old_json, old_query
+
+    asyncio.run(run())
+    print("  graph WebUI save / remote submission / history OK")
+
+
 def test_submit_error_parse() -> None:
     def handler(request):
         return httpx.Response(
@@ -2042,6 +2164,8 @@ def test_resource_family_queries() -> None:
         first = await lookup.call(None, type="lora", model_family="anima", query="style", limit=100)
         assert first.count(".safetensors") == 10 and "next_offset=10" in first
         assert "Krea2/" not in first and "unknown.safetensors" not in first and "wrong" not in first
+        named = await lookup.call(None, type="lora", model_family="anima", query="SDXL/style.safetensors")
+        assert "SDXL/style.safetensors" in named and "兼容性待核对" in named
         second = await lookup.call(None, type="lora", model_family="anima", query="style", offset=10)
         assert "style10" in second and "style00" not in second
         models = await lookup.call(None, type="model", model_family="sdxl")
@@ -2131,6 +2255,8 @@ def main() -> None:
     test_collect_trigger_words()
     test_lora_list_input()
     test_template_management()
+    test_graph_workflow_validation()
+    test_graph_webapi_submission()
     test_submit_error_parse()
     test_execution_status_and_image_media_type()
     test_webapi_original_output_and_interrupt_guard()

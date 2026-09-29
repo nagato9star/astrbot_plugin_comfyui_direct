@@ -140,6 +140,7 @@ BASIC_LLM_TOOLS = {"comfyui_draw", "comfyui_edit", "comfyui_recipe_draw", "comfy
 # 这些工具可能读取任意本地文件、执行未经映射的自定义节点或影响其他任务，
 # 默认不交给模型；需要时由管理员显式打开配置。
 LLM_UNSAFE_TOOLS = {
+    "comfyui_generate",
     "comfyui_run_workflow",
     "comfyui_upload_file",
     "comfyui_free_memory",
@@ -344,6 +345,15 @@ class ComfyUIDirectPlugin(Star):
             client=self._client,
         )
 
+        recipe_tool = ComfyuiRecipeTool(
+            store=self._store,
+            allow_delete=allow_llm_unsafe_tools,
+            builder=self._builder,
+            default_workflow=self._builder.default_workflow,
+            families=self._families,
+        )
+        recipe_tool.refresh_schema()
+
         tools = [
             self._draw_tool,
             self._edit_tool,
@@ -377,13 +387,7 @@ class ComfyUIDirectPlugin(Star):
             ComfyuiValidateWorkflowTool(client=self._client),
             ComfyuiUploadFileTool(client=self._client),
             ComfyuiModelsSearchTool(client=self._client),
-            ComfyuiRecipeTool(
-                store=self._store,
-                allow_delete=allow_llm_unsafe_tools,
-                builder=self._builder,
-                default_workflow=self._builder.default_workflow,
-                families=self._families,
-            ),
+            recipe_tool,
         ]
         for t in tools:
             if llm_tool_mode != "full" and t.name not in BASIC_LLM_TOOLS:

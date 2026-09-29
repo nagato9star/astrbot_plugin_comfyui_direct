@@ -350,7 +350,9 @@ class ComfyUIClient:
         except Exception:  # noqa: BLE001
             pass
 
-    async def submit_prompt_detail(self, workflow: dict) -> tuple[str | None, str | None]:
+    async def submit_prompt_detail(
+        self, workflow: dict, ui_workflow: dict | None = None
+    ) -> tuple[str | None, str | None]:
         """提交工作流，返回 (prompt_id, 错误信息)。成功时错误信息为 None。
 
         提交时同步构造 UI 格式快照塞进 extra_data.extra_pnginfo，
@@ -372,16 +374,20 @@ class ComfyUIClient:
             except ImportError:
                 from astrbot_plugin_comfyui_direct.api_to_ui import build_extra_pnginfo  # 沙箱/包环境兜底
 
-            objinfo = await self._get_object_info_cached()
-            if objinfo:
-                extra_pnginfo = build_extra_pnginfo(workflow, objinfo)
-                if extra_pnginfo:
-                    body["extra_data"] = {"extra_pnginfo": extra_pnginfo}
-                    self._meta_debug("inject_ok")
-                else:
-                    self._meta_debug("build_returned_none")
+            if ui_workflow is not None:
+                body["extra_data"] = {"extra_pnginfo": {"workflow": ui_workflow}}
+                self._meta_debug("inject_original_ui")
             else:
-                self._meta_debug("objinfo_none")
+                objinfo = await self._get_object_info_cached()
+                if objinfo:
+                    extra_pnginfo = build_extra_pnginfo(workflow, objinfo)
+                    if extra_pnginfo:
+                        body["extra_data"] = {"extra_pnginfo": extra_pnginfo}
+                        self._meta_debug("inject_ok")
+                    else:
+                        self._meta_debug("build_returned_none")
+                else:
+                    self._meta_debug("objinfo_none")
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[ComfyUIDirect] 元数据注入失败，按裸提交继续: {e}")
             self._meta_debug(f"inject_fail: {e!r}")

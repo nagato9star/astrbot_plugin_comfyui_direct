@@ -307,7 +307,7 @@ def _match_lora_resources(
 
 
 _RESOURCE_QUERY_PROPERTIES = {
-    "model_family": {"type": "string", "description": "资源家族，如 anima/krea2/sdxl/flux/illustrious；unknown 查未识别项。底模和 LoRA 按生图家族查询"},
+    "model_family": {"type": "string", "description": "按用途、类别或标签搜索时指定家族；完整已知文件名可跨家族查找。unknown 查未识别项"},
     "limit": {"type": "integer", "description": "每页数量，默认 5，最多 10"},
     "offset": {"type": "integer", "description": "分页偏移，默认 0；使用返回的 next_offset"},
     "include_unknown": {"type": "boolean", "description": "同时显示家族未知项，默认 false；未知项需核实兼容性"},
@@ -316,28 +316,37 @@ _RESOURCE_QUERY_PROPERTIES = {
 
 def _resource_page(client, resources, kind, query="", family="", limit=5, offset=0,
                    include_unknown=False) -> str:
-    names = resources.get("lora_name" if kind == "lora" else "unet_name") or []
+    all_names = resources.get("lora_name" if kind == "lora" else "unet_name") or []
+    names = all_names
     meta = metadata_for(resources, kind)
     rules = getattr(client, "resource_family_rules", [])
     title = "LoRA" if kind == "lora" else "底模"
-    if not family:
+    exact = exact_matches(all_names, query) if query else []
+    if exact:
+        names = exact
+    elif family:
+        names = filter_family(names, meta, family, rules, kind, include_unknown)
+        if query:
+            if kind == "lora":
+                names = _match_lora_resources(names, meta, query, limit=len(names))
+            else:
+                names = [n for n in names if query.casefold() in n.casefold()]
+    else:
         return f"【{title}家族摘要】" + family_summary(names, meta, rules, kind) + "。请指定 model_family 后查询文件；query 可省略。"
-    names = filter_family(names, meta, family, rules, kind, include_unknown)
-    if query:
-        exact = exact_matches(names, query)
-        if exact:
-            names = exact
-        elif kind == "lora":
-            names = _match_lora_resources(names, meta, query, limit=len(names))
-        else:
-            names = [n for n in names if query.casefold() in n.casefold()]
     limit = max(1, page_number(limit, 5, 10))
     offset = page_number(offset)
     shown = names[offset:offset + limit]
     lines = [f"【{title} {canonical_family(family)}】共 {len(names)} 项，显示 {offset + 1 if shown else 0}-{offset + len(shown)}"]
     for name in shown:
         found, source = resource_family(name, meta.get(name), rules, kind)
-        lines.append(f"{name} [家族={found or 'unknown'}；{source}]")
+        compatibility = selection_error(
+            resources,
+            {"loras": [{"name": name}]} if kind == "lora" else {"model": name},
+            family,
+            rules,
+        ) if family else ""
+        warning = f"；兼容性待核对: {compatibility}" if compatibility else ""
+        lines.append(f"{name} [家族={found or 'unknown'}；{source}{warning}]")
         if kind == "lora":
             lines.extend("  " + line[:240] for line in _lora_info_summary(meta.get(name) or {}, detailed=True))
     if offset + limit < len(names):
@@ -357,7 +366,7 @@ class ComfyuiListModelsTool(FunctionTool[AstrAgentContext]):
     description: str = (
         "查询本机上ComfyUI可用的UNET底模、LoRA、CLIP、VAE、Embedding列表。"
         "LoRA 会附带触发词，以及 LoRA Manager/Civitai 的 style、character 等类别、标签和使用建议。"
-        "清单会自动同步并本地缓存，ComfyUI离线时返回最近一次同步结果。"
+        "清单会自动同步并本地缓存，ComfyUI离线时返回最近一次同步结果。完整已知文件名可跨家族查询；类别/标签筛选需指定 model_family。"
         "用户询问可用资源，或绘图时需要按画风、角色、服饰、效果挑选已安装 LoRA 时使用。"
     )
     parameters: dict = Field(
@@ -431,11 +440,11 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
         "日常自由生图使用 comfyui_draw，快捷配方生图使用 comfyui_recipe_draw。"
         "prompt 必填；未覆盖的参数沿用配方、插件配置或模板默认值，width/height 可按构图需求填写。"
         "当 LoRA 有助于实现用户要求的画风、角色、服饰或效果时，可主动查询并选用，用户无需点名 LoRA 或提供文件名。"
-        "先用 comfyui_lookup(type=\"lora\", query=需求关键词) 或 comfyui_list_models(kind=\"lora\")，"
-        "依据返回的用途说明、模型适用信息和推荐权重选择，再将实际文件名写入 lora 的 JSON 数组字符串。"
+        "按用途查询 LoRA 时使用 comfyui_lookup(type=\"lora\", model_family=所选家族, query=需求关键词)，"
+        "依据用途说明、兼容性和推荐权重选择，再把实际文件名写入 lora 对象数组。"
         "使用已记录的触发词时同步填写 trigger_words，保留原词格式；查询未提供触发词时可省略该字段并继续使用 LoRA。"
         "省略 lora 会沿用默认设置，传入列表会覆盖映射的可选 LoRA；已有独立加速节点的模板始终沿用其加速设置。"
-        "用户明确要求关闭可选 LoRA 时可传 \"[]\" 或 \"none\"，该操作只关闭映射槽位。"
+        "用户明确要求关闭可选 LoRA 时传空数组，该操作只关闭映射槽位。"
         "角色/画师名称不确定时用 comfyui_lookup 查询；底模、采样参数等按用户要求调整，其余沿用默认值。"
         "recipe 与 workflow 是两个独立入口：传 recipe 时按其模型家族解析当前工作流并写入保存参数；"
         "传 workflow 时按该模板生成、不套配方；两者都省略时优先默认配方，没有默认配方才用配置的默认工作流模板。"
@@ -447,7 +456,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "主提示词：danbooru 风格 tag 串，描述人物/动作/场景/服饰/构图，不含质量词与画师（必填）",
+                    "description": "主提示词，按所选工作流或家族的 prompt_style 编写；人物、动作、场景与构图依用户要求填写（必填）",
                 },
                 "artist": {
                     "type": "string",
@@ -470,13 +479,8 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                     "description": "底模文件名。必须用 comfyui_list_models 返回的完整名字（可能带子目录前缀，如 Anima\\miaomiaoHarem_anima16.safetensors）；传短名会自动匹配，匹配到多份会要求重填。用户指定底模时填，不知道文件名先查 comfyui_list_models",
                 },
                 "lora": {
-                    "type": "string",
-                    "description": (
-                        "本次使用的 LoRA 列表，可按画面需求主动查询并选用已安装资源。"
-                        "传 JSON 数组字符串，每项包含查询得到的 name，可附推荐 strength，例如 "
-                        '[{"name":"style.safetensors","strength":0.55}]（文件名用实际查询结果替换）。'
-                        "按 Power 插槽或旧模板明确映射的可选 LoRA 链顺序覆盖；Power Loader 原条目仅作占位。"
-                        "独立加速 LoRA 始终保留；省略则沿用默认设置，用户要求关闭可选 LoRA 时传 \"[]\" 或 \"none\""
+                    **_lora_array_schema(
+                        "按查询结果提供 LoRA 对象数组，可附推荐 strength。按已映射槽位覆盖可选 LoRA；独立加速 LoRA 保留。省略沿用默认，传空数组关闭可选 LoRA"
                     ),
                 },
                 "steps": {
@@ -964,7 +968,7 @@ class ComfyuiBooruTool(FunctionTool[AstrAgentContext]):
         "从 danbooru（默认）或 gelbooru 查询画师或角色的触发词、别名和常用 tag。"
         "danbooru 查询失败或无结果时自动回退 gelbooru（结果里会标注真实来源）。"
         "用户指定画师风格/角色时，先调用本工具查到真实触发词，"
-        "再把 @画师 串填进 comfyui_generate 的 artist/trigger_words 参数，不要凭记忆编 tag。"
+        "再把 @画师 串填进 comfyui_draw 的 artist/trigger_words 参数，不要凭记忆编 tag。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -1072,7 +1076,7 @@ class ComfyuiCivitaiSearchTool(FunctionTool[AstrAgentContext]):
     name: str = "comfyui_civitai_search"
     description: str = (
         "在 civitai 搜索参考图并返回其完整生成配方（模型、正向/负向提示词、采样器、"
-        "步数、cfg、seed），可直接转成 comfyui_generate 的参数照着出图。"
+        "步数、cfg、seed），可在确认家族和兼容性后填进 comfyui_draw 的参数。"
         "用户想参考某风格/某模型的作品或找现成提示词时使用。"
     )
     parameters: dict = Field(
@@ -1320,7 +1324,7 @@ class ComfyuiAnimadexTool(FunctionTool[AstrAgentContext]):
         "本工具是系统自带 search-characters / get-character / search-artists / "
         "search-copyrights 等 MCP 工具的本地封装，二者任选其一即可，不要重复调用。"
         "用户点名作品角色（如 忍野忍/妃咲/铃兰/初音ミク）或指定画师风格时，"
-        "先调用本工具查到规范触发词，再把结果填进 comfyui_generate 的 prompt/artist 参数，"
+        "先调用本工具查到规范触发词，再把结果填进 comfyui_draw 的 prompt/artist 参数，"
         "不要凭记忆编 tag。搜索时优先用日文原名或英文罗马音（如 himari、初音ミク），罗马音命中率最高；中文虽可搜但自动映射不保证全中，中文查不到就换罗马音重搜。"
         "想拿角色详细设定/关联 LoRA 时，用 type=character 搜索后在结果里取 slug，"
         "再调 get_character 拉完整信息。"
@@ -1943,7 +1947,7 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
                     "type": "string",
                     "description": "配方名（save/load/delete 必填）",
                 },
-                "prompt": {"type": "string", "description": "可选说明文字；不会作为配方的固定主提示词"},
+                "description": {"type": "string", "description": "配方用途说明，帮助模型判断何时复用此配方"},
                 "model_family": {
                     "type": "string",
                     "description": "配方适用的模型家族（save 时必填）",
@@ -1953,7 +1957,7 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
                 "trigger_words": {"type": "string", "description": "lora触发词"},
                 "negative_prompt": {"type": "string", "description": "负向提示词"},
                 "model": {"type": "string", "description": "底模文件名"},
-                "lora": {"type": "string", "description": "LoRA 覆盖 JSON"},
+                "lora": _lora_array_schema("LoRA 对象数组，省略沿用已有设置；旧版 JSON 字符串仍可解析"),
                 "steps": {"type": "number", "description": "采样步数"},
                 "cfg": {"type": "number", "description": "CFG"},
                 "sampler_name": {"type": "string", "description": "采样器"},
@@ -1970,6 +1974,24 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
     builder: WorkflowBuilder | None = None
     default_workflow: str = ""
     families: ModelFamilyRegistry | None = None
+
+    def refresh_schema(self) -> None:
+        actions = ["save", "list", "load"] + (["delete"] if self.allow_delete else [])
+        action = self.parameters["properties"]["action"]
+        action["enum"] = actions
+        action["description"] = "选择保存、列出或读取配方" + ("；仅用户明确要求时删除" if self.allow_delete else "")
+        self.parameters["required"] = ["action"]
+        self.description = (
+            "保存、列出和读取静态配方。保存时提供 name、model_family 和可选生成参数；"
+            "description 描述配方用途，不会固定后续生图提示词。生图调用 comfyui_recipe_draw。"
+            + ("用户明确要求删除时可使用 action=delete。" if self.allow_delete else "")
+        )
+        family = self.parameters["properties"]["model_family"]
+        names = self.families.names() if self.families is not None else []
+        if names:
+            family["enum"] = names
+        else:
+            family.pop("enum", None)
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         action = str(kwargs.get("action") or "save").strip().lower()
@@ -2005,9 +2027,10 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
             defaults = recipe.get("defaults") or {}
             info = {
                 "name": recipe.get("name") or name,
+                "description": recipe.get("description") or "",
                 "model_family": recipe.get("family") or recipe_family(recipe),
                 "model": defaults.get("model") or "",
-                "lora": json.dumps(defaults.get("loras") or [], ensure_ascii=False),
+                "lora": defaults.get("loras") or [],
                 "width": defaults.get("width") or "",
                 "height": defaults.get("height") or "",
                 "steps": defaults.get("steps") or "",
@@ -2056,7 +2079,7 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
             assert self.store is not None
             self.store.save({
                 "name": name,
-                "description": str(kwargs.get("prompt") or "")[:60],
+                "description": str(kwargs.get("description") or kwargs.get("prompt") or "")[:160],
                 "family": family.name,
                 "defaults": defaults,
             })
@@ -2069,7 +2092,7 @@ _DRAW_DESC = (
     "从文字生成新图片并发送；需要修改现有图片时使用 comfyui_edit。model_family、prompt 必填，提示词遵循家族 prompt_style。"
     "省略可选参数沿用工作流。可按画风、角色、服饰或效果需求主动用 comfyui_lookup 查询并选用 LoRA；"
     "分辨率选择器工作流可用 aspect_ratio 和 megapixels 覆盖比例与目标百万像素数；"
-    "查询底模/LoRA 必须传同一 model_family，使用返回文件名和推荐权重，已知触发词填 trigger_words。"
+    "按用途、类别或标签查询资源时传 model_family；完整已知文件名可跨家族查找。使用前核对资源与当前家族兼容，并采用返回的文件名、推荐权重和已知触发词。"
     "复用配方用 comfyui_recipe_draw。成功回执包含图片本地保存路径；图片已直接发送，无需再次发送。"
 )
 
@@ -2081,6 +2104,23 @@ def _recipe_enum(store: RecipeStore | None) -> list[str]:
         return store.names()
     except Exception:
         return []
+
+
+def _lora_array_schema(description: str) -> dict[str, Any]:
+    """Expose structured LoRA arguments while the runtime keeps legacy parsing."""
+    return {
+        "type": "array",
+        "description": description,
+        "items": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "comfyui_lookup 返回的实际文件名"},
+                "strength": {"type": "number", "description": "查询结果给出的推荐权重；省略则使用工作流默认权重"},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+    }
 
 
 def _match_resource(names: list[str], query: str, limit: int = 8) -> list[str]:
@@ -2116,8 +2156,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                     "description": "换底模。用户没点名就不要填。关键词或文件名",
                 },
                 "lora": {
-                    "type": "string",
-                    "description": "本次使用的可选 LoRA，可按画风、角色、服饰或效果需求主动查询并选用，无需用户提供名称。填写查询得到的文件名或唯一关键词，多个用逗号；指定权重时传 JSON 数组字符串，如 [{\"name\":\"查询得到的文件名\",\"strength\":0.8}]。覆盖工作流映射的 Power Loader 占位槽或旧版明确映射链；独立加速 LoRA 始终保留。省略则沿用工作流，用户要求关闭可选 LoRA 时传 \"[]\" 或 \"none\"",
+                    **_lora_array_schema("按实际需求用 comfyui_lookup 查询并选用 LoRA，传对象数组，可附推荐 strength。按工作流映射顺序覆盖可选槽位，独立加速 LoRA 保留。省略沿用工作流，空数组关闭可选 LoRA；旧版字符串调用仍兼容"),
                 },
                 "size": {
                     "type": "string",
@@ -2248,7 +2287,9 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         metadata = resources.get("lora_meta") or {}
         try:
             parsed = parse_lora(raw)
-        except ValueError:
+        except ValueError as error:
+            if not isinstance(raw, str):
+                return None, f"LoRA 参数无效：{error}"
             parsed = [{"name": part.strip()} for part in str(raw).split(",") if part.strip()]
         if not parsed:
             return [], None
@@ -3092,7 +3133,7 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
 
     name: str = "comfyui_lookup"
     description: str = (
-        "查询角色/画师规范词和已安装底模/LoRA。model/lora 请传与生图一致的 model_family；省略仅返回家族数量。"
+        "查询角色/画师规范词和已安装底模/LoRA。完整已知模型或 LoRA 文件名可跨家族查询；按用途、类别或标签搜索时传与生图一致的 model_family。"
         "绘图需要某种画风、角色、服饰或效果时，可主动查询匹配的 LoRA，用户无需点名 LoRA 或提供文件名。"
         "character/artist：把触发词写进 prompt 或 artist。"
         "model/lora：选择符合需求的结果，把实际文件名填进 comfyui_draw 的 model/lora。LoRA 的 query 支持 LoRA Manager/Civitai "

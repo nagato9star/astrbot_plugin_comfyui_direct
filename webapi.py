@@ -41,6 +41,7 @@ from slot_mapping import (
     ANIMA_DROP_NODES,
 )
 from workflow_builder import WorkflowBuilder
+from workflow_graph import validate_api_workflow, validate_ui_snapshot
 
 PLUGIN_NAME = "astrbot_plugin_comfyui_direct"
 
@@ -204,6 +205,7 @@ class StudioApi:
             "name": name,
             "source": self.builder.source_of(self.builder.resolve_workflow_path(name)) or "custom",
             "workflow": wf,
+            "ui_workflow": self.builder.load_ui_template(name),
             "nodes": list_nodes(wf),
             "detected_slots": detected,
             "profile_slots": selected,
@@ -224,6 +226,12 @@ class StudioApi:
         except FileNotFoundError as e:
             return _json({"ok": False, "error": str(e)})
         return _json(self._workflow_payload(name, wf))
+
+    async def get_node_definitions(self) -> Any:
+        definitions = await self.client.get_object_info()
+        if not isinstance(definitions, dict) or not definitions:
+            return _json({"ok": False, "error": "无法从远端 ComfyUI 获取节点定义"}, 503)
+        return _json({"ok": True, "definitions": definitions})
 
     async def import_workflow(self) -> Any:
         body = await _body()
@@ -254,12 +262,55 @@ class StudioApi:
             return _json({"ok": False, "error": str(e)})
         try:
             self.builder.save_template(name, wf)
+            if is_ui_workflow(raw):
+                self.builder.save_ui_template(name, raw)
+            else:
+                self.builder.delete_ui_template(name)
         except ValueError as e:
             return _json({"ok": False, "error": str(e)})
         payload = self._workflow_payload(name, wf)
         if self.profiles is not None:
             self.profiles.ensure(name, wf)
         return _json(payload)
+
+    async def save_graph(self) -> Any:
+        body = await _body()
+        name = str(body.get("name") or "").strip()
+        try:
+            wf = validate_api_workflow(body.get("workflow"))
+            ui = validate_ui_snapshot(body.get("ui_workflow"), wf)
+            self.builder.save_template(name, wf)
+            self.builder.save_ui_template(name, ui)
+        except ValueError as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        if self.profiles is not None:
+            self.profiles.ensure(name, wf)
+        self._refresh_draw_schema()
+        return _json(self._workflow_payload(name, wf))
+
+    async def run_graph(self) -> Any:
+        body = await _body()
+        name = str(body.get("name") or "").strip()
+        try:
+            wf = validate_api_workflow(body.get("workflow"))
+            ui = validate_ui_snapshot(body.get("ui_workflow"), wf)
+        except ValueError as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        prompt_id, error = await self.client.submit_prompt_detail(wf, ui_workflow=ui)
+        if error or not prompt_id:
+            return _json({"ok": False, "error": error or "ComfyUI 未返回任务编号"}, 400)
+        pending = self.shared.setdefault("web_pending_runs", {})
+        pending[prompt_id] = {
+            "entry": "graph",
+            "workflow": name,
+            "prompt": "",
+            "values": {},
+            "recipe": {},
+        }
+        if len(pending) > 64:
+            for old_id in list(pending)[:-64]:
+                pending.pop(old_id, None)
+        return _json({"ok": True, "prompt_id": prompt_id})
 
     async def import_from_history(self) -> Any:
         body = await _body()
@@ -271,8 +322,16 @@ class StudioApi:
             return _json({"ok": False, "error": "ComfyUI 历史里没有可导入的工作流"})
         name = name or f"history-{str(entry['prompt_id'])[:8]}"
         try:
-            wf = normalize_workflow(entry["workflow"])
+            raw_workflow = entry["workflow"]
+            object_info = await self.client.get_object_info() if is_ui_workflow(raw_workflow) else None
+            if is_ui_workflow(raw_workflow) and not object_info:
+                return _json({"ok": False, "error": "无法从远端获取节点定义以解析历史工作流"}, 503)
+            wf = normalize_workflow(raw_workflow, object_info)
             self.builder.save_template(name, wf)
+            if is_ui_workflow(raw_workflow):
+                self.builder.save_ui_template(name, raw_workflow)
+            else:
+                self.builder.delete_ui_template(name)
         except ValueError as e:
             return _json({"ok": False, "error": str(e)})
         if self.profiles is not None:
@@ -753,7 +812,7 @@ class StudioApi:
         self.store.save_history(
             {
                 "prompt_id": pid,
-                "entry": "recipe",
+                "entry": pending.get("entry") or "recipe",
                 "family": pending.get("family") or recipe.get("family") or "",
                 "recipe": recipe.get("name"),
                 "recipe_id": recipe.get("id"),
@@ -852,7 +911,10 @@ def register_web_apis(
         ("/status", api.status, ["GET"], "ComfyUI 状态"),
         ("/workflows", api.list_workflows, ["GET"], "列出工作流"),
         ("/workflow", api.get_workflow, ["GET"], "获取工作流"),
+        ("/workflow/nodes", api.get_node_definitions, ["GET"], "获取远端节点定义"),
         ("/workflow/import", api.import_workflow, ["POST"], "导入工作流"),
+        ("/workflow/save", api.save_graph, ["POST"], "保存节点画布"),
+        ("/workflow/run", api.run_graph, ["POST"], "运行节点画布"),
         ("/workflow/import-history", api.import_from_history, ["POST"], "从 ComfyUI 历史导入"),
         ("/workflow/delete", api.delete_workflow, ["POST"], "删除工作流"),
         ("/workflow/detect", api.detect, ["POST"], "检测槽位"),

@@ -112,7 +112,7 @@ Qwen Image 2.1 可分别配置 T2I 与编辑工作流：生图家族 `qwen` 绑�
 | `workflow_node_mappings` | 空 | 可重复添加的工作流节点映射；填写各槽位的节点 ID，优先于 Workflow Studio 档案和自动检测 |
 | `default_recipe` | `默认` | 用户只说「画一张」时用的配方；在工作台配方列表点「设为默认」自动写入，也可直接填配方名 |
 | `llm_tool_mode` | `basic` | `basic` 暴露自由生图、图片编辑（已配置时）、配方生图和查询；`full` 打开诊断工具 |
-| `allow_llm_unsafe_tools` | `false` | 是否允许 LLM 执行任意工作流、读取本地图片上传、释放显存和删除配方；默认关闭 |
+| `allow_llm_unsafe_tools` | `false` | 是否允许 LLM 使用旧版高级生成、执行任意工作流、读取本地图片上传、释放显存和删除配方；默认关闭 |
 | `default_workflow` / `node_slots` | 旧版兼容 | `model_families` 为空时使用；新版槽位在 Workflow Studio 工作流页按工作流保存 |
 | `danbooru_base_url` | `https://danbooru.donmai.us` | danbooru 接口地址（国内可换镜像） |
 | `gelbooru_base_url` | `https://gelbooru.com` | gelbooru DAPI 地址（镜像可换） |
@@ -134,11 +134,14 @@ Qwen Image 2.1 可分别配置 T2I 与编辑工作流：生图家族 `qwen` 绑�
 
 - `comfyui_models.json`：模型清单缓存
 - `workflows/`：自定义工作流模板
+- `workflows/_ui/`：工作流画布布局与控件快照，和可执行 API JSON 同名保存
 - `workflow_profiles.json`：按工作流保存的共享节点槽位
 - `recipes/`：只保存模型家族与生成参数的快捷配方
 - `output/`：生成的图片文件
 
 ## 🤖 LLM 工具
+
+插件随包提供 `comfyui-direct-generation` Skill，可在 AstrBot Skills 管理页启用。它按所选家族读取 Anima、Krea 2、Qwen-Image-2.1 的提示词参考，并指导模型选择生图、编辑和配方工具。
 
 默认 `llm_tool_mode=basic` 启用以下工具；`comfyui_edit` 仅在至少配置一个可用的独立编辑工作流后启用：
 
@@ -154,7 +157,7 @@ Qwen Image 2.1 可分别配置 T2I 与编辑工作流：生图家族 `qwen` 绑�
 | 工具 | 说明 |
 |:---|:---|
 | `comfyui_list_models` | 查询可用底模 / LoRA / CLIP / VAE / Embedding；支持 `kind`、`query`、`limit` 筛选，LoRA 显示分类、标签、推荐权重和触发词 |
-| `comfyui_generate` | 旧版高级生成入口；保留配方和工作流参数兼容，日常调用优先使用上面的两个明确入口 |
+| `comfyui_generate` | 旧版高级生成入口；需额外开关，保留配方和工作流参数兼容 |
 | `comfyui_interrupt` | 中断生成（`prompt_id` 可选，默认最近一次），可同时取消排队任务 |
 | `comfyui_booru` | 查画师/角色触发词与常用 tag（`source`=danbooru/gelbooru） |
 | `comfyui_civitai_search` | 搜参考图并返回生成配方（模型/prompt/负向/sampler/steps/cfg/seed） |
@@ -167,12 +170,12 @@ Qwen Image 2.1 可分别配置 T2I 与编辑工作流：生图家族 `qwen` 绑�
 | `comfyui_nodes` | 搜索节点类或查询节点输入输出结构 |
 | `comfyui_validate_workflow` | 提交前检查工作流节点和必填输入 |
 | `comfyui_models_search` | 按目录搜索已安装的模型文件 |
-| `comfyui_recipe` | 保存、列出、加载配方；保存时引用模型家族并记录生成参数；删除动作需额外开关 |
-| `comfyui_run_workflow` | 运行指定工作流 JSON 并发送结果，需额外开关 |
+| `comfyui_recipe` | 保存、列出、加载配方；`action` 必填，保存时用 `description` 写用途说明并引用模型家族；删除动作需额外开关 |
+| `comfyui_run_workflow` | 运行 ComfyUI API Format JSON 并发送结果，需额外开关 |
 | `comfyui_upload_file` | 上传本地图片至 ComfyUI 的 input 目录，需额外开关 |
 | `comfyui_free_memory` | 请求卸载模型、释放显存，需额外开关 |
 
-默认不会把 `comfyui_run_workflow`、`comfyui_upload_file`、`comfyui_free_memory` 交给 LLM，且 `comfyui_recipe` 的删除动作也要求在 Workflow Studio 手动完成。确有需要时，先开启 `allow_llm_unsafe_tools`。
+默认不会把 `comfyui_generate`、`comfyui_run_workflow`、`comfyui_upload_file`、`comfyui_free_memory` 交给 LLM，且 `comfyui_recipe` 的删除动作也要求在 Workflow Studio 手动完成。确有需要时，先开启 `allow_llm_unsafe_tools`。
 
 底模与 LoRA 按 `model_family` 查询，支持 `anima`、`krea2`、`sdxl`、`flux`、`illustrious`、`pony` 等家族，以及配置规则中的自定义家族。例如：
 
@@ -195,7 +198,7 @@ comfyui_list_models(query="miaomao")
 LoRA 名称可跨家族查询；按分类、标签和用途关键词挑选 LoRA 时需指定 `model_family`。在线元数据回退只接受文件名匹配的版本，避免直接套用搜索结果首项。升级后资源缓存会重新同步，原有离线缓存仍可回退。
 
 
-`comfyui_draw` 的 `lora` 是字符串：可填文件名、唯一关键词，多个用逗号分隔；指定权重时传 JSON 数组字符串，例如 `"[{\"name\":\"style.safetensors\",\"strength\":0.6}]"`，其中示例文件名需替换成查询结果。传入列表会覆盖工作流映射的 Power Loader 占位槽或旧版明确映射的可选 LoRA 链；独立加速 LoRA 始终保持工作流原值。省略时沿用可选 LoRA 原值，传 `"[]"` 或 `"none"` 只关闭映射槽位。
+`comfyui_draw` 与 `comfyui_recipe` 的 `lora` 使用对象数组，例如 `[{"name":"style.safetensors","strength":0.6}]`；文件名要替换成查询结果。传入数组会覆盖工作流映射的可选 LoRA 槽位；独立加速 LoRA 保持工作流原值。省略时沿用可选 LoRA 原值，传空数组关闭映射槽位。旧版字符串输入仍由运行时解析。
 
 选用 LoRA 时，可将查询返回的已知触发词同步填入 `trigger_words`，保留原词格式，无需用户再次提出。查询未提供触发词时可省略该字段并继续使用 LoRA。插件的绘图工具仍由调用方显式填写触发词；工作台选 LoRA 后自动填充文本框的行为保持不变。
 
@@ -203,14 +206,19 @@ LoRA 名称可跨家族查询；按分类、标签和用途关键词挑选 LoRA 
 
 AstrBot Dashboard → 插件页 → **Workflow Studio**，分为工作流与静态配方两页：
 
-- 工作流页导入、编辑 API JSON、绑定生图家族或独立编辑路由，并独立保存共享槽位映射
+- 工作流页提供可拖拽、选择、连线、缩放和删除节点的画布；右侧检查器编辑节点输入，节点库来自远端 `/object_info`
+- 支持导入 ComfyUI 前端工作流 JSON 并保留节点位置、连线与控件布局；执行用 API JSON 与画布快照一起保存
+- 画布改动后重新编译可执行工作流；未改动时复用转换缓存。「运行当前画布」直接向配置的远端 ComfyUI 提交
+- 工作流页也可编辑 API JSON、绑定生图家族或独立编辑路由，并独立保存共享槽位映射
 - 配方页只保存家族与底模、LoRA、画幅、采样等静态参数
 - 从已保存配方试跑，并从历史另存新配方
 - 配方列表一键「设为默认」，机器人只说「画一张」时即用这套
 - 模型选择：UNET / LoRA / CLIP / VAE 下拉来自自动同步清单
 - 连接状态灯 + 「配方试画」：按已保存配方生成，结果内联预览，可一键中断
 
-后端接口（`webapi.py`）：`workflows` / `workflow` / `workflow/import` / `workflow/profile` / `workflow/bind` / `workflow/delete` / `recipes` / `recipe/save` / `status` / `generate`。
+后端接口（`webapi.py`）：`workflows` / `workflow` / `workflow/nodes` / `workflow/import` / `workflow/save` / `workflow/run` / `workflow/profile` / `workflow/bind` / `workflow/delete` / `recipes` / `recipe/save` / `status` / `generate`。
+
+节点画布使用 MIT 许可的 Comfy Org LiteGraph 0.17.2，构建文件随插件打包。修改画布源码后在 `pages/workflow-editor/` 运行 `npm ci && npm run build`。
 
 ## ⚠️ 注意事项
 

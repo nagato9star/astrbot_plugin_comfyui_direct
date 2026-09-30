@@ -49,6 +49,8 @@ def _extract_text(messages: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for msg in messages:
         result = msg.get("result") or {}
+        if result.get("isError"):
+            continue
         for item in result.get("content") or []:
             if item.get("type") == "text":
                 parts.append(item.get("text", ""))
@@ -160,6 +162,8 @@ class AnimaDexClient:
                 # 尝试拿 structuredContent
                 for msg in messages:
                     result = msg.get("result") or {}
+                    if result.get("isError"):
+                        continue
                     sc = result.get("structuredContent")
                     if isinstance(sc, dict) and sc.get("result"):
                         return str(sc["result"])

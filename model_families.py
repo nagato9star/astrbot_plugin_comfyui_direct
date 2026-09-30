@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,7 @@ class ModelFamily:
 
     name: str
     workflow: str
+    edit_workflow: str = ""
     prompt_style: str = "auto"
     description: str = ""
 
@@ -42,7 +43,7 @@ class ModelFamily:
 class ModelFamilyRegistry:
     """解析 ``model_families`` template_list 并提供稳定的查找接口。"""
 
-    def __init__(self, raw: Any, default_workflow: str = "anima-v3") -> None:
+    def __init__(self, raw: Any, default_workflow: str = "anima-v3", edit_raw: Any = None) -> None:
         self._items: dict[str, ModelFamily] = {}
         for row in self._rows(raw):
             name = str(row.get("name") or row.get("family") or "").strip()
@@ -60,6 +61,7 @@ class ModelFamilyRegistry:
             self._items[key] = ModelFamily(
                 name=name,
                 workflow=workflow,
+                edit_workflow=str(row.get("edit_workflow") or "").strip(),
                 prompt_style=style,
                 description=str(row.get("description") or "").strip(),
             )
@@ -73,6 +75,23 @@ class ModelFamilyRegistry:
                 prompt_style="danbooru" if guessed == "anima" else "auto",
                 description="由旧版 default_workflow 自动兼容",
             )
+
+        seen_edits: set[str] = set()
+        for row in self._rows(edit_raw):
+            name = str(row.get("model_family") or row.get("family") or row.get("name") or "").strip()
+            workflow = str(row.get("workflow") or "").strip()
+            if not name or not workflow:
+                continue
+            key = name.casefold()
+            if key in seen_edits:
+                logger.warning(f"[ComfyUIDirect] 编辑图家族重复，保留第一条: {name}")
+                continue
+            seen_edits.add(key)
+            family = self._items.get(key)
+            if family is None:
+                logger.warning(f"[ComfyUIDirect] 编辑图家族「{name}」没有对应生图家族，已忽略")
+                continue
+            self._items[key] = replace(family, edit_workflow=workflow)
 
     @staticmethod
     def _rows(raw: Any) -> list[dict]:
@@ -98,6 +117,9 @@ class ModelFamilyRegistry:
 
     def names(self) -> list[str]:
         return [item.name for item in self._items.values()]
+
+    def editable_names(self) -> list[str]:
+        return [item.name for item in self._items.values() if item.edit_workflow]
 
     def first(self) -> ModelFamily:
         return next(iter(self._items.values()))
@@ -134,6 +156,8 @@ class ModelFamilyRegistry:
         refs: dict[str, list[str]] = {}
         for item in self._items.values():
             refs.setdefault(item.workflow, []).append(item.name)
+            if item.edit_workflow:
+                refs.setdefault(item.edit_workflow, []).append(f"{item.name}（编辑）")
         return refs
 
     def catalog(self) -> str:

@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild graph-editor-src.js --bundle --format=esm --target=es2022 --outfile=graph-editor.bundle.js"
+  },
+  "dependencies": {
+    "@comfyorg/litegraph": "0.17.2"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

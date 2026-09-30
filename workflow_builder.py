@@ -17,7 +17,14 @@ from typing import Any
 
 from astrbot.api import logger
 
-from slot_mapping import apply_slots, detect_slots, normalize_lora_strength, parse_lora
+from slot_mapping import (
+    ANIMA_DROP_NODES,
+    apply_slots,
+    detect_slots,
+    looks_like_anima,
+    normalize_lora_strength,
+    parse_lora,
+)
 
 # 模板名 -> 文件名；查找顺序：插件数据目录 workflows/（custom）-> skill references 目录
 WORKFLOW_TEMPLATES: dict[str, str] = {
@@ -25,9 +32,6 @@ WORKFLOW_TEMPLATES: dict[str, str] = {
     "nagato-anima": "nagato-anima-workflow.json",
     "anima-v2": "anima-workflow-v2-api.json",
 }
-
-# 模板中提交前删除的 UI/孤立节点（模板内部约定，与 skill 保持一致）
-DROP_NODES = ["445", "446", "447"]
 
 # 画师串特征：(@画师名:权重) 括号写法
 ARTIST_PATTERN = re.compile(r"\(\s*@[^)]*?:\s*[\d.]+\s*\)")
@@ -112,8 +116,13 @@ class WorkflowBuilder:
         return self._resolve_template(workflow)
 
     def load_template(self, workflow: str | None = None) -> dict:
-        """加载模板（去掉 DROP_NODES），供 WebUI 编辑/管理使用。"""
+        """加载完整模板；各工作流的 drop_nodes 只在提交前显式应用。"""
         return self._load(self._resolve_template(workflow))
+
+    def load_template_raw(self, workflow: str | None = None) -> dict:
+        """画布编辑使用原始节点图，避免静默丢失具有旧版保留 ID 的节点。"""
+        with open(self._resolve_template(workflow), encoding="utf-8") as stream:
+            return json.load(stream)
 
     # ------------------------------------------------------------------
     # 模板管理（WebUI 使用）
@@ -163,6 +172,35 @@ class WorkflowBuilder:
         )
         return path
 
+    def load_ui_template(self, name: str) -> dict | None:
+        """读取画布布局；旧模板只有 API JSON 时返回 None。"""
+        if not name or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+            return None
+        path = self.custom_dir() / "_ui" / f"{name}.json"
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) and isinstance(data.get("nodes"), list) else None
+
+    def save_ui_template(self, name: str, ui: dict) -> Path:
+        """保存 ComfyUI 前端格式，保持节点位置、分组与控件布局。"""
+        if not name or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+            raise ValueError(f"模板名不合法: {name}")
+        if not isinstance(ui, dict) or not isinstance(ui.get("nodes"), list):
+            raise ValueError("需要 ComfyUI 前端格式工作流")
+        folder = self.custom_dir() / "_ui"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{name}.json"
+        path.write_text(json.dumps(ui, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    def delete_ui_template(self, name: str) -> None:
+        if name and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+            (self.custom_dir() / "_ui" / f"{name}.json").unlink(missing_ok=True)
+
     def delete_template(self, name: str) -> None:
         """删除自定义模板；内置/技能模板不允许删除。"""
         if not name or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
@@ -170,20 +208,18 @@ class WorkflowBuilder:
         path = self._custom_dir / f"{name}.json" if self._custom_dir else None
         if path is not None and path.is_file():
             path.unlink()
+            self.delete_ui_template(name)
             return
         raise ValueError(f"{name} 不是自定义模板，无法删除")
 
     def _load(self, path: Path) -> dict:
         with open(path, "r", encoding="utf-8") as f:
-            wf = json.load(f)
-        for nid in DROP_NODES:
-            wf.pop(nid, None)
-        return wf
+            return json.load(f)
 
     @staticmethod
-    def drop_ui_nodes(wf: dict) -> dict:
-        """去掉模板约定的 UI/孤立节点（WebUI 编辑/提交前也调用）。"""
-        for nid in DROP_NODES:
+    def drop_ui_nodes(wf: dict, drop_nodes: list[str] | tuple[str, ...] = ANIMA_DROP_NODES) -> dict:
+        """按调用方指定的工作流档案删除 UI/辅助节点。"""
+        for nid in drop_nodes:
             wf.pop(nid, None)
         return wf
 
@@ -501,5 +537,6 @@ class WorkflowBuilder:
         ):
             if val is not None:
                 values[key] = val
-        apply_slots(wf, slots, values, prefix=prefix, drop_nodes=list(DROP_NODES))
+        drop_nodes = list(ANIMA_DROP_NODES) if looks_like_anima(wf) else []
+        apply_slots(wf, slots, values, prefix=prefix, drop_nodes=drop_nodes)
         return wf

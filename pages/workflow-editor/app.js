@@ -1,5 +1,6 @@
 const SLOT_FALLBACK = [
   { id: "prompt", label: "用户要画的内容", help: "必选", basic: true },
+  { id: "source_image", label: "编辑来源图片", help: "图片编辑工作流中的 LoadImage 节点", basic: false },
   { id: "model", label: "底模", help: "", basic: true },
   { id: "loras", label: "LoRA", help: "", basic: true },
   { id: "size", label: "画面大小", help: "", basic: true },
@@ -27,9 +28,12 @@ const state = {
   recipe: emptyRecipe(),
   activeWorkflow: "",
   profileSlots: {},
+  profileSource: "detected",
   profileDropNodes: [],
   history: [],
   runningPid: "",
+  graphEditor: null,
+  nodeDefinitions: {},
 };
 
 function emptyRecipe() {
@@ -358,6 +362,13 @@ function applyRecipeToForm(recipe, resolved = {}) {
   renderLists();
   renderSlots();
   renderDefaults();
+  renderGraphWorkflowChoices();
+}
+
+function renderGraphWorkflowChoices() {
+  const select = $("#graph-workflow-select");
+  if (!select) return;
+  fillSelect(select, state.templates.map((item) => item.name), state.activeWorkflow, [""]);
 }
 
 async function refreshStatus() {
@@ -396,6 +407,7 @@ async function loadLists() {
   state.history = (hist && hist.items) || [];
   renderLists();
   renderHistory();
+  renderGraphWorkflowChoices();
 }
 
 async function setDefaultRecipe(name) {
@@ -414,6 +426,7 @@ async function setDefaultRecipe(name) {
 }
 
 async function bindWorkflow(name) {
+  if (state.graphEditor?.dirty && state.graphEditor.activeName !== name && !confirm("当前画布有未保存的修改，继续切换工作流？")) return;
   const res = await apiGet("workflow", { name });
   if (!res || !res.ok) {
     toast(res?.error || "加载工作流失败", true);
@@ -423,6 +436,7 @@ async function bindWorkflow(name) {
   const switched = state.activeWorkflow !== name;
   state.activeWorkflow = name;
   state.profileSlots = res.profile_slots || res.detected_slots || {};
+  state.profileSource = res.profile_source || "detected";
   state.profileDropNodes = res.drop_nodes || [];
   const matchedFamily = state.families.find((item) => item.workflow === name);
   if (!state.recipe.family && matchedFamily) state.recipe.family = matchedFamily.name;
@@ -442,6 +456,8 @@ async function bindWorkflow(name) {
   renderLists();
   renderSlots();
   renderDefaults();
+  renderGraphWorkflowChoices();
+  if (state.graphEditor) loadGraphPayload(res);
 }
 
 async function loadRecipe(name) {
@@ -450,6 +466,8 @@ async function loadRecipe(name) {
     toast(res?.error || "读取配方失败", true);
     return;
   }
+  if (state.graphEditor?.dirty && state.graphEditor.activeName !== res.resolved_workflow
+      && !confirm("当前画布有未保存的修改，继续切换工作流？")) return;
   if (res.template_missing) {
     toast(`模型家族配置的工作流「${res.template_missing}」不存在，请检查配置`, true);
   }
@@ -459,6 +477,7 @@ async function loadRecipe(name) {
     slots: res.profile_slots || {},
     dropNodes: res.drop_nodes || [],
   });
+  if (state.graphEditor && state.activeWorkflow) await loadGraphForName(state.activeWorkflow);
 }
 
 async function deleteTemplate(name) {
@@ -521,7 +540,40 @@ async function saveRecipe() {
   return true;
 }
 
+async function redetectSlots() {
+  if (!state.activeWorkflow) return toast("请先选择工作流", true);
+  const res = await apiPost("workflow/detect", { name: state.activeWorkflow });
+  if (!res || !res.ok) return toast(res?.error || "节点识别失败", true);
+  state.profileSlots = res.slots || {};
+  state.slotOptions = res.slot_options || state.slotOptions;
+  renderSlots();
+  const count = Object.keys(state.profileSlots).length;
+  const editFamily = state.families.find((item) => item.edit_workflow === state.activeWorkflow);
+  if (editFamily && !slotNode("source_image")) {
+    toast("编辑来源图片无法唯一识别，请手动选择 LoadImage 后保存映射", true);
+  } else {
+    toast(count ? `已加载 ${count} 个节点建议，核对后点「保存映射」` : "无法唯一识别节点，请手动选择后保存", !count);
+  }
+}
+
+async function saveWorkflowProfile() {
+  if (!state.activeWorkflow) return toast("请先选择工作流", true);
+  const res = await apiPost("workflow/profile", {
+    workflow: state.activeWorkflow,
+    slots: state.profileSlots,
+    drop_nodes: state.profileDropNodes,
+  });
+  if (!res || !res.ok) return toast(res?.error || "保存节点映射失败", true);
+  if (state.profileSource === "config") {
+    toast("映射已保存；配置页手动映射仍优先生效，请在配置页同步修改", true);
+  } else {
+    state.profileSource = "profile";
+    toast("工作流节点映射已保存");
+  }
+}
+
 async function importFile(file) {
+  if (state.graphEditor?.dirty && !confirm("当前画布有未保存的修改，继续导入工作流？")) return;
   const text = await file.text();
   let data;
   try {
@@ -530,16 +582,42 @@ async function importFile(file) {
     toast("JSON 格式无效", true);
     return;
   }
-  const name = file.name.replace(/\.json$/i, "").replace(/[^A-Za-z0-9_\u4e00-\u9fff-]/g, "_") || "imported";
-  const res = await apiPost("workflow/import", { name, workflow: data });
+  const name = file.name.replace(/\.json$/i, "")
+    .replace(/[^A-Za-z0-9_-]/g, "_").replace(/^_+|_+$/g, "").slice(0, 64)
+    || `workflow_${Date.now().toString(36)}`;
+  if (state.templates.some((item) => item.name === name) && !confirm(`工作流「${name}」已存在，确认覆盖？`)) return;
+  if (!Array.isArray(data.nodes) && (!data || typeof data !== "object" || !Object.keys(data).length)) {
+    toast("工作流 JSON 结构无效", true);
+    return;
+  }
+  const editor = await ensureGraphEditor();
+  if (!Object.keys(state.nodeDefinitions).length) {
+    toast("需要连接远端 ComfyUI 读取节点定义后才能导入画布", true);
+    return;
+  }
+  const uiWorkflow = Array.isArray(data.nodes) ? data : null;
+  const apiWorkflow = uiWorkflow ? {} : Object.fromEntries(
+    Object.entries(data).filter(([, node]) => node && typeof node === "object" && node.class_type)
+  );
+  if (!uiWorkflow && !Object.keys(apiWorkflow).length) {
+    toast("无法识别工作流 JSON 格式", true);
+    return;
+  }
+  editor.load(name, apiWorkflow, uiWorkflow);
+  $("#graph-name").value = name;
+  const graph = await editor.exportWorkflow();
+  const res = await apiPost("workflow/save", { name, ...graph });
   if (!res || !res.ok) {
     toast(res?.error || "导入失败", true);
     return;
   }
+  editor.markSaved();
   toast(`已导入 ${name}`);
   state.slotOptions = res.slot_options || {};
   state.activeWorkflow = name;
+  renderGraphWorkflowChoices();
   state.profileSlots = res.profile_slots || res.detected_slots || {};
+  state.profileSource = res.profile_source || "detected";
   state.profileDropNodes = res.drop_nodes || [];
   await loadLists();
   const detect = await apiPost("workflow/detect", { name });
@@ -557,9 +635,12 @@ async function importFile(file) {
   if (!matchedFamily) {
     toast(`工作流已导入；请到插件配置添加模型家族并选择「${name}」，随后重载插件`, true);
   }
+  loadGraphPayload(res);
+  await setGraphMode(true);
 }
 
 async function importFromComfy() {
+  if (state.graphEditor?.dirty && !confirm("当前画布有未保存的修改，继续导入工作流？")) return;
   const hist = await apiGet("comfy-history");
   const item = ((hist && hist.items) || []).find((x) => x.has_workflow);
   if (!item) {
@@ -577,6 +658,7 @@ async function importFromComfy() {
   state.slotOptions = res.slot_options || {};
   state.activeWorkflow = res.name;
   state.profileSlots = res.profile_slots || res.detected_slots || {};
+  state.profileSource = res.profile_source || "detected";
   state.profileDropNodes = res.drop_nodes || [];
   await bindWorkflow(res.name);
 }
@@ -610,27 +692,307 @@ async function runGenerate() {
     return;
   }
   state.runningPid = res.prompt_id;
-  pollResult(res.prompt_id);
+  pollResult(res.prompt_id, "#preview", res.wait_timeout).catch((error) => toast(String(error), true));
 }
 
-async function pollResult(pid) {
-  for (let i = 0; i < 150; i++) {
-    const poll = await apiGet("generate", { pid });
+async function pollResult(pid, previewSelector = "#preview", waitTimeout = 300) {
+  const preview = $(previewSelector);
+  const resume = $(previewSelector === "#graph-preview" ? "#graph-resume" : "#btn-resume");
+  resume.hidden = true;
+  const deadline = performance.now() + Math.max(1, Number(waitTimeout) || 300) * 1000;
+  while (performance.now() < deadline) {
+    let poll;
+    try { poll = await apiGet("generate", { pid }); }
+    catch (_) {
+      preview.textContent = "连接暂时中断，正在重新查询任务…";
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      continue;
+    }
     if (poll && poll.done) {
       state.runningPid = "";
       if (poll.error) {
-        $("#preview").textContent = poll.error;
+        preview.textContent = poll.error;
         toast(poll.error, true);
         return;
       }
-      $("#preview").innerHTML = `<img alt="preview" src="${poll.data_url}" />`;
+      if (poll.data_url) {
+        const img = document.createElement("img");
+        img.alt = "生成结果";
+        img.src = poll.data_url;
+        preview.replaceChildren(img);
+      } else preview.textContent = poll.message || "执行完成";
       await loadLists();
       return;
     }
-    await new Promise((r) => setTimeout(r, 2000));
+    const progress = poll?.progress;
+    if (progress?.event === "progress") preview.textContent = `正在生成 · ${progress.value}/${progress.max}`;
+    await new Promise((r) => setTimeout(r, 200));
   }
   state.runningPid = "";
-  $("#preview").textContent = "等待超时";
+  preview.textContent = `等待超时，任务仍可能在排队或执行。任务 ID：${pid}`;
+  resume.dataset.promptId = pid;
+  resume.hidden = false;
+}
+
+function updateGraphStatus() {
+  const editor = state.graphEditor;
+  if (!editor) return;
+  const count = editor.graph._nodes.length;
+  const name = editor.activeName || "未命名工作流";
+  $("#graph-status").textContent = `${name} · ${count} 个节点${editor.dirty ? " · 未保存" : ""}`;
+  $("#graph-undo").disabled = !editor.canUndo;
+  $("#graph-redo").disabled = !editor.canRedo;
+}
+
+function setGraphPanel(panel, hidden) {
+  document.body.classList.toggle(`graph-${panel}-hidden`, hidden);
+  $(`#graph-toggle-${panel}`).setAttribute("aria-expanded", String(!hidden));
+}
+
+function loadGraphPayload(payload) {
+  if (!state.graphEditor || !payload?.workflow) return;
+  state.graphEditor.load(payload.name, payload.workflow, payload.ui_workflow);
+  $("#graph-name").value = payload.name || "";
+  updateGraphStatus();
+}
+
+async function loadGraphForName(name) {
+  if (!name) return;
+  const res = await apiGet("workflow", { name });
+  if (!res?.ok) throw new Error(res?.error || "无法加载工作流画布");
+  loadGraphPayload(res);
+}
+
+function renderGraphPalette() {
+  const holder = $("#graph-palette-list");
+  const query = $("#graph-search").value.trim().toLocaleLowerCase();
+  holder.replaceChildren();
+  const entries = Object.entries(state.nodeDefinitions)
+    .filter(([type, def]) => {
+      const hay = `${type} ${def.display_name || ""} ${def.category || ""}`.toLocaleLowerCase();
+      return !query || hay.includes(query);
+    })
+    .sort((a, b) => String(a[1].category || "").localeCompare(String(b[1].category || "")) || a[0].localeCompare(b[0]))
+    .slice(0, query ? 250 : 90);
+  let category = "";
+  for (const [type, def] of entries) {
+    const next = def.category || "其他";
+    if (category !== next) {
+      category = next;
+      const header = document.createElement("div");
+      header.className = "graph-category";
+      header.textContent = category;
+      holder.append(header);
+    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "graph-palette-node";
+    button.draggable = true;
+    const title = document.createElement("strong");
+    title.textContent = def.display_name || type;
+    const technical = document.createElement("small");
+    technical.textContent = type;
+    button.append(title, technical);
+    button.addEventListener("click", () => {
+      try { state.graphEditor.addNode(type); }
+      catch (error) { toast(String(error), true); }
+    });
+    button.addEventListener("dragstart", (event) => event.dataTransfer.setData("text/x-comfy-node", type));
+    holder.append(button);
+  }
+  if (!entries.length) {
+    const empty = document.createElement("p");
+    empty.className = "graph-empty";
+    empty.textContent = query ? "没有匹配的节点" : "连接 ComfyUI 后加载节点库";
+    holder.append(empty);
+  }
+}
+
+function renderGraphInspector(node) {
+  const holder = $("#graph-inspector-content");
+  holder.replaceChildren();
+  if (!node) {
+    holder.textContent = "点击画布中的节点查看参数。";
+    return;
+  }
+  const title = document.createElement("h3");
+  title.textContent = node.title || node.type;
+  const id = document.createElement("span");
+  id.className = "graph-node-id";
+  id.textContent = `#${node.id} · ${node.type}`;
+  holder.append(title, id);
+  const definitions = state.nodeDefinitions[node.type]?.input || {};
+  const fields = { ...(definitions.required || {}), ...(definitions.optional || {}) };
+  const names = new Set([...Object.keys(fields), ...Object.keys(node._apiInputs || {}),
+    ...(node.widgets || []).filter((widget) => widget._seedWidget).map((widget) => widget.name)]);
+  for (const name of names) {
+    const widget = node.widgets?.find((item) => item.name === name);
+    const spec = fields[name] || (widget?._seedWidget ? [widget.options.values, {}] : []);
+    const link = node.inputs?.find((input) => input.name === name && input.link != null);
+    const label = document.createElement("label");
+    label.className = "field";
+    const caption = document.createElement("span");
+    caption.textContent = name;
+    label.append(caption);
+    if (link) {
+      const source = state.graphEditor.graph.links.get(link.link);
+      const linked = document.createElement("div");
+      linked.className = "graph-linked-field";
+      linked.textContent = source ? `连接自 #${source.origin_id} · 输出 ${source.origin_slot}` : "连线已失效";
+      label.append(linked);
+      holder.append(label);
+      continue;
+    }
+    const value = widget?.value ?? node._apiInputs?.[name] ?? spec?.[1]?.default ?? "";
+    const choices = Array.isArray(spec[0]) ? spec[0]
+      : spec[0] === "COMBO" ? (spec[1]?.options || spec[1]?.values || []) : null;
+    let control;
+    if (Array.isArray(choices) && choices.length) {
+      control = document.createElement("select");
+      const options = [...choices];
+      if (value && !options.includes(value)) options.unshift(value);
+      for (const choice of options) control.add(new Option(String(choice), String(choice)));
+      control.value = String(value);
+    } else if (spec[0] === "BOOLEAN") {
+      control = document.createElement("input");
+      control.type = "checkbox";
+      control.checked = Boolean(value);
+    } else if (spec[0] === "INT" || spec[0] === "FLOAT") {
+      control = document.createElement("input");
+      control.type = "number";
+      control.step = spec[0] === "INT" ? "1" : String(spec[1]?.step || "any");
+      if (spec[1]?.min !== undefined) control.min = spec[1].min;
+      if (spec[1]?.max !== undefined) control.max = spec[1].max;
+      control.value = String(value);
+    } else {
+      control = document.createElement("textarea");
+      control.rows = spec[1]?.multiline ? 5 : 2;
+      control.value = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+    }
+    control.addEventListener("change", () => {
+      let next;
+      if (control.type === "checkbox") next = control.checked;
+      else if (control.type === "number") {
+        next = Number(control.value);
+        if (!Number.isFinite(next) || (spec[0] === "INT" && !Number.isInteger(next))) {
+          toast(`${name} 的数字无效`, true);
+          return;
+        }
+      } else if (!Object.hasOwn(fields, name) && typeof value === "object") {
+        try { next = JSON.parse(control.value); }
+        catch (_) { toast(`${name} 的 JSON 无效`, true); return; }
+      } else next = control.value;
+      node._apiInputs = node._apiInputs || {};
+      if (widget?.options?.serialize !== false) node._apiInputs[name] = next;
+      if (widget) widget.value = next;
+      state.graphEditor.changed();
+    });
+    label.append(control);
+    if (!Object.hasOwn(fields, name) && !widget) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "移除此输入";
+      remove.addEventListener("click", () => {
+        delete node._apiInputs[name];
+        state.graphEditor.changed();
+        renderGraphInspector(node);
+      });
+      label.append(remove);
+    }
+    holder.append(label);
+  }
+  if (node.type.includes("Power Lora Loader")) {
+    const addLora = document.createElement("button");
+    addLora.type = "button";
+    addLora.textContent = "添加 LoRA 槽位";
+    addLora.addEventListener("click", () => {
+      node._apiInputs = node._apiInputs || {};
+      let index = 1;
+      while (Object.hasOwn(node._apiInputs, `lora_${index}`)) index++;
+      node._apiInputs[`lora_${index}`] = { on: false, lora: "", strength: 0.8 };
+      state.graphEditor.changed();
+      renderGraphInspector(node);
+    });
+    holder.append(addLora);
+  }
+  if (!names.size) {
+    const empty = document.createElement("p");
+    empty.textContent = "此节点没有可编辑的输入。";
+    holder.append(empty);
+  }
+}
+
+async function ensureGraphEditor() {
+  if (state.graphEditor) return state.graphEditor;
+  const { WorkflowGraphEditor } = await import("./graph-editor.bundle.js?v=canvas-3");
+  const editor = new WorkflowGraphEditor($("#workflow-canvas"), {
+    onChange: updateGraphStatus,
+    onSelect: renderGraphInspector,
+  });
+  state.graphEditor = editor;
+  const result = await apiGet("workflow/nodes");
+  if (result?.ok) {
+    state.nodeDefinitions = result.definitions || {};
+    editor.setDefinitions(state.nodeDefinitions);
+  } else toast(result?.error || "远端节点库不可用；已有画布快照仍可打开", true);
+  renderGraphPalette();
+  return editor;
+}
+
+async function setGraphMode(enabled) {
+  document.body.classList.toggle("graph-mode", enabled);
+  $("#btn-mode-graph").classList.toggle("active", enabled);
+  $("#btn-mode-recipe").classList.toggle("active", !enabled);
+  if (!enabled) return;
+  const editor = await ensureGraphEditor();
+  editor.resize();
+  if (state.activeWorkflow && editor.activeName !== state.activeWorkflow) await loadGraphForName(state.activeWorkflow);
+}
+
+async function saveGraph() {
+  const editor = await ensureGraphEditor();
+  const name = $("#graph-name").value.trim();
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) return toast("工作流名称仅允许字母、数字、下划线和连字符", true);
+  if (name !== editor.activeName && state.templates.some((item) => item.name === name)
+      && !confirm(`工作流「${name}」已存在，确认覆盖？`)) return;
+  const graph = await editor.exportWorkflow();
+  const res = await apiPost("workflow/save", { name, ...graph });
+  if (!res?.ok) return toast(res?.error || "保存工作流失败", true);
+  editor.activeName = name;
+  editor.markSaved();
+  state.activeWorkflow = name;
+  state.slotOptions = res.slot_options || {};
+  state.profileSlots = res.profile_slots || res.detected_slots || {};
+  state.profileSource = res.profile_source || "detected";
+  state.profileDropNodes = res.drop_nodes || [];
+  await loadLists();
+  renderSlots();
+  const staleRoles = Object.entries(state.profileSlots).filter(([, spec]) => {
+    const nodeId = String(spec?.node || "").split(" ")[0];
+    return nodeId && !Object.hasOwn(graph.workflow, nodeId);
+  }).map(([role]) => role);
+  toast(staleRoles.length
+    ? `工作流已保存；请重新确认槽位映射：${staleRoles.join("、")}`
+    : `工作流「${name}」已保存`, !!staleRoles);
+}
+
+async function runGraph() {
+  if (state.runningPid) return toast("上一张仍在运行，请先等待或中断", true);
+  const editor = await ensureGraphEditor();
+  const graph = await editor.exportWorkflow();
+  const preview = $("#graph-preview");
+  preview.textContent = "正在提交到远端 ComfyUI…";
+  const res = await apiPost("workflow/run", { name: $("#graph-name").value.trim(), ...graph });
+  if (!res?.ok) {
+    preview.textContent = res?.error || "提交失败";
+    return toast(res?.error || "提交失败", true);
+  }
+  state.runningPid = res.prompt_id;
+  editor.afterQueued();
+  setGraphPanel("inspector", false);
+  $("#graph-run-status").textContent = `#${res.prompt_id.slice(0, 8)}`;
+  await pollResult(res.prompt_id, "#graph-preview", res.wait_timeout);
+  $("#graph-run-status").textContent = "";
 }
 
 async function saveHistoryAsRecipe(item) {
@@ -658,8 +1020,68 @@ async function newRecipe() {
 }
 
 function bindUi() {
+  for (const [button, selector] of [["#btn-resume", "#preview"], ["#graph-resume", "#graph-preview"]]) {
+    $(button).addEventListener("click", () => {
+      const pid = $(button).dataset.promptId;
+      if (!pid || state.runningPid) return;
+      state.runningPid = pid;
+      pollResult(pid, selector).catch((error) => { state.runningPid = ""; toast(String(error), true); });
+    });
+  }
+  document.addEventListener("keydown", (event) => {
+    if (!document.body.classList.contains("graph-mode") || !(event.ctrlKey || event.metaKey)) return;
+    const key = event.key.toLowerCase();
+    if (key !== "s" && key !== "enter") return;
+    event.preventDefault();
+    const action = key === "s" ? saveGraph : runGraph;
+    action().catch((error) => toast(String(error), true));
+  });
+  $("#graph-workflow-select").addEventListener("change", async (event) => {
+    const name = event.target.value;
+    if (!name) return;
+    try { await bindWorkflow(name); }
+    catch (error) { toast(String(error), true); }
+    event.target.value = state.activeWorkflow;
+  });
+  $("#btn-mode-graph").addEventListener("click", () => setGraphMode(true).catch((e) => toast(String(e), true)));
+  $("#btn-mode-recipe").addEventListener("click", () => setGraphMode(false));
+  $("#graph-search").addEventListener("input", renderGraphPalette);
+  $("#graph-save").addEventListener("click", () => saveGraph().catch((e) => toast(String(e), true)));
+  $("#graph-run").addEventListener("click", () => runGraph().catch((e) => toast(String(e), true)));
+  $("#graph-fit").addEventListener("click", () => state.graphEditor?.fit());
+  $("#graph-undo").addEventListener("click", () => state.graphEditor?.undo());
+  $("#graph-redo").addEventListener("click", () => state.graphEditor?.redo());
+  for (const panel of ["palette", "inspector"]) {
+    $(`#graph-toggle-${panel}`).addEventListener("click", () => {
+      setGraphPanel(panel, !document.body.classList.contains(`graph-${panel}-hidden`));
+    });
+  }
+  $("#graph-stop").addEventListener("click", async () => {
+    if (!state.runningPid) return;
+    const res = await apiPost("generate/interrupt", { prompt_id: state.runningPid });
+    toast(res?.ok ? "已请求中断" : (res?.error || "中断失败"), !res?.ok);
+  });
+  $("#graph-import").addEventListener("change", (event) => {
+    const file = event.target.files?.[0];
+    if (file) importFile(file).catch((e) => toast(String(e), true));
+    event.target.value = "";
+  });
+  const graphCanvas = $("#workflow-canvas");
+  graphCanvas.addEventListener("dragover", (event) => {
+    if (event.dataTransfer.types.includes("text/x-comfy-node")) event.preventDefault();
+  });
+  graphCanvas.addEventListener("drop", (event) => {
+    const type = event.dataTransfer.getData("text/x-comfy-node");
+    if (!type || !state.graphEditor) return;
+    event.preventDefault();
+    const pos = state.graphEditor.eventToGraph(event);
+    try { state.graphEditor.addNode(type, pos); }
+    catch (error) { toast(String(error), true); }
+  });
   $("#btn-refresh").addEventListener("click", () => refreshStatus().catch((e) => toast(String(e), true)));
   $("#btn-save").addEventListener("click", () => saveRecipe().catch((e) => toast(String(e), true)));
+  $("#btn-detect-slots").addEventListener("click", () => redetectSlots().catch((e) => toast(String(e), true)));
+  $("#btn-save-profile").addEventListener("click", () => saveWorkflowProfile().catch((e) => toast(String(e), true)));
   $("#btn-new-recipe").addEventListener("click", () => newRecipe().catch((e) => toast(String(e), true)));
   $("#btn-delete-recipe").addEventListener("click", async () => {
     if (!state.recipe.name) return;
@@ -731,6 +1153,7 @@ async function main() {
     if (state.recipes.length) await loadRecipe(state.recipes[0].id || state.recipes[0].name);
     else if (state.families.length) await newRecipe();
     else if (state.templates.length) await bindWorkflow(state.templates[0].name);
+    await setGraphMode(true);
   } catch (e) {
     toast(String(e), true);
   }

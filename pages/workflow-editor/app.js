@@ -1,9 +1,14 @@
 const SLOT_FALLBACK = [
   { id: "prompt", label: "用户要画的内容", help: "必选", basic: true },
   { id: "source_image", label: "编辑来源图片", help: "图片编辑工作流中的 LoadImage 节点", basic: false },
+  { id: "source_images", label: "编辑参考图输入（多选）", help: "按节点列表顺序填入所选图片；行内标记显示节点连接的 Qwen 输入口，可用上/下调整图片对应关系", basic: false },
+  { id: "resolution", label: "编辑输出分辨率", help: "Qwen Image 2.1 编辑 resolution 输入；0 保留参考图尺寸", basic: false },
+  { id: "custom_size", label: "编辑自定义画布", help: "custom_size 开关；启用后使用分辨率选择器画布", basic: false },
   { id: "model", label: "底模", help: "", basic: true },
   { id: "loras", label: "LoRA", help: "", basic: true },
   { id: "size", label: "画面大小", help: "", basic: true },
+  { id: "aspect_ratio", label: "分辨率选择器画幅比例", help: "例如 1:1、16:9", basic: false },
+  { id: "megapixels", label: "分辨率选择器目标 MP", help: "例如 1.0；Qwen Image 2.1 2K 方图约 4.0", basic: false },
   { id: "sampler", label: "出图采样", help: "必选", basic: true },
   { id: "negative", label: "不要出现的东西", help: "", basic: false },
   { id: "artist", label: "画师风格", help: "", basic: false },
@@ -18,6 +23,7 @@ const state = {
   connected: false,
   templates: [],
   families: [],
+  editWorkflows: [],
   recipes: [],
   defaultRecipe: "",
   slotRoles: SLOT_FALLBACK,
@@ -26,7 +32,15 @@ const state = {
   samplers: ["er_sde", "euler", "dpmpp_2m"],
   schedulers: ["normal", "karras", "simple"],
   recipe: emptyRecipe(),
+  activeMode: "workflow",
   activeWorkflow: "",
+  workflowSource: "",
+  workflowPurpose: "generate",
+  workflowFamily: "",
+  workflowEditRoute: "",
+  workflowEditDescription: "",
+  workflowJsonOriginal: "",
+  profileSlotsOriginal: "{}",
   profileSlots: {},
   profileSource: "detected",
   profileDropNodes: [],
@@ -47,6 +61,23 @@ function emptyRecipe() {
 }
 
 const $ = (sel) => document.querySelector(sel);
+
+function selectMode(mode) {
+  state.activeMode = mode === "recipe" ? "recipe" : "workflow";
+  const workflow = state.activeMode === "workflow";
+  if (!workflow) {
+    $("#graph-editor-panel").classList.remove("graph-expanded");
+    $("#graph-expand").textContent = "放大画布";
+  }
+  $("#workflow-pane").hidden = !workflow;
+  $("#recipe-pane").hidden = workflow;
+  $("#rail-right").hidden = workflow;
+  $("#layout").classList.toggle("workflow-mode", workflow);
+  $("#graph-editor-panel").hidden = !workflow;
+  $("#tab-workflow").setAttribute("aria-selected", String(workflow));
+  $("#tab-recipe").setAttribute("aria-selected", String(!workflow));
+  if (workflow && state.graphEditor) requestAnimationFrame(() => state.graphEditor.resize());
+}
 
 function toast(msg, isErr = false) {
   const t = $("#toast");
@@ -109,9 +140,48 @@ function familyByName(name) {
   return state.families.find((item) => String(item.name || "").toLocaleLowerCase() === wanted) || null;
 }
 
+function renderWorkflowRouting() {
+  const active = state.activeWorkflow;
+  $("#workflow-active-name").textContent = active || "尚未选择";
+  $("#workflow-active-source").textContent = active ? (state.workflowSource === "custom" ? "已导入" : state.workflowSource) : "";
+  $("#workflow-purpose").value = state.workflowPurpose;
+  const isEdit = state.workflowPurpose === "edit";
+  const boundFamily = state.families.find((family) => family.workflow === active);
+  if (!familyByName(state.workflowFamily) && boundFamily) state.workflowFamily = boundFamily.name;
+  fillSelect($("#workflow-family"), state.families.map((family) => family.name), state.workflowFamily, [""]);
+  const family = familyByName(state.workflowFamily);
+  const route = state.editWorkflows.find((item) => String(item.name || "").toLocaleLowerCase() === state.workflowEditRoute.toLocaleLowerCase());
+  $("#workflow-family-wrap").hidden = isEdit;
+  $("#workflow-edit-route-wrap").hidden = !isEdit;
+  $("#workflow-edit-description-wrap").hidden = !isEdit;
+  $("#workflow-edit-route").value = state.workflowEditRoute;
+  $("#workflow-edit-description").value = state.workflowEditDescription;
+  $("#workflow-edit-route-options").innerHTML = state.editWorkflows
+    .filter((item) => item.name)
+    .map((item) => `<option value="${escapeAttr(item.name)}"></option>`)
+    .join("");
+  $("#workflow-bind-status").textContent = isEdit
+    ? `编辑路由「${state.workflowEditRoute || "(未命名)"}」：${route?.workflow || "尚未绑定"}`
+    : family
+      ? `${family.name} 的生图工作流：${family.workflow || "未绑定"}`
+      : "选择生图家族后绑定当前工作流；配方数据不会改变。";
+  $("#btn-bind-workflow").disabled = !active || (isEdit ? !state.workflowEditRoute.trim() : !family);
+  $("#btn-bind-workflow").textContent = isEdit ? "保存编辑路由" : "绑定生图工作流";
+  $("#btn-unbind-edit").hidden = !isEdit || !route?.workflow;
+  $("#btn-save-workflow-json").disabled = !active;
+}
+
+function workflowDraftDirty() {
+  return $("#workflow-json").value !== state.workflowJsonOriginal
+    || JSON.stringify(state.profileSlots) !== state.profileSlotsOriginal;
+}
+
 function slotNode(role) {
   const spec = state.profileSlots?.[role];
   if (!spec) return "";
+  if (role === "source_images" && Array.isArray(spec)) {
+    return spec.map((item) => typeof item === "string" ? item : (item?.node || ""));
+  }
   if (typeof spec === "string") return spec;
   return spec.node || "";
 }
@@ -130,20 +200,78 @@ function renderSlotSelect(role, parent) {
   sel.dataset.slot = role.id;
   const current = slotNode(role.id);
   const options = state.slotOptions[role.id] || [""];
-  fillSelect(sel, options, current, [""]);
-  if (current && ![...sel.options].some((o) => o.value === current || o.value.startsWith(`${current} `) || o.value.startsWith(`${current} —`))) {
-    const opt = document.createElement("option");
-    opt.value = current;
-    opt.textContent = prettyNode(current);
-    opt.selected = true;
-    sel.insertBefore(opt, sel.firstChild);
+  if (role.id === "source_images") {
+    const specs = (state.profileSlots.source_images || []).map((item) => typeof item === "string" ? { node: item } : { ...item });
+    const save = () => {
+      state.profileSlots.source_images = specs;
+      if (specs.length) state.profileSlots.source_image = { ...specs[0] };
+      else delete state.profileSlots.source_image;
+      renderSlots();
+    };
+    label.append(span);
+    specs.forEach((spec, index) => {
+      const row = document.createElement("div");
+      row.className = "source-image-row";
+      const number = document.createElement("span");
+      number.textContent = spec.input_field || `images.image_${index + 1}`;
+      const select = document.createElement("select");
+      select.setAttribute("aria-label", `${number.textContent} 节点`);
+      const selected = options.find((option) => option === spec.node || option.startsWith(`${spec.node} —`)) || spec.node || "";
+      const chosenElsewhere = new Set(specs
+        .filter((_, otherIndex) => otherIndex !== index)
+        .map((item) => String(item.node || "").split(" — ", 1)[0])
+        .filter(Boolean));
+      const available = options.filter((option) => {
+        const nodeId = String(option).split(" — ", 1)[0];
+        return !nodeId || !chosenElsewhere.has(nodeId);
+      });
+      fillSelect(select, available, selected);
+      select.addEventListener("change", () => {
+        specs[index] = {
+          ...spec,
+          node: select.value,
+          field: "image",
+          mode: "replace",
+          input_field: spec.input_field || `images.image_${index + 1}`,
+        };
+        save();
+      });
+      row.append(number, select);
+      for (const [title, offset] of [["上移", -1], ["下移", 1], ["删除", 0]]) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = title;
+        button.setAttribute("aria-label", `${title}参考图 ${index + 1}`);
+        button.disabled = offset !== 0 && (index + offset < 0 || index + offset >= specs.length);
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          if (offset === 0) specs.splice(index, 1);
+          else [specs[index], specs[index + offset]] = [specs[index + offset], specs[index]];
+          save();
+        });
+        row.append(button);
+      }
+      label.append(row);
+    });
+    const add = document.createElement("button");
+    add.type = "button";
+    add.textContent = "添加参考图输入";
+    add.addEventListener("click", (event) => {
+      event.preventDefault();
+      specs.push({
+        node: "",
+        field: "image",
+        mode: "replace",
+        input_field: `images.image_${specs.length + 1}`,
+      });
+      save();
+    });
+    label.append(add);
+    parent.appendChild(label);
+    return;
   }
-  for (const o of sel.options) {
-    if (o.value === current || o.value.startsWith(`${current} —`) || o.value.startsWith(`${current} `)) {
-      o.selected = true;
-      break;
-    }
-  }
+  const selected = options.find((o) => o === current || o.startsWith(`${current} —`) || o.startsWith(`${current} `)) || current;
+  fillSelect(sel, options, selected, [""]);
   sel.addEventListener("change", () => {
     state.profileSlots = state.profileSlots || {};
     const v = sel.value;
@@ -160,6 +288,8 @@ function renderSlots() {
   basic.innerHTML = "";
   if (extra) extra.innerHTML = "";
   for (const role of state.slotRoles) {
+    if (role.id === "source_image" && Array.isArray(state.profileSlots.source_images)
+        && state.profileSlots.source_images.length) continue;
     renderSlotSelect(role, role.basic === false ? extra || basic : basic);
   }
   const guide = $("#empty-guide");
@@ -242,12 +372,18 @@ function renderLists() {
     const li = document.createElement("li");
     li.className = t.name === state.activeWorkflow ? "active" : "";
     const src = t.source === "custom" ? "已导入" : (t.source || "");
-    li.innerHTML = `<strong>${escapeHtml(t.name)}</strong><span class="meta">${escapeHtml(src)} · ${t.node_count || "?"} 个格子</span>`;
+    const drawFamilies = state.families.filter((item) => item.workflow === t.name).map((item) => item.name);
+    const editRoutes = state.editWorkflows.filter((item) => item.workflow === t.name).map((item) => item.name);
+    const routes = [
+      drawFamilies.length ? `生图 ${drawFamilies.join("、")}` : "",
+      editRoutes.length ? `编辑 ${editRoutes.join("、")}` : "",
+    ].filter(Boolean).join(" · ");
+    li.innerHTML = `<strong>${escapeHtml(t.name)}</strong><span class="meta">${escapeHtml(src)} · ${t.node_count || "?"} 个节点${routes ? ` · ${escapeHtml(routes)}` : ""}</span>`;
     li.addEventListener("click", () => bindWorkflow(t.name));
     const del = document.createElement("button");
     del.className = "wf-del";
     del.textContent = "×";
-    del.title = "删除这张模板（模型家族或旧配方仍引用时会被拒绝）";
+    del.title = "删除这张模板（生图家族、编辑路由或旧配方仍引用时会被拒绝）";
     del.addEventListener("click", (e) => {
       e.stopPropagation();
       deleteTemplate(t.name);
@@ -348,27 +484,16 @@ function numOrEmpty(v) {
   return Number.isFinite(n) ? n : undefined;
 }
 
-function applyRecipeToForm(recipe, resolved = {}) {
+function applyRecipeToForm(recipe) {
   state.recipe = {
     ...emptyRecipe(),
     ...recipe,
     defaults: { loras: [], ...(recipe.defaults || {}) },
   };
-  if (resolved.workflow !== undefined) state.activeWorkflow = resolved.workflow || "";
-  if (resolved.slots !== undefined) state.profileSlots = resolved.slots || {};
-  if (resolved.dropNodes !== undefined) state.profileDropNodes = resolved.dropNodes || [];
   $("#recipe-name").value = state.recipe.name || "";
   $("#recipe-desc").value = state.recipe.description || "";
   renderLists();
-  renderSlots();
   renderDefaults();
-  renderGraphWorkflowChoices();
-}
-
-function renderGraphWorkflowChoices() {
-  const select = $("#graph-workflow-select");
-  if (!select) return;
-  fillSelect(select, state.templates.map((item) => item.name), state.activeWorkflow, [""]);
 }
 
 async function refreshStatus() {
@@ -381,6 +506,7 @@ async function refreshStatus() {
   state.connected = !!res.connected;
   state.resources = res.resources || state.resources;
   state.families = res.model_families || state.families;
+  state.editWorkflows = res.edit_workflows || state.editWorkflows;
   if (res.sampler_names) state.samplers = res.sampler_names;
   if (res.schedulers) state.schedulers = res.schedulers;
   if (res.slot_roles) state.slotRoles = res.slot_roles;
@@ -393,6 +519,7 @@ async function refreshStatus() {
     $("#gpu-text").textContent = `显存 ${free}/${total}G`;
   }
   renderDefaults();
+  renderWorkflowRouting();
 }
 
 async function loadLists() {
@@ -407,7 +534,6 @@ async function loadLists() {
   state.history = (hist && hist.items) || [];
   renderLists();
   renderHistory();
-  renderGraphWorkflowChoices();
 }
 
 async function setDefaultRecipe(name) {
@@ -425,8 +551,11 @@ async function setDefaultRecipe(name) {
   }
 }
 
-async function bindWorkflow(name) {
-  if (state.graphEditor?.dirty && state.graphEditor.activeName !== name && !confirm("当前画布有未保存的修改，继续切换工作流？")) return;
+async function bindWorkflow(name, force = false) {
+  if (!force && state.graphEditor?.dirty && state.graphEditor.activeName !== name
+      && !confirm("当前画布有未保存的修改，确定切换工作流吗？")) return false;
+  if (!force && state.activeWorkflow && workflowDraftDirty()
+      && !confirm("当前工作流 JSON 或节点映射有未保存的修改，确定要放弃吗？")) return false;
   const res = await apiGet("workflow", { name });
   if (!res || !res.ok) {
     toast(res?.error || "加载工作流失败", true);
@@ -435,29 +564,33 @@ async function bindWorkflow(name) {
   state.slotOptions = res.slot_options || {};
   const switched = state.activeWorkflow !== name;
   state.activeWorkflow = name;
+  state.workflowSource = res.source || "";
   state.profileSlots = res.profile_slots || res.detected_slots || {};
   state.profileSource = res.profile_source || "detected";
   state.profileDropNodes = res.drop_nodes || [];
-  const matchedFamily = state.families.find((item) => item.workflow === name);
-  if (!state.recipe.family && matchedFamily) state.recipe.family = matchedFamily.name;
-  if (switched) toast(`已打开工作流「${name}」的共享槽位`);
-  if (switched) {
-    const detect = await apiPost("workflow/detect", { name });
-    if (detect && detect.ok && detect.values) {
-      const keepLoras = state.recipe.defaults.loras || [];
-      state.recipe.defaults = { loras: keepLoras, ...detect.values };
-    }
-  } else if (res.detected_slots) {
-    const detect = await apiPost("workflow/detect", { name });
-    if (detect && detect.ok && detect.values) {
-      state.recipe.defaults = { loras: [], ...detect.values, ...state.recipe.defaults };
-    }
+  state.workflowJsonOriginal = JSON.stringify(res.workflow || {}, null, 2);
+  state.profileSlotsOriginal = JSON.stringify(state.profileSlots);
+  $("#workflow-json").value = state.workflowJsonOriginal;
+  const editRoute = state.editWorkflows.find((item) => item.workflow === name && item.workflow);
+  const drawFamily = state.families.find((item) => item.workflow === name);
+  if (editRoute && !drawFamily) state.workflowPurpose = "edit";
+  else if (drawFamily) state.workflowPurpose = "generate";
+  if (editRoute && !drawFamily) {
+    state.workflowEditRoute = editRoute.name;
+    state.workflowEditDescription = editRoute.description || "";
   }
+  else if (drawFamily) state.workflowFamily = drawFamily.name;
+  else if (state.workflowPurpose === "edit") {
+    state.workflowEditRoute = name;
+    state.workflowEditDescription = "";
+  }
+  if (switched) toast(`已打开工作流「${name}」的共享槽位`);
   renderLists();
   renderSlots();
-  renderDefaults();
-  renderGraphWorkflowChoices();
+  renderWorkflowRouting();
   if (state.graphEditor) loadGraphPayload(res);
+  selectMode("workflow");
+  return true;
 }
 
 async function loadRecipe(name) {
@@ -466,22 +599,12 @@ async function loadRecipe(name) {
     toast(res?.error || "读取配方失败", true);
     return;
   }
-  if (state.graphEditor?.dirty && state.graphEditor.activeName !== res.resolved_workflow
-      && !confirm("当前画布有未保存的修改，继续切换工作流？")) return;
-  if (res.template_missing) {
-    toast(`模型家族配置的工作流「${res.template_missing}」不存在，请检查配置`, true);
-  }
-  state.slotOptions = res.slot_options || {};
-  applyRecipeToForm(res.recipe, {
-    workflow: res.resolved_workflow || "",
-    slots: res.profile_slots || {},
-    dropNodes: res.drop_nodes || [],
-  });
-  if (state.graphEditor && state.activeWorkflow) await loadGraphForName(state.activeWorkflow);
+  applyRecipeToForm(res.recipe);
+  selectMode("recipe");
 }
 
 async function deleteTemplate(name) {
-  if (!confirm(`删除模板「${name}」？模型家族或旧配方仍引用时会被拒绝。`)) return;
+  if (!confirm(`删除模板「${name}」？生图家族、编辑路由或旧配方仍引用时会被拒绝。`)) return;
   const res = await apiPost("workflow/delete", { name });
   if (!res || !res.ok) {
     toast(res?.error || "删除失败", true);
@@ -490,9 +613,15 @@ async function deleteTemplate(name) {
   toast(`模板「${name}」已删除`);
   if (state.activeWorkflow === name) {
     state.activeWorkflow = "";
+    state.workflowSource = "";
     state.profileSlots = {};
     state.slotOptions = {};
+    state.workflowJsonOriginal = "";
+    state.profileSlotsOriginal = "{}";
+    $("#workflow-json").value = "";
+    if (state.graphEditor) state.graphEditor.load("", {}, null);
     renderSlots();
+    renderWorkflowRouting();
   }
   await loadLists();
 }
@@ -512,19 +641,9 @@ async function saveRecipe() {
     toast("当前家族没有配置，请重载插件配置", true);
     return false;
   }
-  if (!state.activeWorkflow || state.activeWorkflow !== family.workflow) {
-    toast(`当前家族应使用工作流「${family.workflow}」，请先确认该工作流`, true);
-    return false;
-  }
-  if (!slotNode("prompt") || !slotNode("sampler")) {
-    toast("请确认「用户要画的内容」和「出图采样」两个格子", true);
-    return false;
-  }
   const res = await apiPost("recipe/save", {
     ...state.recipe,
     family: family.name,
-    profile_slots: state.profileSlots,
-    drop_nodes: state.profileDropNodes,
   });
   if (!res || !res.ok) {
     toast(res?.error || "保存失败", true);
@@ -532,11 +651,8 @@ async function saveRecipe() {
   }
   toast("这套已经记住了");
   await loadLists();
-  applyRecipeToForm(res.recipe, {
-    workflow: state.activeWorkflow,
-    slots: state.profileSlots,
-    dropNodes: state.profileDropNodes,
-  });
+  applyRecipeToForm(res.recipe);
+  selectMode("recipe");
   return true;
 }
 
@@ -548,8 +664,12 @@ async function redetectSlots() {
   state.slotOptions = res.slot_options || state.slotOptions;
   renderSlots();
   const count = Object.keys(state.profileSlots).length;
-  const editFamily = state.families.find((item) => item.edit_workflow === state.activeWorkflow);
-  if (editFamily && !slotNode("source_image")) {
+  const editRoute = state.editWorkflows.find((item) => item.workflow === state.activeWorkflow && item.workflow);
+  const mappedImages = slotNode("source_images");
+  const hasSourceImageMapping = Array.isArray(mappedImages)
+    ? mappedImages.some(Boolean) || !!slotNode("source_image")
+    : !!mappedImages || !!slotNode("source_image");
+  if ((editRoute || state.workflowPurpose === "edit") && !hasSourceImageMapping) {
     toast("编辑来源图片无法唯一识别，请手动选择 LoadImage 后保存映射", true);
   } else {
     toast(count ? `已加载 ${count} 个节点建议，核对后点「保存映射」` : "无法唯一识别节点，请手动选择后保存", !count);
@@ -570,10 +690,11 @@ async function saveWorkflowProfile() {
     state.profileSource = "profile";
     toast("工作流节点映射已保存");
   }
+  state.profileSlotsOriginal = JSON.stringify(state.profileSlots);
 }
 
 async function importFile(file) {
-  if (state.graphEditor?.dirty && !confirm("当前画布有未保存的修改，继续导入工作流？")) return;
+  if (state.graphEditor?.dirty && !confirm("当前画布有未保存的修改，确定导入工作流吗？")) return;
   const text = await file.text();
   let data;
   try {
@@ -585,62 +706,20 @@ async function importFile(file) {
   const name = file.name.replace(/\.json$/i, "")
     .replace(/[^A-Za-z0-9_-]/g, "_").replace(/^_+|_+$/g, "").slice(0, 64)
     || `workflow_${Date.now().toString(36)}`;
-  if (state.templates.some((item) => item.name === name) && !confirm(`工作流「${name}」已存在，确认覆盖？`)) return;
-  if (!Array.isArray(data.nodes) && (!data || typeof data !== "object" || !Object.keys(data).length)) {
-    toast("工作流 JSON 结构无效", true);
-    return;
-  }
-  const editor = await ensureGraphEditor();
-  if (!Object.keys(state.nodeDefinitions).length) {
-    toast("需要连接远端 ComfyUI 读取节点定义后才能导入画布", true);
-    return;
-  }
-  const uiWorkflow = Array.isArray(data.nodes) ? data : null;
-  const apiWorkflow = uiWorkflow ? {} : Object.fromEntries(
-    Object.entries(data).filter(([, node]) => node && typeof node === "object" && node.class_type)
-  );
-  if (!uiWorkflow && !Object.keys(apiWorkflow).length) {
-    toast("无法识别工作流 JSON 格式", true);
-    return;
-  }
-  editor.load(name, apiWorkflow, uiWorkflow);
-  $("#graph-name").value = name;
-  const graph = await editor.exportWorkflow();
-  const res = await apiPost("workflow/save", { name, ...graph });
+  if (state.templates.some((item) => item.name === name)
+      && !confirm(`工作流「${name}」已存在，确定覆盖吗？`)) return;
+  const res = await apiPost("workflow/import", { name, workflow: data });
   if (!res || !res.ok) {
     toast(res?.error || "导入失败", true);
     return;
   }
-  editor.markSaved();
   toast(`已导入 ${name}`);
-  state.slotOptions = res.slot_options || {};
-  state.activeWorkflow = name;
-  renderGraphWorkflowChoices();
-  state.profileSlots = res.profile_slots || res.detected_slots || {};
-  state.profileSource = res.profile_source || "detected";
-  state.profileDropNodes = res.drop_nodes || [];
   await loadLists();
-  const detect = await apiPost("workflow/detect", { name });
-  if (detect && detect.ok) {
-    state.recipe.defaults = { loras: [], ...(detect.values || {}) };
-  }
-  if (!state.recipe.name) state.recipe.name = name;
-  const matchedFamily = state.families.find((item) => item.workflow === name);
-  if (matchedFamily) state.recipe.family = matchedFamily.name;
-  applyRecipeToForm(state.recipe, {
-    workflow: name,
-    slots: state.profileSlots,
-    dropNodes: state.profileDropNodes,
-  });
-  if (!matchedFamily) {
-    toast(`工作流已导入；请到插件配置添加模型家族并选择「${name}」，随后重载插件`, true);
-  }
-  loadGraphPayload(res);
-  await setGraphMode(true);
+  await bindWorkflow(name);
 }
 
 async function importFromComfy() {
-  if (state.graphEditor?.dirty && !confirm("当前画布有未保存的修改，继续导入工作流？")) return;
+  if (state.graphEditor?.dirty && !confirm("当前画布有未保存的修改，确定从 ComfyUI 导入吗？")) return;
   const hist = await apiGet("comfy-history");
   const item = ((hist && hist.items) || []).find((x) => x.has_workflow);
   if (!item) {
@@ -655,11 +734,6 @@ async function importFromComfy() {
   }
   toast("已从 ComfyUI 历史导入");
   await loadLists();
-  state.slotOptions = res.slot_options || {};
-  state.activeWorkflow = res.name;
-  state.profileSlots = res.profile_slots || res.detected_slots || {};
-  state.profileSource = res.profile_source || "detected";
-  state.profileDropNodes = res.drop_nodes || [];
   await bindWorkflow(res.name);
 }
 
@@ -668,13 +742,8 @@ async function runGenerate() {
     toast("上一张还在跑，等等或点停止", true);
     return;
   }
-  readFormIntoRecipe();
-  if (!state.recipe.name) {
-    toast("先保存这套，再试画", true);
-    return;
-  }
-  const saved = await saveRecipe();
-  if (!saved) return;
+  const saved = state.recipes.find((row) => row.id === state.recipe.id || row.name === state.recipe.name);
+  if (!saved) return toast("先保存配方，再试画已保存的参数", true);
   const prompt = $("#test-prompt").value.trim();
   if (!prompt) {
     toast("先写一句要画什么", true);
@@ -683,7 +752,7 @@ async function runGenerate() {
   $("#preview").textContent = "排队中…";
   const res = await apiPost("generate", {
     prompt,
-    recipe: state.recipe.name,
+    recipe: saved.name,
     size: $("#test-size").value,
   });
   if (!res || !res.ok) {
@@ -734,6 +803,79 @@ async function pollResult(pid, previewSelector = "#preview", waitTimeout = 300) 
   resume.hidden = false;
 }
 
+async function saveHistoryAsRecipe(item) {
+  const name = prompt("给这套起个名字", item.recipe ? `${item.recipe}-2` : "新套装");
+  if (!name) return;
+  const res = await apiPost("recipe/from-history", { prompt_id: item.prompt_id, name });
+  if (!res || !res.ok) {
+    toast(res?.error || "保存失败", true);
+    return;
+  }
+  toast("已经存成一套新配方");
+  await loadLists();
+  await loadRecipe(res.recipe.id || res.recipe.name);
+}
+
+async function newRecipe() {
+  const recipe = emptyRecipe();
+  const family = state.families[0] || null;
+  if (family) recipe.family = family.name;
+  applyRecipeToForm(recipe);
+  selectMode("recipe");
+}
+
+async function saveWorkflowBinding(unbind = false) {
+  if (!state.activeWorkflow && !unbind) return toast("请先选择工作流", true);
+  const mode = $("#workflow-purpose").value;
+  if (unbind && mode !== "edit") return;
+  let payload;
+  if (mode === "edit") {
+    const editRoute = $("#workflow-edit-route").value.trim();
+    if (!editRoute) return toast("请填写编辑路由名", true);
+    payload = {
+      edit_route: editRoute,
+      description: $("#workflow-edit-description").value.trim(),
+      mode,
+      workflow: unbind ? "" : state.activeWorkflow,
+    };
+  } else {
+    const family = $("#workflow-family").value;
+    if (!family) return toast("请选择生图家族", true);
+    payload = { family, mode, workflow: state.activeWorkflow };
+  }
+  const res = await apiPost("workflow/bind", payload);
+  if (!res || !res.ok) return toast(res?.error || "绑定工作流失败", true);
+  state.families = res.model_families || state.families;
+  state.editWorkflows = res.edit_workflows || state.editWorkflows;
+  if (mode === "generate") state.workflowFamily = payload.family;
+  else state.workflowEditRoute = payload.edit_route;
+  if (mode === "edit") state.workflowEditDescription = payload.description;
+  state.workflowPurpose = mode;
+  renderLists();
+  renderWorkflowRouting();
+  const warning = (res.warnings || []).join("；");
+  toast(warning ? `已保存；${warning}，请检查节点映射` : (unbind ? `已解除「${payload.edit_route}」的工作流绑定` : mode === "edit" ? `已将「${state.activeWorkflow}」绑定到编辑路由「${payload.edit_route}」` : `已将「${state.activeWorkflow}」绑定到生图家族「${payload.family}」`), !!warning);
+}
+
+async function saveWorkflowJson() {
+  if (state.graphEditor?.dirty && !confirm("当前画布有未保存的修改，确定改用 API JSON 保存吗？")) return;
+  if (!state.activeWorkflow) return toast("请先选择工作流", true);
+  if (JSON.stringify(state.profileSlots) !== state.profileSlotsOriginal) {
+    return toast("先保存节点映射，再修改工作流 JSON", true);
+  }
+  let workflow;
+  try {
+    workflow = JSON.parse($("#workflow-json").value);
+  } catch (e) {
+    return toast(`工作流 JSON 格式错误：${e.message}`, true);
+  }
+  const res = await apiPost("workflow/import", { name: state.activeWorkflow, workflow });
+  if (!res || !res.ok) return toast(res?.error || "保存工作流失败", true);
+  await loadLists();
+  await bindWorkflow(state.activeWorkflow, true);
+  toast(`工作流「${state.activeWorkflow}」已保存；请重新核对节点映射`);
+}
+
 function updateGraphStatus() {
   const editor = state.graphEditor;
   if (!editor) return;
@@ -756,40 +898,30 @@ function loadGraphPayload(payload) {
   updateGraphStatus();
 }
 
-async function loadGraphForName(name) {
-  if (!name) return;
-  const res = await apiGet("workflow", { name });
-  if (!res?.ok) throw new Error(res?.error || "无法加载工作流画布");
-  loadGraphPayload(res);
-}
-
 function renderGraphPalette() {
   const holder = $("#graph-palette-list");
   const query = $("#graph-search").value.trim().toLocaleLowerCase();
   holder.replaceChildren();
   const entries = Object.entries(state.nodeDefinitions)
-    .filter(([type, def]) => {
-      const hay = `${type} ${def.display_name || ""} ${def.category || ""}`.toLocaleLowerCase();
-      return !query || hay.includes(query);
-    })
+    .filter(([type, def]) => `${type} ${def.display_name || ""} ${def.category || ""}`.toLocaleLowerCase().includes(query))
     .sort((a, b) => String(a[1].category || "").localeCompare(String(b[1].category || "")) || a[0].localeCompare(b[0]))
     .slice(0, query ? 250 : 90);
   let category = "";
-  for (const [type, def] of entries) {
-    const next = def.category || "其他";
+  for (const [type, definition] of entries) {
+    const next = definition.category || "其他";
     if (category !== next) {
       category = next;
-      const header = document.createElement("div");
-      header.className = "graph-category";
-      header.textContent = category;
-      holder.append(header);
+      const heading = document.createElement("div");
+      heading.className = "graph-category";
+      heading.textContent = category;
+      holder.append(heading);
     }
     const button = document.createElement("button");
     button.type = "button";
     button.className = "graph-palette-node";
     button.draggable = true;
     const title = document.createElement("strong");
-    title.textContent = def.display_name || type;
+    title.textContent = definition.display_name || type;
     const technical = document.createElement("small");
     technical.textContent = type;
     button.append(title, technical);
@@ -939,37 +1071,36 @@ async function ensureGraphEditor() {
   return editor;
 }
 
-async function setGraphMode(enabled) {
-  document.body.classList.toggle("graph-mode", enabled);
-  $("#btn-mode-graph").classList.toggle("active", enabled);
-  $("#btn-mode-recipe").classList.toggle("active", !enabled);
-  if (!enabled) return;
-  const editor = await ensureGraphEditor();
-  editor.resize();
-  if (state.activeWorkflow && editor.activeName !== state.activeWorkflow) await loadGraphForName(state.activeWorkflow);
-}
-
 async function saveGraph() {
   const editor = await ensureGraphEditor();
   const name = $("#graph-name").value.trim();
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) return toast("工作流名称仅允许字母、数字、下划线和连字符", true);
   if (name !== editor.activeName && state.templates.some((item) => item.name === name)
       && !confirm(`工作流「${name}」已存在，确认覆盖？`)) return;
-  const graph = await editor.exportWorkflow();
+  const graph = await editor.exportWorkflowSnapshot();
   const res = await apiPost("workflow/save", { name, ...graph });
   if (!res?.ok) return toast(res?.error || "保存工作流失败", true);
   editor.activeName = name;
   editor.markSaved();
   state.activeWorkflow = name;
+  state.workflowSource = res.source || "custom";
   state.slotOptions = res.slot_options || {};
   state.profileSlots = res.profile_slots || res.detected_slots || {};
   state.profileSource = res.profile_source || "detected";
   state.profileDropNodes = res.drop_nodes || [];
+  state.workflowJsonOriginal = JSON.stringify(res.workflow || graph.workflow, null, 2);
+  state.profileSlotsOriginal = JSON.stringify(state.profileSlots);
+  $("#workflow-json").value = state.workflowJsonOriginal;
   await loadLists();
   renderSlots();
+  renderWorkflowRouting();
+  updateGraphStatus();
   const staleRoles = Object.entries(state.profileSlots).filter(([, spec]) => {
-    const nodeId = String(spec?.node || "").split(" ")[0];
-    return nodeId && !Object.hasOwn(graph.workflow, nodeId);
+    const entries = Array.isArray(spec) ? spec : [spec];
+    return entries.some((entry) => {
+      const nodeId = String(entry?.node || "").split(" ")[0];
+      return nodeId && !Object.hasOwn(graph.workflow, nodeId);
+    });
   }).map(([role]) => role);
   toast(staleRoles.length
     ? `工作流已保存；请重新确认槽位映射：${staleRoles.join("、")}`
@@ -995,60 +1126,17 @@ async function runGraph() {
   $("#graph-run-status").textContent = "";
 }
 
-async function saveHistoryAsRecipe(item) {
-  const name = prompt("给这套起个名字", item.recipe ? `${item.recipe}-2` : "新套装");
-  if (!name) return;
-  const res = await apiPost("recipe/from-history", { prompt_id: item.prompt_id, name });
-  if (!res || !res.ok) {
-    toast(res?.error || "保存失败", true);
-    return;
-  }
-  toast("已经存成一套新配方");
-  await loadLists();
-  await loadRecipe(res.recipe.id || res.recipe.name);
-}
-
-async function newRecipe() {
-  const recipe = emptyRecipe();
-  const family = state.families[0] || null;
-  if (family) recipe.family = family.name;
-  state.activeWorkflow = "";
-  state.profileSlots = {};
-  state.profileDropNodes = [];
-  applyRecipeToForm(recipe);
-  if (family) await bindWorkflow(family.workflow);
-}
-
-function bindUi() {
-  for (const [button, selector] of [["#btn-resume", "#preview"], ["#graph-resume", "#graph-preview"]]) {
-    $(button).addEventListener("click", () => {
-      const pid = $(button).dataset.promptId;
-      if (!pid || state.runningPid) return;
-      state.runningPid = pid;
-      pollResult(pid, selector).catch((error) => { state.runningPid = ""; toast(String(error), true); });
-    });
-  }
-  document.addEventListener("keydown", (event) => {
-    if (!document.body.classList.contains("graph-mode") || !(event.ctrlKey || event.metaKey)) return;
-    const key = event.key.toLowerCase();
-    if (key !== "s" && key !== "enter") return;
-    event.preventDefault();
-    const action = key === "s" ? saveGraph : runGraph;
-    action().catch((error) => toast(String(error), true));
-  });
-  $("#graph-workflow-select").addEventListener("change", async (event) => {
-    const name = event.target.value;
-    if (!name) return;
-    try { await bindWorkflow(name); }
-    catch (error) { toast(String(error), true); }
-    event.target.value = state.activeWorkflow;
-  });
-  $("#btn-mode-graph").addEventListener("click", () => setGraphMode(true).catch((e) => toast(String(e), true)));
-  $("#btn-mode-recipe").addEventListener("click", () => setGraphMode(false));
+function bindGraphUi() {
   $("#graph-search").addEventListener("input", renderGraphPalette);
-  $("#graph-save").addEventListener("click", () => saveGraph().catch((e) => toast(String(e), true)));
-  $("#graph-run").addEventListener("click", () => runGraph().catch((e) => toast(String(e), true)));
+  $("#graph-save").addEventListener("click", () => saveGraph().catch((error) => toast(String(error), true)));
+  $("#graph-run").addEventListener("click", () => runGraph().catch((error) => toast(String(error), true)));
   $("#graph-fit").addEventListener("click", () => state.graphEditor?.fit());
+  $("#graph-expand").addEventListener("click", () => {
+    const panel = $("#graph-editor-panel");
+    const expanded = panel.classList.toggle("graph-expanded");
+    $("#graph-expand").textContent = expanded ? "收起画布" : "放大画布";
+    requestAnimationFrame(() => { state.graphEditor?.resize(); state.graphEditor?.fit(); });
+  });
   $("#graph-undo").addEventListener("click", () => state.graphEditor?.undo());
   $("#graph-redo").addEventListener("click", () => state.graphEditor?.redo());
   for (const panel of ["palette", "inspector"]) {
@@ -1063,22 +1151,77 @@ function bindUi() {
   });
   $("#graph-import").addEventListener("change", (event) => {
     const file = event.target.files?.[0];
-    if (file) importFile(file).catch((e) => toast(String(e), true));
+    if (file) importFile(file).catch((error) => toast(String(error), true));
     event.target.value = "";
   });
-  const graphCanvas = $("#workflow-canvas");
-  graphCanvas.addEventListener("dragover", (event) => {
+  const canvas = $("#workflow-canvas");
+  canvas.addEventListener("dragover", (event) => {
     if (event.dataTransfer.types.includes("text/x-comfy-node")) event.preventDefault();
   });
-  graphCanvas.addEventListener("drop", (event) => {
+  canvas.addEventListener("drop", (event) => {
     const type = event.dataTransfer.getData("text/x-comfy-node");
     if (!type || !state.graphEditor) return;
     event.preventDefault();
-    const pos = state.graphEditor.eventToGraph(event);
-    try { state.graphEditor.addNode(type, pos); }
+    const position = state.graphEditor.eventToGraph(event);
+    try { state.graphEditor.addNode(type, position); }
     catch (error) { toast(String(error), true); }
   });
+}
+
+function bindUi() {
+  for (const [button, selector] of [["#btn-resume", "#preview"], ["#graph-resume", "#graph-preview"]]) {
+    $(button).addEventListener("click", () => {
+      const pid = $(button).dataset.promptId;
+      if (!pid || state.runningPid) return;
+      state.runningPid = pid;
+      pollResult(pid, selector).catch((error) => { state.runningPid = ""; toast(String(error), true); });
+    });
+  }
+  document.addEventListener("keydown", (event) => {
+    if (state.activeMode !== "workflow" || !(event.ctrlKey || event.metaKey)) return;
+    const key = event.key.toLowerCase();
+    if (key !== "s" && key !== "enter") return;
+    event.preventDefault();
+    const action = key === "s" ? saveGraph : runGraph;
+    action().catch((error) => toast(String(error), true));
+  });
+
+  bindGraphUi();
   $("#btn-refresh").addEventListener("click", () => refreshStatus().catch((e) => toast(String(e), true)));
+  $("#tab-workflow").addEventListener("click", () => selectMode("workflow"));
+  $("#tab-recipe").addEventListener("click", () => selectMode("recipe"));
+  $("#btn-bind-workflow").addEventListener("click", () => saveWorkflowBinding().catch((e) => toast(String(e), true)));
+  $("#btn-unbind-edit").addEventListener("click", () => saveWorkflowBinding(true).catch((e) => toast(String(e), true)));
+  $("#btn-save-workflow-json").addEventListener("click", () => saveWorkflowJson().catch((e) => toast(String(e), true)));
+  $("#workflow-purpose").addEventListener("change", () => {
+    state.workflowPurpose = $("#workflow-purpose").value;
+    if (state.workflowPurpose === "edit") {
+      const route = state.editWorkflows.find((item) => item.workflow === state.activeWorkflow && item.workflow);
+      state.workflowEditRoute = route?.name || state.activeWorkflow;
+      state.workflowEditDescription = route?.description || "";
+    } else {
+      const family = state.families.find((item) => item.workflow === state.activeWorkflow);
+      if (family) state.workflowFamily = family.name;
+    }
+    renderWorkflowRouting();
+  });
+  $("#workflow-family").addEventListener("change", () => {
+    state.workflowFamily = $("#workflow-family").value;
+    renderWorkflowRouting();
+  });
+  $("#workflow-edit-route").addEventListener("input", () => {
+    state.workflowEditRoute = $("#workflow-edit-route").value;
+    renderWorkflowRouting();
+  });
+  $("#workflow-edit-route").addEventListener("change", () => {
+    const wanted = $("#workflow-edit-route").value.trim().toLocaleLowerCase();
+    const route = state.editWorkflows.find((item) => String(item.name || "").toLocaleLowerCase() === wanted);
+    state.workflowEditDescription = route?.description || "";
+    renderWorkflowRouting();
+  });
+  $("#workflow-edit-description").addEventListener("input", () => {
+    state.workflowEditDescription = $("#workflow-edit-description").value;
+  });
   $("#btn-save").addEventListener("click", () => saveRecipe().catch((e) => toast(String(e), true)));
   $("#btn-detect-slots").addEventListener("click", () => redetectSlots().catch((e) => toast(String(e), true)));
   $("#btn-save-profile").addEventListener("click", () => saveWorkflowProfile().catch((e) => toast(String(e), true)));
@@ -1120,9 +1263,7 @@ function bindUi() {
   });
   $("#recipe-family").addEventListener("change", () => {
     state.recipe.family = $("#recipe-family").value;
-    const family = familyByName(state.recipe.family);
-    if (family) bindWorkflow(family.workflow).catch((e) => toast(String(e), true));
-    else renderLists();
+    renderLists();
   });
   document.querySelectorAll(".size-presets button").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -1147,13 +1288,14 @@ async function main() {
   }
   overlay.classList.add("hidden");
   bindUi();
+  selectMode("workflow");
   try {
     await refreshStatus();
     await loadLists();
-    if (state.recipes.length) await loadRecipe(state.recipes[0].id || state.recipes[0].name);
-    else if (state.families.length) await newRecipe();
-    else if (state.templates.length) await bindWorkflow(state.templates[0].name);
-    await setGraphMode(true);
+    await ensureGraphEditor();
+    if (state.templates.length) await bindWorkflow(state.templates[0].name);
+    else if (state.recipes.length) await loadRecipe(state.recipes[0].id || state.recipes[0].name);
+    else await newRecipe();
   } catch (e) {
     toast(String(e), true);
   }

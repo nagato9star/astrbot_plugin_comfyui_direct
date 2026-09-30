@@ -13,7 +13,7 @@ Use the plugin tools to generate or edit images. The available family and recipe
 - For a saved setup, use `comfyui_recipe_draw` with `prompt`; pass `recipe` only when the user names one. Omit it to use the configured default recipe.
 - When the user asks to save a named setup, call `comfyui_draw` with `save_as` for the parameters just used. If `comfyui_recipe` is available for a separately specified recipe, call it with `action=save`, `name`, and `model_family`; pass `description` only as a short purpose note. A recipe stores generation settings, not a fixed prompt.
 - When `comfyui_recipe` is available and the user asks to list or inspect recipes, use `action=list` or `action=load`. Use `comfyui_recipe_draw` to generate with a loaded or named recipe. Do not attempt `delete` unless it is present in the live tool schema and the user explicitly requested deletion.
-- For changes to an existing image, use `comfyui_edit`. Prefer the current or quoted message image. Use `image_index` when the message contains multiple images. Use `image_path` only when it is a path returned by this plugin.
+- For changes to an existing image, use `comfyui_edit`. Select `edit_workflow` from the live schema when multiple edit routes exist. Prefer current or quoted message images. Use `image_index` for one selected image or `image_indices` for ordered multi-image inputs. Use `image_path` / `image_paths` only for a path returned by this plugin or a readable AstrBot temporary image path.
 - Do not use legacy `comfyui_generate` for ordinary requests. Use `comfyui_run_workflow` only when the user explicitly asks to run an API-format workflow and that tool is available.
 
 ## Write prompts for the selected family

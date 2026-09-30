@@ -119,11 +119,6 @@ class WorkflowBuilder:
         """加载完整模板；各工作流的 drop_nodes 只在提交前显式应用。"""
         return self._load(self._resolve_template(workflow))
 
-    def load_template_raw(self, workflow: str | None = None) -> dict:
-        """画布编辑使用原始节点图，避免静默丢失具有旧版保留 ID 的节点。"""
-        with open(self._resolve_template(workflow), encoding="utf-8") as stream:
-            return json.load(stream)
-
     # ------------------------------------------------------------------
     # 模板管理（WebUI 使用）
     # ------------------------------------------------------------------

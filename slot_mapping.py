@@ -23,9 +23,14 @@ NEGATIVE_MARKERS = ("lowres", "worst quality")
 SLOT_ROLES: tuple[tuple[str, str], ...] = (
     ("prompt", "用户要画的内容"),
     ("source_image", "编辑来源图片"),
+    ("source_images", "编辑参考图输入（多选）"),
+    ("resolution", "编辑输出分辨率"),
+    ("custom_size", "按参考图自适配画布"),
     ("model", "底模"),
     ("loras", "LoRA"),
     ("size", "画面大小"),
+    ("aspect_ratio", "分辨率选择器画幅比例"),
+    ("megapixels", "分辨率选择器目标 MP"),
     ("sampler", "出图采样"),
     ("sampler_2", "第二段采样"),
     ("negative", "不要出现的东西"),
@@ -40,9 +45,14 @@ SLOT_BASIC = ("prompt", "model", "loras", "size", "sampler")
 SLOT_HELP: dict[str, str] = {
     "prompt": "机器人会把用户的描述写到这里。必选。",
     "source_image": "图片编辑工作流中的 LoadImage 节点。上传后的图片文件名写到这里。",
+    "source_images": "多参考图工作流的 LoadImage 节点，按节点顺序对应 images.image_1、images.image_2 等输入。",
+    "resolution": "编辑分辨率输入；也可复用画面大小槽位，按参考图宽高比写入 EmptyLatentImage.width/height。0 保留原始尺寸。",
+    "custom_size": "编辑工作流的 custom_size 开关；开启时由工作流使用分辨率选择器画布。",
+    "aspect_ratio": "T2I 分辨率选择器的比例输入，例如 1:1、16:9。",
+    "megapixels": "T2I 分辨率选择器的目标百万像素数，例如 1.0；Qwen Image 2.1 的 2K 方图约为 4.0。",
     "model": "这套默认用哪颗底模。用户说换模型时也写到这里。",
     "loras": "这套默认挂哪些 LoRA。用户点名 LoRA 时覆盖这里。",
-    "size": "宽和高写到这里。竖图/横图也靠它。",
+    "size": "生图时写入宽高；编辑时可按参考图比例把 resolution 换算后写入 EmptyLatentImage.width/height。",
     "sampler": "步数、精细程度写到这里。必选。双采样时选第一段。",
     "sampler_2": "双采样的第二段。可留空；映射后才会同步它的步数和种子，共享外联节点会自然联动。",
     "negative": "不想看到的东西。没有可留空。",
@@ -56,8 +66,10 @@ SLOT_HELP: dict[str, str] = {
 
 SLOT_CLASS_HINTS: dict[str, tuple[str, ...]] = {
     "source_image": ("LoadImage",),
+    "source_images": ("LoadImage",),
     "prompt": (
         "TextEncodeQwenImageEdit",
+        "TextEncodeQwenImage21",
         "CR Prompt Text",
         "CLIPTextEncode",
         "DanbooruText",
@@ -330,7 +342,33 @@ def normalize_workflow(data: dict, object_info: dict | None = None) -> dict:
     if is_api_workflow(data):
         return {str(k): v for k, v in data.items() if isinstance(v, dict) and "class_type" in v}
     if is_ui_workflow(data):
-        return ui_to_api(data, object_info)
+        wf = ui_to_api(data, object_info)
+        if object_info is not None:
+            missing = {
+                nid: str(node.get("class_type") or "")
+                for nid, node in wf.items()
+                if node.get("class_type") not in object_info
+            }
+            if missing:
+                outputs = [
+                    nid for nid, node in wf.items()
+                    if (object_info.get(str(node.get("class_type") or "")) or {}).get("output_node")
+                    or node.get("class_type") in {"SaveImage", "PreviewImage", "SaveImageWithAlpha"}
+                ]
+                if not outputs:
+                    raise ValueError("工作流中没有可识别的输出节点，无法判断缺失节点是否可移除")
+                active = _upstream_ids(wf, outputs)
+                required_missing = {nid: cls for nid, cls in missing.items() if nid in active}
+                if required_missing:
+                    detail = "、".join(f"{nid} ({cls})" for nid, cls in required_missing.items())
+                    raise ValueError(f"工作流输出依赖未安装节点：{detail}")
+                for nid in missing:
+                    wf.pop(nid)
+                logger.info(
+                    "[ComfyUIDirect] 导入时移除 %d 个未安装且不参与输出的 UI 节点",
+                    len(missing),
+                )
+        return wf
     raise ValueError("无法识别工作流格式。请在 ComfyUI 使用 Save (API Format) 再导入。")
 
 
@@ -341,10 +379,7 @@ def ui_to_api(ui: dict, object_info: dict | None = None) -> dict:
     links_by_id: dict[int, list] = {}
     for link in raw_links:
         if isinstance(link, list) and len(link) >= 5:
-            try:
-                links_by_id[int(link[0])] = link
-            except (TypeError, ValueError) as exc:
-                raise ValueError("工作流包含无效连线 ID") from exc
+            links_by_id[int(link[0])] = link
 
     out: dict[str, dict] = {}
     for node in nodes:
@@ -362,56 +397,48 @@ def ui_to_api(ui: dict, object_info: dict | None = None) -> dict:
             link_id = inp.get("link")
             if name is None or link_id is None:
                 continue
-            try:
-                link = links_by_id.get(int(link_id))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"节点 {nid} 的输入 {name} 连线 ID 无效") from exc
+            link = links_by_id.get(int(link_id))
             if not link:
-                raise ValueError(f"节点 {nid} 的输入 {name} 引用了不存在的连线 {link_id}")
-            if str(link[3]) != nid:
-                raise ValueError(f"节点 {nid} 的输入 {name} 连线目标不匹配")
-            try:
-                output_index = int(link[2])
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"节点 {nid} 的输入 {name} 输出端口无效") from exc
-            if output_index < 0:
-                raise ValueError(f"节点 {nid} 的输入 {name} 输出端口无效")
-            inputs[str(name)] = [str(link[1]), output_index]
+                continue
+            inputs[str(name)] = [str(link[1]), int(link[2])]
 
-        raw_widgets = node.get("widgets_values")
-        widgets = list(raw_widgets) if isinstance(raw_widgets, list) else []
-        widget_specs = _widget_input_specs(cls, object_info)
+        widgets = list(node.get("widgets_values") or [])
+        widget_names = _widget_input_names(cls, object_info)
+        # Seed controls live only in UI workflows. Keep literal strings such as
+        # a prompt of "fixed" intact on nodes without a seed widget.
+        if "seed" in widget_names or "noise_seed" in widget_names:
+            widgets = [v for v in widgets if not (isinstance(v, str) and v.lower() in _WIDGET_SKIP)]
         used = set(inputs)
+        # ComfyUI may retain widget values even when those inputs are linked.
+        # Other UI exports compact them away. Choose by the actual array size.
+        full_widget_layout = len(widgets) >= len(widget_names)
         wi = 0
-        for name, spec in widget_specs:
+        for name in widget_names:
             if name in used:
-                # ComfyUI 序列化连线 widget 时会保留 null 占位。
-                if wi < len(widgets) and widgets[wi] is None:
-                    wi += 1
-                if _control_after_generate(spec) and wi < len(widgets) and _is_control_widget(widgets[wi]):
+                if full_widget_layout and wi < len(widgets):
                     wi += 1
                 continue
-            while wi < len(widgets) and _is_control_widget(widgets[wi]):
-                wi += 1
             if wi >= len(widgets):
                 break
-            if widgets[wi] is not None:
-                inputs[name] = widgets[wi]
+            inputs[name] = widgets[wi]
             wi += 1
-            if _control_after_generate(spec) and wi < len(widgets) and _is_control_widget(widgets[wi]):
-                wi += 1
-        if "Power Lora Loader" in cls:
-            index = 1
-            for value in widgets:
-                if isinstance(value, dict) and "lora" in value:
-                    inputs[f"lora_{index}"] = value
-                    index += 1
+
+        if cls == POWER_LORA_CLASS:
+            lora_index = 1
+            for value in node.get("widgets_values") or []:
+                if not isinstance(value, dict) or not {"on", "lora", "strength"} <= value.keys():
+                    continue
+                inputs[f"lora_{lora_index}"] = {
+                    "on": bool(value["on"]),
+                    "lora": value["lora"],
+                    "strength": value["strength"],
+                }
+                lora_index += 1
         # 没有 object_info 时：把剩余 widgets 按常见字段名尽量填
-        if object_info is None and wi < len(widgets) and "Power Lora Loader" not in cls:
-            remaining = [v for v in widgets[wi:] if v is not None and not _is_control_widget(v)]
+        if object_info is None and wi < len(widgets):
             for guess, val in zip(
                 ("seed", "steps", "cfg", "sampler_name", "scheduler", "denoise", "text", "prompt"),
-                remaining,
+                widgets[wi:],
             ):
                 if guess not in inputs:
                     inputs[guess] = val
@@ -437,28 +464,25 @@ def ui_to_api(ui: dict, object_info: dict | None = None) -> dict:
     return out
 
 
-def _is_control_widget(value: Any) -> bool:
-    return isinstance(value, str) and value.lower() in _WIDGET_SKIP
-
-
-def _control_after_generate(spec: Any) -> bool:
-    return isinstance(spec, list) and len(spec) > 1 and isinstance(spec[1], dict) and "control_after_generate" in spec[1]
-
-
-def _widget_input_specs(cls: str, object_info: dict | None) -> list[tuple[str, Any]]:
+def _widget_input_names(cls: str, object_info: dict | None) -> list[str]:
     if not object_info:
         return []
     info = object_info.get(cls) or {}
     spec = info.get("input") or {}
-    fields: list[tuple[str, Any]] = []
+    input_order = info.get("input_order") or {}
+    names: list[str] = []
     for bucket in ("required", "optional"):
         block = spec.get(bucket) or {}
         if not isinstance(block, dict):
             continue
-        for name, typ in block.items():
+        ordered = input_order.get(bucket) if isinstance(input_order, dict) else None
+        keys = list(ordered) if isinstance(ordered, list) else []
+        keys.extend(name for name in block if name not in keys)
+        for name in keys:
+            typ = block.get(name)
             if _is_widget_spec(typ):
-                fields.append((name, typ))
-    return fields
+                names.append(name)
+    return names
 
 
 def _is_widget_spec(typ: Any) -> bool:
@@ -498,7 +522,9 @@ def node_options_for_slot(wf: dict, slot: str, selected: str = "") -> list[str]:
     rest = []
     for row in list_nodes(wf):
         label = row["label"]
-        if hints and row["class_type"] not in hints and row["id"] != selected_id:
+        node = wf.get(row["id"]) or {}
+        matches = node_matches_slot(node, slot)
+        if (hints or slot in {"resolution", "custom_size", "aspect_ratio", "megapixels"}) and not matches and row["id"] != selected_id:
             rest.append(label)
             continue
         if label not in options:
@@ -514,6 +540,36 @@ def node_options_for_slot(wf: dict, slot: str, selected: str = "") -> list[str]:
         else:
             options.insert(1, selected)
     return options
+
+
+def node_matches_slot(node: dict, slot: str) -> bool:
+    """Match an editable slot to a node class or a named workflow input."""
+    if not isinstance(node, dict):
+        return False
+    classes = set(SLOT_CLASS_HINTS.get(slot) or ())
+    cls = str(node.get("class_type") or "")
+    if cls in classes:
+        return True
+    if slot not in {"resolution", "custom_size", "aspect_ratio", "megapixels"}:
+        return False
+
+    wanted = slot.casefold()
+    title = str((node.get("_meta") or {}).get("title") or "")
+    normalized_name = f"{cls} {title}".casefold().replace(" ", "_").replace("-", "_")
+    fields = node.get("inputs") or {}
+    aliases = {
+        "resolution": {"resolution"},
+        "custom_size": {"custom_size"},
+        "aspect_ratio": {"aspect_ratio", "aspect", "ratio"},
+        "megapixels": {"megapixels", "megapixel", "mp", "target_megapixels"},
+    }[slot]
+    if aliases.intersection(fields):
+        return True
+    if wanted in normalized_name and infer_field(node, slot) in fields:
+        return True
+    if slot == "custom_size" and "switch" in fields and "switch" in cls.casefold():
+        return True
+    return False
 
 
 def _linked_node_id(wf: dict, value: Any) -> str | None:
@@ -547,6 +603,29 @@ def _unique_class_on_path(wf: dict, roots: list[str], classes: tuple[str, ...]) 
     return matches[0] if len(matches) == 1 else None
 
 
+def _edit_canvas_switch(wf: dict, sampler_ids: list[str], edit_id: str) -> str | None:
+    """Find a switch selecting the Qwen edit latent or an explicit size canvas."""
+    for sampler_id in sampler_ids:
+        sampler_inputs = wf[sampler_id].get("inputs") or {}
+        for key in ("latent", "latent_image"):
+            switch_id = _linked_node_id(wf, sampler_inputs.get(key))
+            switch = wf.get(switch_id or "") or {}
+            switch_class = str(switch.get("class_type") or "").casefold()
+            if not switch_id or "switch" not in switch_class:
+                continue
+            switch_inputs = switch.get("inputs") or {}
+            edit_branch = _linked_node_id(wf, switch_inputs.get("on_false"))
+            canvas_branch = _linked_node_id(wf, switch_inputs.get("on_true"))
+            if (
+                edit_branch and canvas_branch
+                and edit_id in _upstream_ids(wf, [edit_branch])
+                and _unique_class_on_path(wf, [canvas_branch], SLOT_CLASS_HINTS["size"])
+                and "switch" in switch_inputs
+            ):
+                return switch_id
+    return None
+
+
 def _edit_branch_slots(wf: dict) -> dict[str, dict] | None:
     """Map only the Qwen edit branch that reaches an image output.
 
@@ -556,13 +635,13 @@ def _edit_branch_slots(wf: dict) -> dict[str, dict] | None:
     output_ids = [
         str(nid) for nid, node in wf.items()
         if isinstance(node, dict) and node.get("class_type") in
-        {"SaveImage", "SaveImageWithAlpha", "PreviewImage"}
+        {"SaveImage", "SaveImageAdvanced", "SaveImageWithAlpha", "PreviewImage"}
     ]
     active = _upstream_ids(wf, output_ids) if output_ids else set(wf)
     edit_ids = [
         str(nid) for nid, node in wf.items()
         if str(nid) in active and isinstance(node, dict)
-        and node.get("class_type") == "TextEncodeQwenImageEdit"
+        and node.get("class_type") in {"TextEncodeQwenImageEdit", "TextEncodeQwenImage21"}
     ]
     if not edit_ids:
         return None
@@ -584,11 +663,56 @@ def _edit_branch_slots(wf: dict) -> dict[str, dict] | None:
     elif isinstance(edit_inputs.get("prompt"), str):
         slots["prompt"] = _slot(edit_id, wf, "prompt")
 
-    image_link = _linked_node_id(wf, edit_inputs.get("image"))
-    if image_link:
-        source_id = _unique_class_on_path(wf, [image_link], ("LoadImage",))
-        if source_id:
-            slots["source_image"] = _slot(source_id, wf, "source_image")
+    image_inputs = [
+        (key, value) for key, value in edit_inputs.items()
+        if key == "image" or re.fullmatch(r"images\.image_\d+", str(key))
+    ]
+    image_inputs.sort(
+        key=lambda item: 0 if item[0] == "image" else int(str(item[0]).rsplit("_", 1)[-1])
+    )
+    source_specs: list[dict] = []
+    for input_field, value in image_inputs:
+        image_link = _linked_node_id(wf, value)
+        if not image_link:
+            continue
+        source_ids = [
+            nid for nid in _upstream_ids(wf, [image_link])
+            if wf[nid].get("class_type") == "LoadImage"
+        ]
+        if len(source_ids) == 1:
+            spec = _slot(source_ids[0], wf, "source_image")
+            spec["field"] = "image"
+            spec["input_field"] = str(input_field)
+            source_specs.append(spec)
+    if source_specs:
+        slots["source_images"] = source_specs
+        slots["source_image"] = dict(source_specs[0])
+
+    for role in ("resolution", "custom_size", "aspect_ratio", "megapixels"):
+        value = edit_inputs.get(role)
+        if value is None:
+            continue
+        linked = _linked_node_id(wf, value)
+        if linked is None:
+            slots[role] = _slot(edit_id, wf, role)
+            continue
+        candidates = [
+            nid for nid in _upstream_ids(wf, [linked])
+            if node_matches_slot(wf[nid], role)
+        ]
+        if len(candidates) == 1:
+            slots[role] = _slot(candidates[0], wf, role)
+        elif not candidates:
+            source_node = wf.get(linked) or {}
+            source_cls = str(source_node.get("class_type") or "").casefold()
+            if role == "resolution" and _is_int_node(source_node):
+                slots[role] = _slot(linked, wf, role)
+            elif role == "custom_size" and ("bool" in source_cls or "boolean" in source_cls):
+                slots[role] = _slot(linked, wf, role)
+            elif role == "megapixels" and ("float" in source_cls or "primitive" in source_cls):
+                slots[role] = _slot(linked, wf, role)
+            elif role == "aspect_ratio" and any(tag in source_cls for tag in ("combo", "string", "primitive")):
+                slots[role] = _slot(linked, wf, role)
 
     sampler_ids = [
         nid for nid in _rank_sampler_ids(wf)
@@ -598,6 +722,10 @@ def _edit_branch_slots(wf: dict) -> dict[str, dict] | None:
         slots["sampler"] = _slot(sampler_ids[0], wf, "sampler")
         if len(sampler_ids) > 1:
             slots["sampler_2"] = _slot(sampler_ids[1], wf, "sampler")
+        if not slots.get("custom_size"):
+            switch_id = _edit_canvas_switch(wf, sampler_ids, edit_id)
+            if switch_id:
+                slots["custom_size"] = _slot(switch_id, wf, "custom_size")
 
     for role in ("clip", "vae"):
         root = _linked_node_id(wf, edit_inputs.get(role))
@@ -644,7 +772,7 @@ def detect_slots(wf: dict) -> dict[str, dict]:
     active = _upstream_ids(
         wf,
         [str(nid) for nid, node in wf.items() if isinstance(node, dict)
-         and node.get("class_type") in {"SaveImage", "SaveImageWithAlpha", "PreviewImage"}],
+         and node.get("class_type") in {"SaveImage", "SaveImageAdvanced", "SaveImageWithAlpha", "PreviewImage"}],
     )
     source_image_ids = [
         str(nid) for nid, node in wf.items()
@@ -653,6 +781,10 @@ def detect_slots(wf: dict) -> dict[str, dict]:
     ]
     if len(source_image_ids) == 1:
         slots["source_image"] = _slot(source_image_ids[0], wf, "source_image")
+    for role in ("resolution", "custom_size", "aspect_ratio", "megapixels"):
+        matches = [nid for nid in active if node_matches_slot(wf[nid], role)]
+        if len(matches) == 1:
+            slots[role] = _slot(matches[0], wf, role)
     if roles.get("artist"):
         slots["artist"] = _slot(roles["artist"], wf, "artist")
     if roles.get("quality"):
@@ -719,6 +851,8 @@ def infer_field(node: dict, role: str) -> str:
     cls = str(node.get("class_type") or "")
     if role == "source_image":
         return "image"
+    if role == "source_images":
+        return "image"
     if role in ("prompt", "artist", "quality", "trigger_words"):
         if "prompt" in ins:
             return "prompt"
@@ -743,6 +877,27 @@ def infer_field(node: dict, role: str) -> str:
         return "vae_name"
     if role == "guidance":
         return "strength"
+    if role == "resolution":
+        if "resolution" in ins:
+            return "resolution"
+        if _is_int_node(node):
+            return _int_field(node) or "resolution"
+        return "resolution"
+    if role == "custom_size":
+        for key in ("custom_size", "switch", "value", "boolean", "bool", "enabled"):
+            if key in ins:
+                return key
+        return "custom_size"
+    if role == "aspect_ratio":
+        for key in ("aspect_ratio", "aspect", "ratio", "value"):
+            if key in ins:
+                return key
+        return "aspect_ratio"
+    if role == "megapixels":
+        for key in ("megapixels", "megapixel", "target_megapixels", "mp", "value"):
+            if key in ins:
+                return key
+        return "megapixels"
     if role == "size":
         return "width"
     if role == "sampler":
@@ -885,12 +1040,28 @@ def _find_negative_node(wf: dict) -> str | None:
     return None
 
 
-def slots_from_config(raw: Any) -> dict[str, dict]:
+def slots_from_config(raw: Any) -> dict[str, Any]:
     """把配置对象 node_slots 收成配方 slots。"""
     if not isinstance(raw, dict):
         return {}
-    out: dict[str, dict] = {}
+    out: dict[str, Any] = {}
     for role, _label in SLOT_ROLES:
+        if role == "source_images":
+            value = raw.get(role)
+            if isinstance(value, str):
+                values = value.split(",")
+            elif isinstance(value, list):
+                values = value
+            else:
+                values = []
+            specs = []
+            for item in values:
+                node = parse_node_option(item.get("node") if isinstance(item, dict) else item)
+                if node:
+                    specs.append({"node": node, "field": "image", "mode": "replace"})
+            if specs:
+                out[role] = specs
+            continue
         nid = parse_node_option(raw.get(role))
         if nid:
             out[role] = {"node": nid, "mode": "append" if role in ("negative", "quality") else "replace"}
@@ -1081,9 +1252,41 @@ def resolve_size(
     return w, h
 
 
+def source_image_slots(wf: dict, slots: Any) -> list[dict]:
+    """Resolve ordered image mappings without silently dropping or reordering ports."""
+    if not isinstance(slots, dict):
+        raise ValueError("工作流节点映射必须是对象")
+    if "source_images" in slots:
+        specs = slots["source_images"]
+        if not isinstance(specs, list):
+            raise ValueError("source_images 必须是有序节点列表")
+        if not specs and slots.get("source_image") not in (None, ""):
+            specs = [slots["source_image"]]
+    else:
+        spec = slots.get("source_image")
+        specs = [spec] if spec not in (None, "") else []
+    result, seen = [], set()
+    for spec in specs:
+        if isinstance(spec, str):
+            spec = {"node": spec}
+        if not isinstance(spec, dict):
+            raise ValueError("参考图映射必须包含 node 字段")
+        nid = parse_node_option(spec.get("node"))
+        node = wf.get(nid)
+        if not isinstance(node, dict) or node.get("class_type") != "LoadImage":
+            raise ValueError(f"参考图映射 {nid or '(空)'} 未指向有效 LoadImage")
+        if "image" not in (node.get("inputs") or {}):
+            raise ValueError(f"参考图节点 {nid} 缺少 image 输入")
+        if nid in seen:
+            raise ValueError(f"参考图节点 {nid} 重复映射，会覆盖前一张图片")
+        seen.add(nid)
+        result.append({**spec, "node": nid, "field": "image"})
+    return result
+
+
 def apply_slots(
     wf: dict,
-    slots: dict[str, dict],
+    slots: dict[str, Any],
     values: dict[str, Any],
     *,
     prefix: str | None = None,
@@ -1100,11 +1303,13 @@ def apply_slots(
 
     # 槽位指向的节点必须存在，否则对应值会被静默丢弃；统一先告警。
     for role, spec in (slots or {}).items():
-        nid = str((spec or {}).get("node") or "")
-        if nid and str(nid) not in wf:
-            logger.warning(
-                f"[slot_mapping] 配方槽位 {role} 指向节点 {nid}，但当前工作流里没有它，该槽位本轮不会写入"
-            )
+        specs = spec if role == "source_images" and isinstance(spec, list) else [spec]
+        for item in specs:
+            nid = str((item or {}).get("node") or "") if isinstance(item, dict) else ""
+            if nid and nid not in wf:
+                logger.warning(
+                    f"[slot_mapping] 配方槽位 {role} 指向节点 {nid}，但当前工作流里没有它，该槽位本轮不会写入"
+                )
 
     prompt = values.get("prompt")
     if prompt is not None and slots.get("prompt"):
@@ -1117,6 +1322,20 @@ def apply_slots(
         if node is not None:
             field = spec.get("field") or infer_field(node, "source_image")
             node.setdefault("inputs", {})[field] = str(source_image)
+
+    source_images = values.get("source_images")
+    if source_images is not None:
+        source_specs = source_image_slots(wf, slots)
+        if not isinstance(source_images, list):
+            raise ValueError("多图来源映射必须是图片名与节点列表")
+        if len(source_images) > len(source_specs):
+            raise ValueError(f"工作流只映射了 {len(source_specs)} 个参考图输入")
+        for spec, filename in zip(source_specs, source_images):
+            node = wf.get(str((spec or {}).get("node") or ""))
+            if node is None:
+                raise ValueError("多图来源映射的 LoadImage 节点不存在")
+            field = (spec or {}).get("field") or infer_field(node, "source_image")
+            node.setdefault("inputs", {})[field] = str(filename)
 
     for role in ("artist", "trigger_words"):
         val = values.get(role)
@@ -1159,6 +1378,44 @@ def apply_slots(
             except (TypeError, ValueError):
                 pass
 
+    for role in ("resolution", "custom_size", "aspect_ratio", "megapixels"):
+        value = values.get(role)
+        if value is None:
+            continue
+        spec = slots.get(role)
+        if not spec:
+            raise ValueError(f"工作流未映射 {role} 输入，请先在工作台保存节点映射")
+        node = wf.get(str(spec.get("node") or ""))
+        if node is None:
+            raise ValueError(f"{role} 槽位映射的节点不存在")
+        field = spec.get("field") or infer_field(node, role)
+        if not field or field not in (node.get("inputs") or {}):
+            raise ValueError(f"{role} 映射节点缺少输入字段 {field or '(空)'}，请重新确认映射")
+        if role == "resolution":
+            if isinstance(value, bool):
+                raise ValueError("resolution 必须是 0 到 8192 之间的整数")
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError) as e:
+                raise ValueError("resolution 必须是 0 到 8192 之间的整数") from e
+            if not math.isfinite(numeric) or not numeric.is_integer() or not 0 <= numeric <= 8192:
+                raise ValueError("resolution 必须是 0 到 8192 之间的整数")
+            value = int(numeric)
+        elif role == "custom_size" and not isinstance(value, bool):
+            raise ValueError("custom_size 必须是布尔值")
+        elif role == "aspect_ratio":
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("aspect_ratio 必须是非空字符串")
+            value = value.strip()
+        elif role == "megapixels":
+            try:
+                value = float(value)
+            except (TypeError, ValueError) as e:
+                raise ValueError("megapixels 必须是数字") from e
+            if not math.isfinite(value) or not 0.1 <= value <= 64:
+                raise ValueError("megapixels 必须在 0.1 到 64 之间")
+        node.setdefault("inputs", {})[field] = value
+
     if values.get("loras") is not None and slots.get("loras"):
         _apply_loras(wf, str(slots["loras"]["node"]), parse_lora(values.get("loras")))
     elif values.get("lora") is not None and slots.get("loras"):
@@ -1177,12 +1434,15 @@ def apply_slots(
 
     if (width is not None or height is not None) and slots.get("size"):
         node = wf.get(str(slots["size"]["node"]))
-        if node is not None:
-            ins = node.setdefault("inputs", {})
-            if width is not None:
-                ins["width"] = int(width)
-            if height is not None:
-                ins["height"] = int(height)
+        if not isinstance(node, dict):
+            raise ValueError("画面大小映射的节点不存在")
+        ins = node.setdefault("inputs", {})
+        if any(value is not None and key not in ins for key, value in (("width", width), ("height", height))):
+            raise ValueError("画面大小映射节点缺少 width/height 输入，请重新确认映射")
+        if width is not None:
+            ins["width"] = int(width)
+        if height is not None:
+            ins["height"] = int(height)
 
     sampler_spec = slots.get("sampler")
     sampler2_spec = slots.get("sampler_2")

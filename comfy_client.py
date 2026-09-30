@@ -14,6 +14,7 @@ import html
 import json
 import mimetypes
 import re
+import struct
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -98,6 +99,68 @@ def image_media_type(content: bytes, filename: str = "") -> str:
         return "image/gif"
     mime_type, _ = mimetypes.guess_type(filename)
     return mime_type if mime_type and mime_type.startswith("image/") else "application/octet-stream"
+
+
+def image_dimensions(content: bytes) -> tuple[int, int] | None:
+    """Read width/height from the image formats accepted by comfyui_edit."""
+    if content.startswith(b"\x89PNG\r\n\x1a\n") and len(content) >= 24:
+        width, height = struct.unpack_from(">II", content, 16)
+        return (width, height) if width and height else None
+    if content.startswith((b"GIF87a", b"GIF89a")) and len(content) >= 10:
+        width, height = struct.unpack_from("<HH", content, 6)
+        return (width, height) if width and height else None
+    if content.startswith(b"\xff\xd8\xff"):
+        sof_markers = {
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+            0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+        }
+        offset = 2
+        while offset + 4 <= len(content):
+            if content[offset] != 0xFF:
+                offset += 1
+                continue
+            while offset < len(content) and content[offset] == 0xFF:
+                offset += 1
+            if offset >= len(content):
+                break
+            marker = content[offset]
+            offset += 1
+            if marker in {0xD8, 0xD9, 0x01} or 0xD0 <= marker <= 0xD7:
+                continue
+            if offset + 2 > len(content):
+                break
+            segment_size = struct.unpack_from(">H", content, offset)[0]
+            if segment_size < 2 or offset + segment_size > len(content):
+                break
+            if marker in sof_markers and segment_size >= 7:
+                height, width = struct.unpack_from(">HH", content, offset + 3)
+                return (width, height) if width and height else None
+            offset += segment_size
+    if len(content) >= 30 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        offset = 12
+        while offset + 8 <= len(content):
+            chunk_type = content[offset : offset + 4]
+            chunk_size = struct.unpack_from("<I", content, offset + 4)[0]
+            start = offset + 8
+            end = start + chunk_size
+            if end > len(content):
+                break
+            data = content[start:end]
+            if chunk_type == b"VP8X" and len(data) >= 10:
+                width = 1 + int.from_bytes(data[4:7], "little")
+                height = 1 + int.from_bytes(data[7:10], "little")
+                return (width, height) if width and height else None
+            if chunk_type == b"VP8 " and len(data) >= 10 and data[3:6] == b"\x9d\x01\x2a":
+                width = struct.unpack_from("<H", data, 6)[0] & 0x3FFF
+                height = struct.unpack_from("<H", data, 8)[0] & 0x3FFF
+                return (width, height) if width and height else None
+            if chunk_type == b"VP8L" and len(data) >= 5 and data[0] == 0x2F:
+                b1, b2, b3, b4 = data[1:5]
+                width = 1 + ((b2 & 0x3F) << 8) + b1
+                height = 1 + ((b4 & 0x0F) << 10) + (b3 << 2) + ((b2 & 0xC0) >> 6)
+                return (width, height) if width and height else None
+            offset = end + (chunk_size & 1)
+    return None
 
 
 def execution_error_message(status: Any, fallback: str = "执行出错") -> str:
@@ -191,6 +254,7 @@ class ComfyUIClient:
         # 可选：civitai 客户端，用于本地 metadata 无触发词时在线回退
         self.civitai_client = None
 
+
     @property
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -199,6 +263,7 @@ class ComfyUIClient:
                 timeout=httpx.Timeout(self.request_timeout, connect=min(5.0, self.request_timeout)),
             )
         return self._client
+
 
     async def close(self) -> None:
         """关闭底层连接，插件卸载（terminate）时调用。"""
@@ -212,6 +277,7 @@ class ComfyUIClient:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
 
     async def _request_with_retry(
         self,
@@ -258,6 +324,7 @@ class ComfyUIClient:
             )
         return None
 
+
     async def _get(self, path: str, params: dict | None = None) -> Any:
         """GET（幂等，自动重试），失败返回 None。"""
         resp = await self._request_with_retry("GET", path, params=params)
@@ -282,6 +349,7 @@ class ComfyUIClient:
                 return self._object_info
             return None if force_refresh else self._object_info
 
+
     async def ping(self, timeout: float = 5.0) -> bool:
         """轻量连通性探测（用于 WebUI 状态灯），ZeroTier 抽风时重试 2 次。"""
         for i in range(2):
@@ -301,6 +369,7 @@ class ComfyUIClient:
     async def _get_object_info_cached(self) -> dict | None:
         """拉取 /object_info（进程内缓存），失败返回 None。"""
         return await self.get_object_info()
+
 
     def _meta_debug(self, msg: str) -> None:
         """独立文件级日志：不依赖 astrbot logger，用于判定新代码是否真的在跑。"""
@@ -437,71 +506,13 @@ class ComfyUIClient:
             return None, "ComfyUI 未返回 prompt_id"
         return pid, None
 
+
     async def poll_history(self, prompt_id: str) -> dict | None:
         """查询执行历史（outputs 部分）；未完成/不存在返回 None。"""
         history = await self._get(f"/history/{prompt_id}")
         if history and prompt_id in history:
             return history[prompt_id].get("outputs", {})
         return None
-
-    def start_events(self):
-        if not getattr(self, "events_enabled", False) or getattr(self, "_closed", False):
-            return None
-        if self._events is None:
-            from execution_events import ExecutionEvents
-            self._events = ExecutionEvents(self.base_url, self.request_timeout)
-        return self._events
-
-    def execution_progress(self, prompt_id: str) -> dict:
-        events = getattr(self, "_events", None)
-        return dict(events.states.get(prompt_id, {})) if events is not None else {}
-
-    async def wait_for_history(self, prompt_id: str, timeout: float | None = None) -> tuple[dict | None, str | None]:
-        budget = self.timeout if timeout is None else max(0.0, timeout)
-        deadline = time.monotonic() + budget
-        events = self.start_events()
-        try:
-            while (remaining := deadline - time.monotonic()) > 0:
-                if getattr(self, "_closed", False):
-                    return None, f"等待中断，插件连接已关闭。任务可能仍在执行。prompt_id: {prompt_id}，可继续查询该任务。"
-                state = self.execution_progress(prompt_id)
-                if state.get("event") in {"execution_error", "execution_interrupted"}:
-                    return {"status": {"status_str": "error", "messages": [[state["event"], state]]}, "outputs": {}}, None
-                try:
-                    if events is None:
-                        entry = await asyncio.wait_for(self.get_history_entry(prompt_id), remaining)
-                    else:
-                        request = asyncio.create_task(self.get_history_entry(prompt_id))
-                        signal = asyncio.create_task(events.wait(prompt_id, remaining))
-                        try:
-                            done, _ = await asyncio.wait({request, signal}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
-                            state = self.execution_progress(prompt_id)
-                            if state.get("event") in {"execution_error", "execution_interrupted"}:
-                                return {"status": {"status_str": "error", "messages": [[state["event"], state]]}, "outputs": {}}, None
-                            if not done:
-                                break
-                            entry = await asyncio.wait_for(request, max(0.001, deadline - time.monotonic()))
-                        finally:
-                            for task in (request, signal):
-                                if not task.done():
-                                    task.cancel()
-                            await asyncio.gather(request, signal, return_exceptions=True)
-                except TimeoutError:
-                    break
-                if entry is not None:
-                    return entry, None
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                interval = min(0.2 if state.get("event") == "execution_success" else 2.0, remaining)
-                if events is not None:
-                    await events.wait(prompt_id, interval)
-                else:
-                    await asyncio.sleep(interval)
-        finally:
-            if events is not None:
-                events.forget(prompt_id)
-        return None, f"等待超时（{budget:g}s），任务可能仍在排队或执行。prompt_id: {prompt_id}，可继续查询该任务。"
 
     async def get_history_entry(self, prompt_id: str) -> dict | None:
         """查询完整历史条目（含 status/message，用于识别执行失败）。"""
@@ -1136,6 +1147,7 @@ class ComfyUIClient:
         await asyncio.gather(*(one(n) for n in lora_names))
         return out
 
+
     async def get_embeddings(self) -> list[str] | None:
         """GET /embeddings → 嵌入模型名列表（去扩展名）。
 
@@ -1337,6 +1349,7 @@ class ComfyUIClient:
             logger.warning(f"[ComfyUIDirect] 读取模型缓存失败: {e}")
             return None
 
+
     def _save_cache(self, data: dict) -> None:
         self._memory_cache = data
         if not self.cache_file:
@@ -1353,6 +1366,7 @@ class ComfyUIClient:
             self._cache_stamp = (stat.st_mtime_ns, stat.st_size)
         except OSError as e:
             logger.warning(f"[ComfyUIDirect] 写入模型缓存失败: {e}")
+
 
     async def _fetch_resources(self) -> dict | None:
         """从 ComfyUI 拉取最新资源清单；任何失败（含空响应/超时）返回 None。
@@ -1385,6 +1399,101 @@ class ComfyUIClient:
         except Exception as e:
             logger.error(f"[ComfyUIDirect] 资源同步失败: {e}")
             return None
+
+    async def list_resources(
+        self, force_refresh: bool = False
+    ) -> tuple[dict[str, list[str]], bool]:
+        """返回 (资源清单, 是否来自缓存)。
+
+        未过期且非强制刷新时直接用缓存；过期则重新从 ComfyUI 同步；
+        ComfyUI 离线时回退本地缓存，保证清单不因本机关机而丢失。
+        """
+        previous = self._load_cache()
+        resources = await self.generation_resources(force_refresh)
+        task = self._metadata_task
+        if task is not None and not task.done():
+            await asyncio.shield(task)
+        cached = self._load_cache()
+        if cached and not cached.get("lora_metadata_v4"):
+            if self._full_metadata_task is None or self._full_metadata_task.done():
+                self._full_metadata_task = asyncio.create_task(self._enrich_catalog(full=True))
+            await asyncio.shield(self._full_metadata_task)
+        cached = self._load_cache()
+        return copy.deepcopy(cached["resources"]) if cached else resources, bool(previous and not force_refresh)
+
+
+    async def warm_up_cache(self) -> None:
+        """插件加载时后台预热资源清单（自动同步）。
+
+        ComfyUI 刚启动时 /object_info 可能尚未就绪（空响应），最多重试 3 次。
+        """
+        for attempt in range(1, 4):
+            resources = await self.generation_resources()
+            if resources.get("unet_name") or resources.get("lora_name"):
+                return
+            if attempt < 3:
+                await asyncio.sleep(8)
+        logger.warning("[ComfyUIDirect] 预热资源清单失败（3 次尝试后放弃，将按需同步）")
+
+
+    def start_events(self):
+        if not getattr(self, "events_enabled", False) or getattr(self, "_closed", False):
+            return None
+        if self._events is None:
+            from execution_events import ExecutionEvents
+            self._events = ExecutionEvents(self.base_url, self.request_timeout)
+        return self._events
+
+    def execution_progress(self, prompt_id: str) -> dict:
+        events = getattr(self, "_events", None)
+        return dict(events.states.get(prompt_id, {})) if events is not None else {}
+
+    async def wait_for_history(self, prompt_id: str, timeout: float | None = None) -> tuple[dict | None, str | None]:
+        budget = self.timeout if timeout is None else max(0.0, timeout)
+        deadline = time.monotonic() + budget
+        events = self.start_events()
+        try:
+            while (remaining := deadline - time.monotonic()) > 0:
+                if getattr(self, "_closed", False):
+                    return None, f"等待中断，插件连接已关闭。任务可能仍在执行。prompt_id: {prompt_id}，可继续查询该任务。"
+                state = self.execution_progress(prompt_id)
+                if state.get("event") in {"execution_error", "execution_interrupted"}:
+                    return {"status": {"status_str": "error", "messages": [[state["event"], state]]}, "outputs": {}}, None
+                try:
+                    if events is None:
+                        entry = await asyncio.wait_for(self.get_history_entry(prompt_id), remaining)
+                    else:
+                        request = asyncio.create_task(self.get_history_entry(prompt_id))
+                        signal = asyncio.create_task(events.wait(prompt_id, remaining))
+                        try:
+                            done, _ = await asyncio.wait({request, signal}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+                            state = self.execution_progress(prompt_id)
+                            if state.get("event") in {"execution_error", "execution_interrupted"}:
+                                return {"status": {"status_str": "error", "messages": [[state["event"], state]]}, "outputs": {}}, None
+                            if not done:
+                                break
+                            entry = await asyncio.wait_for(request, max(0.001, deadline - time.monotonic()))
+                        finally:
+                            for task in (request, signal):
+                                if not task.done():
+                                    task.cancel()
+                            await asyncio.gather(request, signal, return_exceptions=True)
+                except TimeoutError:
+                    break
+                if entry is not None:
+                    return entry, None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                interval = min(0.2 if state.get("event") == "execution_success" else 2.0, remaining)
+                if events is not None:
+                    await events.wait(prompt_id, interval)
+                else:
+                    await asyncio.sleep(interval)
+        finally:
+            if events is not None:
+                events.forget(prompt_id)
+        return None, f"等待超时（{budget:g}s），任务可能仍在排队或执行。prompt_id: {prompt_id}，可继续查询该任务。"
 
     async def generation_resources(self, force_refresh: bool = False) -> dict:
         """Fast catalog for generation; full LoRA enrichment never holds this lock."""
@@ -1463,40 +1572,6 @@ class ComfyUIClient:
                     updated["resources"].setdefault("lora_meta", {}).update({name: value for name, value in metadata.items() if name in known_names})
                     self._save_cache(updated)
         return resources
-
-    async def list_resources(
-        self, force_refresh: bool = False
-    ) -> tuple[dict[str, list[str]], bool]:
-        """返回 (资源清单, 是否来自缓存)。
-
-        未过期且非强制刷新时直接用缓存；过期则重新从 ComfyUI 同步；
-        ComfyUI 离线时回退本地缓存，保证清单不因本机关机而丢失。
-        """
-        previous = self._load_cache()
-        resources = await self.generation_resources(force_refresh)
-        task = self._metadata_task
-        if task is not None and not task.done():
-            await asyncio.shield(task)
-        cached = self._load_cache()
-        if cached and not cached.get("lora_metadata_v4"):
-            if self._full_metadata_task is None or self._full_metadata_task.done():
-                self._full_metadata_task = asyncio.create_task(self._enrich_catalog(full=True))
-            await asyncio.shield(self._full_metadata_task)
-        cached = self._load_cache()
-        return copy.deepcopy(cached["resources"]) if cached else resources, bool(previous and not force_refresh)
-
-    async def warm_up_cache(self) -> None:
-        """插件加载时后台预热资源清单（自动同步）。
-
-        ComfyUI 刚启动时 /object_info 可能尚未就绪（空响应），最多重试 3 次。
-        """
-        for attempt in range(1, 4):
-            resources = await self.generation_resources()
-            if resources.get("unet_name") or resources.get("lora_name"):
-                return
-            if attempt < 3:
-                await asyncio.sleep(8)
-        logger.warning("[ComfyUIDirect] 预热资源清单失败（3 次尝试后放弃，将按需同步）")
 
     def start_warmup(self) -> None:
         if not self._closed and (self._warmup_task is None or self._warmup_task.done()):

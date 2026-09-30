@@ -17655,7 +17655,7 @@ var WorkflowGraphEditor = class {
       { content: "\u9002\u914D\u753B\u5E03", callback: () => this.fit() }
     ];
     this.keyHandler = (event) => {
-      if (!document.body.classList.contains("graph-mode") || event.target.closest?.("input, textarea, select, [contenteditable=true]")) return;
+      if (this.element.offsetParent === null || event.target.closest?.("input, textarea, select, [contenteditable=true]")) return;
       if ((event.ctrlKey || event.metaKey) && ["z", "y"].includes(event.key.toLowerCase())) {
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -17874,7 +17874,7 @@ var WorkflowGraphEditor = class {
           this.domWidgets.set(widget, entry);
         }
         const { element } = entry;
-        const visible = !node2.flags?.collapsed && !widget.hidden && scale >= 0.3;
+        const visible = !node2.flags?.collapsed && !widget.hidden && scale >= 0.2;
         element.hidden = !visible;
         if (!visible) continue;
         const [x2, y] = this.canvas.ds.convertOffsetToCanvas([node2.pos[0] + 10, node2.pos[1] + widget.y + 4]);

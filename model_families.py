@@ -79,9 +79,9 @@ class ModelFamilyRegistry:
         seen_edits: set[str] = set()
         for row in self._rows(edit_raw):
             name = str(row.get("model_family") or row.get("family") or row.get("name") or "").strip()
-            workflow = str(row.get("workflow") or "").strip()
-            if not name or not workflow:
+            if not name or "workflow" not in row:
                 continue
+            workflow = str(row.get("workflow") or "").strip()
             key = name.casefold()
             if key in seen_edits:
                 logger.warning(f"[ComfyUIDirect] 编辑图家族重复，保留第一条: {name}")
@@ -120,6 +120,11 @@ class ModelFamilyRegistry:
 
     def editable_names(self) -> list[str]:
         return [item.name for item in self._items.values() if item.edit_workflow]
+
+    def reconfigure(self, raw: Any, default_workflow: str, edit_raw: Any = None) -> None:
+        """Refresh the same registry object held by Bot tools and Workflow Studio."""
+        updated = ModelFamilyRegistry(raw, default_workflow, edit_raw)
+        self._items = updated._items
 
     def first(self) -> ModelFamily:
         return next(iter(self._items.values()))
@@ -168,6 +173,109 @@ class ModelFamilyRegistry:
         return "；".join(parts)
 
 
+@dataclass(frozen=True)
+class EditWorkflow:
+    """独立的图片编辑路由，不依赖生图模型家族。"""
+
+    name: str
+    workflow: str
+    description: str = ""
+
+    def public(self) -> dict[str, str]:
+        return asdict(self)
+
+
+class EditWorkflowRegistry:
+    """解析独立编辑路由，并读取旧的家族绑定作为迁移兼容。"""
+
+    def __init__(
+        self,
+        raw: Any = None,
+        legacy_edit_raw: Any = None,
+        legacy_families_raw: Any = None,
+    ) -> None:
+        self._items: dict[str, EditWorkflow] = {}
+        # Older edit_families rows used the generation family name as route name.
+        for row in ModelFamilyRegistry._rows(legacy_edit_raw):
+            name = str(
+                row.get("name") or row.get("model_family") or row.get("family") or ""
+            ).strip()
+            workflow = str(row.get("workflow") or "").strip()
+            if name:
+                self._items.setdefault(
+                    name.casefold(),
+                    EditWorkflow(name, workflow, str(row.get("description") or "").strip()),
+                )
+        # The original configuration put edit_workflow directly on model_families.
+        for row in ModelFamilyRegistry._rows(legacy_families_raw):
+            name = str(row.get("name") or row.get("family") or "").strip()
+            workflow = str(row.get("edit_workflow") or "").strip()
+            if name and workflow:
+                self._items.setdefault(name.casefold(), EditWorkflow(name, workflow))
+        # New independent edit_workflows always take precedence over legacy values.
+        for row in ModelFamilyRegistry._rows(raw):
+            name = str(row.get("name") or row.get("route") or "").strip()
+            if not name:
+                continue
+            self._items[name.casefold()] = EditWorkflow(
+                name=name,
+                workflow=str(row.get("workflow") or "").strip(),
+                description=str(row.get("description") or "").strip(),
+            )
+
+    def list(self) -> list[dict[str, str]]:
+        return [item.public() for item in self._items.values()]
+
+    def names(self) -> list[str]:
+        return [item.name for item in self._items.values() if item.workflow]
+
+    def get(self, name: str) -> EditWorkflow | None:
+        return self._items.get(str(name or "").strip().casefold())
+
+    def by_workflow(self, workflow: str) -> EditWorkflow | None:
+        wanted = str(workflow or "").strip().casefold()
+        if not wanted:
+            return None
+        return next(
+            (item for item in self._items.values() if item.workflow.casefold() == wanted),
+            None,
+        )
+
+    def set(self, name: str, workflow: str, description: str | None = None) -> EditWorkflow:
+        route_name = str(name or "").strip()
+        if not route_name:
+            raise ValueError("编辑路由名不能为空")
+        key = route_name.casefold()
+        previous = self._items.get(key)
+        route = EditWorkflow(
+            name=previous.name if previous else route_name,
+            workflow=str(workflow or "").strip(),
+            description=(
+                str(description).strip()
+                if description is not None
+                else (previous.description if previous else "")
+            ),
+        )
+        self._items[key] = route
+        return route
+
+    def reconfigure(
+        self,
+        raw: Any = None,
+        legacy_edit_raw: Any = None,
+        legacy_families_raw: Any = None,
+    ) -> None:
+        updated = EditWorkflowRegistry(raw, legacy_edit_raw, legacy_families_raw)
+        self._items = updated._items
+
+    def workflow_references(self) -> dict[str, list[str]]:
+        refs: dict[str, list[str]] = {}
+        for item in self._items.values():
+            if item.workflow:
+                refs.setdefault(item.workflow, []).append(item.name)
+        return refs
+
+
 class WorkflowProfileStore:
     """持久化工作流的槽位映射，使多份配方共享同一份节点定义。"""
 
@@ -176,7 +284,7 @@ class WorkflowProfileStore:
         self._configured = self._parse_configured(configured)
 
     @staticmethod
-    def _parse_configured(raw: Any) -> dict[str, dict[str, dict]]:
+    def _parse_configured(raw: Any) -> dict[str, dict[str, Any]]:
         """解析配置页按工作流填写的完整槽位映射。"""
         if isinstance(raw, str):
             try:
@@ -196,7 +304,7 @@ class WorkflowProfileStore:
         else:
             rows = []
 
-        configured: dict[str, dict[str, dict]] = {}
+        configured: dict[str, dict[str, Any]] = {}
         for row in rows:
             workflow = str(row.get("workflow") or "").strip()
             if not workflow:
@@ -208,16 +316,49 @@ class WorkflowProfileStore:
             configured[key] = slots_from_config(row)
         return configured
 
-    def configured(self, workflow: str) -> dict[str, dict] | None:
+    def configured(self, workflow: str) -> dict[str, Any] | None:
         slots = self._configured.get(str(workflow or "").strip().casefold())
         return dict(slots) if slots is not None else None
 
     @staticmethod
-    def _normalize_slots(raw: Any) -> dict[str, dict]:
+    def _normalize_slots(raw: Any) -> dict[str, Any]:
         if not isinstance(raw, dict):
             return {}
-        out: dict[str, dict] = {}
+        out: dict[str, Any] = {}
         for role, spec in raw.items():
+            if role == "source_images":
+                if isinstance(spec, str):
+                    specs = [item.strip() for item in spec.split(",") if item.strip()]
+                elif isinstance(spec, list):
+                    specs = spec
+                elif isinstance(spec, dict):
+                    specs = [spec]
+                elif spec in (None, ""):
+                    specs = []
+                else:
+                    raise ValueError("source_images 必须是有序节点列表")
+                nodes = []
+                seen = set()
+                for item in specs:
+                    if isinstance(item, str):
+                        node = parse_node_option(item)
+                        if node:
+                            nodes.append({"node": node, "field": "image", "mode": "replace"})
+                    elif isinstance(item, dict):
+                        node = parse_node_option(item.get("node"))
+                        if node:
+                            normalized_item = dict(item)
+                            normalized_item["node"] = node
+                            nodes.append(normalized_item)
+                    else:
+                        raise ValueError("参考图映射必须包含 node 字段")
+                    if not node:
+                        raise ValueError("参考图映射存在空节点，请选择节点或删除该行")
+                    if node in seen:
+                        raise ValueError(f"参考图节点 {node} 重复映射，请为每个输入选择不同节点")
+                    seen.add(node)
+                out[str(role)] = nodes
+                continue
             if isinstance(spec, str):
                 node = parse_node_option(spec)
                 if node:

@@ -28,26 +28,12 @@
   "model_cache_ttl": {
     "type": "int",
     "default": 600,
-    "slider": {"min": 0, "max": 3600, "step": 60},
+    "slider": {
+      "min": 0,
+      "max": 3600,
+      "step": 60
+    },
     "hint": "资源清单刷新间隔（秒），0 表示每次刷新。生图复用单次请求快照；LoRA 元数据在后台补全，选中的文件按需查询。"
-  },
-  "comfyui_request_timeout": {
-    "type": "float",
-    "default": 15.0,
-    "description": "网络请求超时（秒）",
-    "hint": "与上方任务等待上限分开。历史、资源和图片请求会遵守此超时，等待超时后保留任务 ID，便于继续查询。"
-  },
-  "comfyui_events_enabled": {
-    "type": "bool",
-    "default": true,
-    "description": "使用 ComfyUI 执行事件",
-    "hint": "通过 WebSocket 接收进度、完成和错误事件；连接断开时自动重连，并保留 HTTP 历史轮询回退。"
-  },
-  "auto_lora_trigger_words": {
-    "type": "bool",
-    "default": false,
-    "description": "自动使用已记录的 LoRA 触发词",
-    "hint": "默认关闭，Bot 与 WebUI 一致。启用后仅补全未显式设置的触发词，写入已映射的触发词槽位；显式留空可关闭本次补全。训练词频和数据集标签猜测不会自动写入。"
   },
   "lora_manager_enabled": {
     "type": "bool",
@@ -62,7 +48,7 @@
   "model_families": {
     "type": "template_list",
     "description": "生图家族与工作流",
-    "hint": "先在配方工作台导入生图工作流，再给每个家族选择工作流。家族名是暴露给 LLM 的稳定路由名；修改后重载插件生效。",
+    "hint": "先在 Workflow Studio 工作流页导入生图工作流，再给每个家族选择工作流。家族名是暴露给 LLM 的稳定路由名；修改后重载插件生效。",
     "obvious_hint": true,
     "templates": {
       "family": {
@@ -84,7 +70,7 @@
             "type": "string",
             "default": "",
             "invisible": true,
-            "hint": "旧配置兼容；新配置请使用下方的编辑图家族列表"
+            "hint": "旧配置兼容；新配置请使用独立编辑工作流路由"
           },
           "prompt_style": {
             "type": "string",
@@ -119,10 +105,43 @@
       }
     ]
   },
+  "edit_workflows": {
+    "type": "template_list",
+    "description": "独立编辑工作流路由",
+    "hint": "编辑工作流独立于生图家族。每条记录为 LLM 提供一个 edit_workflow 名称，并选择本地导入的工作流；也可在 Workflow Studio 的工作流页创建和绑定。",
+    "obvious_hint": true,
+    "templates": {
+      "edit_workflow": {
+        "name": "编辑工作流",
+        "items": {
+          "name": {
+            "type": "string",
+            "description": "编辑路由名",
+            "default": "",
+            "hint": "暴露给 LLM 的独立编辑路由名，例如 qwen-edit；无需在生图家族中创建同名项"
+          },
+          "workflow": {
+            "type": "string",
+            "description": "编辑工作流",
+            "default": "",
+            "hint": "从本地已导入工作流中选择；需包含来源图片 LoadImage 和编辑提示词节点"
+          },
+          "description": {
+            "type": "string",
+            "description": "路由说明",
+            "default": "",
+            "hint": "说明这条编辑工作流适合哪些编辑任务，帮助 LLM 在多个路由中选择"
+          }
+        }
+      }
+    },
+    "default": []
+  },
   "edit_families": {
     "type": "template_list",
-    "description": "编辑图家族与工作流",
-    "hint": "为上方已有的生图家族选择图片编辑工作流。先在配方工作台导入成功的编辑工作流，再在这里选择；修改后重载插件生效。",
+    "description": "旧版编辑图家族配置（兼容）",
+    "invisible": true,
+    "hint": "旧版配置兼容项。新配置请使用独立编辑工作流路由。",
     "obvious_hint": true,
     "templates": {
       "edit_family": {
@@ -169,6 +188,21 @@
             "default": "",
             "hint": "编辑来源图片的 LoadImage 节点 ID；使用编辑工作流时必填"
           },
+          "source_images": {
+            "type": "string",
+            "default": "",
+            "hint": "多图编辑时按顺序填写 LoadImage 节点 ID，以逗号分隔；顺序对应工作流 images.image_1、images.image_2 等输入"
+          },
+          "resolution": {
+            "type": "string",
+            "default": "",
+            "hint": "可选编辑 resolution 输入节点 ID；0 表示保留参考图尺寸"
+          },
+          "custom_size": {
+            "type": "string",
+            "default": "",
+            "hint": "可选编辑 custom_size 开关节点 ID；启用后由工作流使用分辨率选择器画布"
+          },
           "model": {
             "type": "string",
             "default": "",
@@ -183,6 +217,16 @@
             "type": "string",
             "default": "",
             "hint": "画面宽高节点 ID"
+          },
+          "aspect_ratio": {
+            "type": "string",
+            "default": "",
+            "hint": "T2I 分辨率选择器的 aspect_ratio 输入节点 ID"
+          },
+          "megapixels": {
+            "type": "string",
+            "default": "",
+            "hint": "T2I 分辨率选择器的 MP 目标输入节点 ID"
           },
           "sampler": {
             "type": "string",
@@ -237,7 +281,7 @@
   "default_recipe": {
     "type": "string",
     "default": "默认",
-    "hint": "用户只说「画一张」时 comfyui_recipe_draw 用的配方名；在配方工作台点「设为默认」自动写入，也可直接填配方名"
+    "hint": "用户只说「画一张」时 comfyui_recipe_draw / comfyui_generate 用的配方名；在 Workflow Studio 静态配方列表点「设为默认」自动写入，也可直接填配方名"
   },
   "_tool_section": {
     "description": "=== LLM 工具 ===",
@@ -255,12 +299,12 @@
       "基础（画图 + 查词）",
       "完整（开放诊断工具）"
     ],
-    "hint": "basic 暴露 comfyui_draw / comfyui_recipe_draw / comfyui_lookup；配置 edit_workflow 后还会暴露 comfyui_edit。full 额外开放队列、任务、模型信息等工具；旧版 comfyui_generate 和高风险工具仍需打开下方开关"
+    "hint": "basic 暴露 comfyui_draw / comfyui_recipe_draw / comfyui_lookup；配置独立编辑工作流后还会暴露 comfyui_edit。full 额外开放队列、任务、模型信息等诊断工具，其中高风险工具仍需打开下方开关"
   },
   "allow_llm_unsafe_tools": {
     "type": "bool",
     "default": false,
-    "hint": "允许 LLM 使用旧版高级 comfyui_generate、执行任意工作流 JSON、上传本地文件到 ComfyUI、释放显存和删除配方。存在误操作与数据丢失风险，默认关闭；确有需要再开"
+    "hint": "允许 LLM 使用旧版高级生成入口、执行任意 API 工作流 JSON、上传本地文件到 ComfyUI、释放显存和删除配方。默认关闭；确有需要再开"
   },
   "node_slots": {
     "type": "object",
@@ -345,52 +389,6 @@
     "obvious_hint": true,
     "description": "danbooru API 文档：https://danbooru.donmai.us/wiki_pages/help:api",
     "hint": "danbooru 接口地址，国内可换可用镜像；官方 API 文档 https://danbooru.donmai.us/wiki_pages/help:api（可点击链接见 Workflow Studio 侧栏「相关链接」）"
-  },
-  "character_names_enabled": {
-    "type": "bool",
-    "default": true,
-    "description": "启用中文角色名字索引",
-    "hint": "首次角色查询下载约 1 MB 的名字 JSON，保存在插件数据目录。名称来自 Jannchie/danbooru-tag-index 的 Wiki 别名选取及人工校订；缓存有效期内离线查询。关闭后仍可用配置别名和已缓存数据。"
-  },
-  "character_names_file": {
-    "type": "string",
-    "default": "",
-    "description": "本地角色名字库 JSON（可选）",
-    "hint": "填写文件路径后优先使用该文件，跳过名字库下载。支持规范 tag 到语言名字对象的映射，或 [{tag,names,appearance_tags}] 列表；文件修改后下次查询自动重新读取。"
-  },
-  "character_aliases": {
-    "type": "template_list",
-    "default": [],
-    "description": "手动角色别名与外观标签",
-    "hint": "添加已核实的中文名到规范角色 tag 的映射。同名角色可添加多行，查询时会返回候选。配置优先，便于纠正社区数据。",
-    "templates": {
-      "character": {
-        "name": "角色别名",
-        "items": {
-          "name": {"type": "string", "description": "中文名或其他别名", "default": ""},
-          "tag": {"type": "string", "description": "规范角色 tag，如 hatsune_miku", "default": ""},
-          "appearance_tags": {"type": "string", "description": "外观 tag（可选，逗号分隔）", "default": ""}
-        }
-      }
-    }
-  },
-  "character_reference_url": {
-    "type": "string",
-    "default": "https://animadex.net",
-    "description": "AnimaDex 外观参考 HTTP 地址",
-    "hint": "规范 tag 定位后查询结构化外观标签。可改成本地 AnimaDex Web 服务地址；留空关闭外观在线查询。与 animadex_mcp_url 分开，不需要额外 MCP 服务。"
-  },
-  "character_lookup_timeout": {
-    "type": "float",
-    "default": 6.0,
-    "description": "角色查询每阶段超时（秒）",
-    "hint": "名字库下载、在线名称兜底、外观参考查询各自有总超时，防止多个镜像逐个长时间等待。缓存命中时不联网。"
-  },
-  "character_cache_hours": {
-    "type": "float",
-    "default": 168.0,
-    "description": "名字索引与角色参考缓存有效期（小时）",
-    "hint": "默认 7 天。过期下载失败时保留旧名字索引；外观只对唯一精确匹配查询并缓存，同名候选不自动合并。"
   },
   "gelbooru_base_url": {
     "type": "string",
@@ -626,5 +624,81 @@
       }
     },
     "default": []
+  },
+  "comfyui_request_timeout": {
+    "type": "float",
+    "default": 15.0,
+    "description": "网络请求超时（秒）",
+    "hint": "与上方任务等待上限分开。历史、资源和图片请求会遵守此超时，等待超时后保留任务 ID，便于继续查询。"
+  },
+  "comfyui_events_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "使用 ComfyUI 执行事件",
+    "hint": "通过 WebSocket 接收进度、完成和错误事件；连接断开时自动重连，并保留 HTTP 历史轮询回退。"
+  },
+  "auto_lora_trigger_words": {
+    "type": "bool",
+    "default": false,
+    "description": "自动使用已记录的 LoRA 触发词",
+    "hint": "默认关闭，Bot 与 WebUI 一致。启用后仅补全未显式设置的触发词，写入已映射的触发词槽位；显式留空可关闭本次补全。训练词频和数据集标签猜测不会自动写入。"
+  },
+  "character_names_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "启用中文角色名字索引",
+    "hint": "首次角色查询下载约 1 MB 的名字 JSON，保存在插件数据目录。名称来自 Jannchie/danbooru-tag-index 的 Wiki 别名选取及人工校订；缓存有效期内离线查询。关闭后仍可用配置别名和已缓存数据。"
+  },
+  "character_names_file": {
+    "type": "string",
+    "default": "",
+    "description": "本地角色名字库 JSON（可选）",
+    "hint": "填写文件路径后优先使用该文件，跳过名字库下载。支持规范 tag 到语言名字对象的映射，或 [{tag,names,appearance_tags}] 列表；文件修改后下次查询自动重新读取。"
+  },
+  "character_aliases": {
+    "type": "template_list",
+    "default": [],
+    "description": "手动角色别名与外观标签",
+    "hint": "添加已核实的中文名到规范角色 tag 的映射。同名角色可添加多行，查询时会返回候选。配置优先，便于纠正社区数据。",
+    "templates": {
+      "character": {
+        "name": "角色别名",
+        "items": {
+          "name": {
+            "type": "string",
+            "description": "中文名或其他别名",
+            "default": ""
+          },
+          "tag": {
+            "type": "string",
+            "description": "规范角色 tag，如 hatsune_miku",
+            "default": ""
+          },
+          "appearance_tags": {
+            "type": "string",
+            "description": "外观 tag（可选，逗号分隔）",
+            "default": ""
+          }
+        }
+      }
+    }
+  },
+  "character_reference_url": {
+    "type": "string",
+    "default": "https://animadex.net",
+    "description": "AnimaDex 外观参考 HTTP 地址",
+    "hint": "规范 tag 定位后查询结构化外观标签。可改成本地 AnimaDex Web 服务地址；留空关闭外观在线查询。与 animadex_mcp_url 分开，不需要额外 MCP 服务。"
+  },
+  "character_lookup_timeout": {
+    "type": "float",
+    "default": 6.0,
+    "description": "角色查询每阶段超时（秒）",
+    "hint": "名字库下载、在线名称兜底、外观参考查询各自有总超时，防止多个镜像逐个长时间等待。缓存命中时不联网。"
+  },
+  "character_cache_hours": {
+    "type": "float",
+    "default": 168.0,
+    "description": "名字索引与角色参考缓存有效期（小时）",
+    "hint": "默认 7 天。过期下载失败时保留旧名字索引；外观只对唯一精确匹配查询并缓存，同名候选不自动合并。"
   }
 }

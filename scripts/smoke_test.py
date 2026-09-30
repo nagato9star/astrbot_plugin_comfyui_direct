@@ -85,13 +85,14 @@ from comfy_client import (  # noqa: E402
     execution_error_message,
     image_media_type,
 )
-from api_to_ui import api_to_ui  # noqa: E402
+from api_to_ui import api_to_ui, build_extra_pnginfo  # noqa: E402
 from model_families import ModelFamilyRegistry, WorkflowProfileStore  # noqa: E402
 from recipe_store import RecipeStore  # noqa: E402
 from slot_mapping import (  # noqa: E402
     apply_slots,
     collect_trigger_words,
     detect_slots,
+    normalize_workflow,
     node_options_for_slot,
     parse_node_option,
     read_current_values,
@@ -100,6 +101,7 @@ from slot_mapping import (  # noqa: E402
     ui_to_api,
 )
 from workflow_builder import WorkflowBuilder  # noqa: E402
+from workflow_graph import validate_api_workflow, validate_ui_snapshot  # noqa: E402
 from tools import (  # noqa: E402
     ComfyuiDrawTool,
     ComfyuiEditTool,
@@ -515,6 +517,7 @@ def test_llm_entry_schemas() -> None:
     assert draw.name == "comfyui_draw"
     assert draw.parameters["required"] == ["model_family", "prompt"]
     assert draw.parameters["properties"]["model_family"]["enum"] == ["anima", "krea2"]
+    assert draw.parameters["properties"]["lora"]["type"] == "array"
 
     with tempfile.TemporaryDirectory() as td:
         store = RecipeStore(Path(td), preferred_default="柔光")
@@ -531,12 +534,23 @@ def test_llm_entry_schemas() -> None:
         assert recipe_draw.name == "comfyui_recipe_draw"
         assert recipe_draw.parameters["required"] == ["prompt"]
         assert recipe_draw.parameters["properties"]["recipe"]["enum"] == ["柔光"]
-        assert ComfyuiGenerateTool(
+        advanced = ComfyuiGenerateTool(
             store=store,
             families=registry,
             profiles=profiles,
-        ).name == "comfyui_generate"
-        assert ComfyuiRecipeTool(store=store, families=registry).name == "comfyui_recipe"
+        )
+        assert advanced.name == "comfyui_generate"
+        assert advanced.parameters["properties"]["lora"]["type"] == "array"
+        recipe_tool = ComfyuiRecipeTool(store=store, families=registry)
+        recipe_tool.refresh_schema()
+        assert recipe_tool.parameters["required"] == ["action"]
+        assert recipe_tool.parameters["properties"]["model_family"]["enum"] == ["anima", "krea2"]
+        assert recipe_tool.parameters["properties"]["lora"]["type"] == "array"
+        assert "description" in recipe_tool.parameters["properties"]
+        assert "delete" not in recipe_tool.parameters["properties"]["action"]["enum"]
+        recipe_tool.allow_delete = True
+        recipe_tool.refresh_schema()
+        assert "delete" in recipe_tool.parameters["properties"]["action"]["enum"]
     print("  llm entry schemas OK")
 
 
@@ -550,6 +564,9 @@ def test_family_and_recipe_generation_paths() -> None:
         def __init__(self):
             self.submitted = []
 
+        async def generation_resources(self):
+            return (await self.list_resources())[0]
+
         async def list_resources(self):
             return (
                 {
@@ -560,9 +577,6 @@ def test_family_and_recipe_generation_paths() -> None:
                 },
                 False,
             )
-
-        async def generation_resources(self):
-            return (await self.list_resources())[0]
 
         async def submit_prompt_detail(self, workflow):
             self.submitted.append(copy.deepcopy(workflow))
@@ -758,7 +772,7 @@ def test_qwen_edit_upload_and_output_path() -> None:
                 output_dir=root / "output", shared={}, families=families, profiles=profiles,
             )
             tool.refresh_schema()
-            assert tool.parameters["properties"]["model_family"]["enum"] == ["qwen"]
+            assert tool.parameters["properties"]["edit_workflow"]["enum"] == ["qwen"]
             result = await tool.call(context, model_family="qwen", prompt="make the sky blue")
             assert "图片已编辑并发送" in result and "本地路径:" in result
             assert client.uploads[0][1] == png
@@ -857,7 +871,7 @@ def test_qwen_edit_graph_scoped_detection() -> None:
 def test_split_family_config_dropdowns() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        builder = WorkflowBuilder(plugin_dir=PLUGIN, custom_dir=root / "workflows")
+        builder = WorkflowBuilder(plugin_dir=root / "plugin", custom_dir=root / "workflows")
         wf = _load_fixture("mini_workflow.json")
         builder.save_template("qwen-generate", wf)
         builder.save_template("qwen-edit", {
@@ -887,7 +901,7 @@ def test_split_family_config_dropdowns() -> None:
         gen_items = schema["model_families"]["templates"]["family"]["items"]
         edit_items = schema["edit_families"]["templates"]["edit_family"]["items"]
         assert gen_items["workflow"]["options"] == ["qwen-edit", "qwen-generate"]
-        assert edit_items["workflow"]["options"] == ["qwen-edit", "qwen-generate"]
+        assert edit_items["workflow"]["options"] == ["", "qwen-edit", "qwen-generate"]
         assert edit_items["model_family"]["options"] == ["qwen"]
         assert schema["workflow_node_mappings"]["templates"]["mapping"]["items"]["workflow"]["options"] == ["qwen-edit", "qwen-generate"]
         assert schema["default_recipe"]["options"] == ["日常"]
@@ -940,12 +954,118 @@ def test_ui_to_api() -> None:
     assert wf["3"]["inputs"]["model"] == ["4", 0]
     assert wf["3"]["inputs"]["seed"] == 11
     assert wf["4"]["class_type"] == "UNETLoader"
-    try:
-        ui_to_api({**ui, "links": []})
-        raise AssertionError("失效连线应在导入时拒绝")
-    except ValueError as exc:
-        assert "不存在的连线" in str(exc)
     print("  ui to api OK")
+
+
+def test_ui_to_api_retained_widgets_and_power_lora() -> None:
+    """Anima-style UI exports retain linked widget slots and rgthree presets."""
+    sampler_required = {
+        "model": ["MODEL"],
+        "add_noise": [["enable", "disable"]],
+        "noise_seed": ["INT", {"default": 0}],
+        "steps": ["INT", {"default": 20}],
+        "cfg": ["FLOAT", {"default": 8.0}],
+        "sampler": [["er_sde", "euler"]],
+        "scheduler": [["sgm_uniform", "simple"]],
+        "positive": ["CONDITIONING"],
+        "negative": ["CONDITIONING"],
+        "latent": ["LATENT"],
+        "start_at_step": ["INT", {"default": 0}],
+        "end_at_step": ["INT", {"default": 10000}],
+        "return_with_leftover_noise": [["enable", "disable"]],
+        "cleanup": [["不做任何清理"]],
+    }
+    object_info = {
+        "XB_ROCmKSamplerAdvanced": {
+            "input": {"required": sampler_required},
+            "input_order": {"required": list(sampler_required)},
+        },
+        "Power Lora Loader (rgthree)": {
+            "input": {"required": {"model": ["MODEL"], "clip": ["CLIP"]}}
+        },
+        "CR Prompt Text": {"input": {"required": {"prompt": ["STRING", {}]}}},
+    }
+    ui = {
+        "nodes": [
+            {
+                "id": 10,
+                "type": "XB_ROCmKSamplerAdvanced",
+                "inputs": [
+                    {"name": "model", "link": 1},
+                    {"name": "steps", "link": 2},
+                    {"name": "end_at_step", "link": 3},
+                ],
+                "widgets_values": [
+                    "enable", 123, "randomize", 20, 4.6, "er_sde",
+                    "sgm_uniform", 0, 10000, "enable", "不做任何清理",
+                ],
+            },
+            {
+                "id": 20,
+                "type": "Power Lora Loader (rgthree)",
+                "inputs": [{"name": "model", "link": 4}],
+                "widgets_values": [
+                    {}, {"type": "Power Lora Loader (rgthree)"},
+                    {"on": False, "lora": "optional.safetensors", "strength": 0.8, "strengthTwo": 0.8},
+                    {},
+                ],
+            },
+            {"id": 30, "type": "CR Prompt Text", "widgets_values": ["fixed"]},
+        ],
+        "links": [
+            [1, 1, 0, 10, 0, "MODEL"],
+            [2, 2, 0, 10, 1, "INT"],
+            [3, 3, 0, 10, 2, "INT"],
+            [4, 1, 0, 20, 0, "MODEL"],
+        ],
+    }
+    api = ui_to_api(ui, object_info)
+    sampler = api["10"]["inputs"]
+    assert sampler["steps"] == ["2", 0]
+    assert sampler["end_at_step"] == ["3", 0]
+    assert sampler["cfg"] == 4.6
+    assert sampler["sampler"] == "er_sde"
+    assert sampler["scheduler"] == "sgm_uniform"
+    assert sampler["return_with_leftover_noise"] == "enable"
+    assert sampler["cleanup"] == "不做任何清理"
+    assert api["20"]["inputs"]["lora_1"] == {
+        "on": False, "lora": "optional.safetensors", "strength": 0.8,
+    }
+    assert api["30"]["inputs"]["prompt"] == "fixed"
+
+    snapshot = api_to_ui(api, object_info)
+    rebuilt = next(node for node in snapshot["nodes"] if node["id"] == 10)
+    assert rebuilt["widgets_values"] == [
+        "enable", 123, "fixed", None, 4.6, "er_sde", "sgm_uniform",
+        0, None, "enable", "不做任何清理",
+    ]
+    print("  ui to api retained widgets / Power LoRA slots OK")
+
+
+def test_ui_import_prunes_unavailable_orphans() -> None:
+    object_info = {
+        "LoadImage": {"input": {"required": {"image": [["source.png"]]}}, "output": ["IMAGE"]},
+        "SaveImage": {"input": {"required": {"images": ["IMAGE"]}}, "output_node": True},
+    }
+    ui = {
+        "nodes": [
+            {"id": 1, "type": "LoadImage", "widgets_values": ["source.png"]},
+            {"id": 2, "type": "SaveImage", "inputs": [{"name": "images", "link": 1}]},
+            {"id": 9, "type": "MarkdownNote", "widgets_values": ["UI-only note"]},
+        ],
+        "links": [[1, 1, 0, 2, 0, "IMAGE"]],
+    }
+    wf = normalize_workflow(ui, object_info)
+    assert set(wf) == {"1", "2"}
+    ui["nodes"][1]["inputs"][0]["link"] = 2
+    ui["links"].append([2, 9, 0, 2, 0, "IMAGE"])
+    try:
+        normalize_workflow(ui, object_info)
+    except ValueError as e:
+        assert "9 (MarkdownNote)" in str(e)
+    else:
+        raise AssertionError("output-dependent missing nodes must be rejected")
+    print("  UI import orphan pruning / active missing-node guard OK")
 
 
 def test_api_to_ui_linked_widget_positions() -> None:
@@ -1077,26 +1197,185 @@ def test_api_to_ui_linked_widget_positions() -> None:
         15,
         "disable",
     ]
-    restored = ui_to_api(ui, object_info)
-    assert restored["4"]["inputs"]["batch_size"] == 1
-    assert restored["20"]["inputs"]["noise_seed"] == ["12", 0]
-    assert restored["20"]["inputs"]["steps"] == 8
-    assert restored["21"]["inputs"]["steps"] == ["13", 0]
-    assert restored["21"]["inputs"]["cfg"] == 4.6
-    assert restored["22"]["inputs"]["noise_seed"] == 456
-    assert restored["22"]["inputs"]["steps"] == 16
-    lora_api = {
-        "1": {"class_type": "Power Lora Loader (rgthree)", "inputs": {
-            "model": ["2", 0],
-            "lora_1": {"on": True, "lora": "style.safetensors", "strength": 0.8},
-            "lora_2": {"on": False, "lora": "", "strength": 0.8},
-        }}
+    print("  api to ui linked widget positions OK")
+
+
+def test_api_to_ui_composite_node_ids() -> None:
+    api = {
+        "13": {"class_type": "ResolutionSelector", "inputs": {"aspect_ratio": "1:1 (Square)"}},
+        "459:470": {"class_type": "LoadImage", "inputs": {"image": "source.png"}},
+        "459:474": {"class_type": "TextEncodeQwenImage21", "inputs": {"images.image_1": ["459:470", 0]}},
+        "461": {"class_type": "SaveImageAdvanced", "inputs": {"images": ["459:474", 0]}},
     }
-    lora_info = {"Power Lora Loader (rgthree)": {"input": {"required": {"model": ["MODEL"]}}, "output": ["MODEL"]}}
-    lora_ui = api_to_ui(lora_api, lora_info)
-    assert ui_to_api(lora_ui, lora_info)["1"]["inputs"]["lora_1"]["lora"] == "style.safetensors"
-    assert "lora_2" in ui_to_api(lora_ui, lora_info)["1"]["inputs"]
-    print("  api/ui linked widget and LoRA round trip OK")
+    snapshot = api_to_ui(api)
+    nodes = snapshot["nodes"]
+    node_ids = {node["id"] for node in nodes}
+    assert len(nodes) == len(api)
+    assert len(node_ids) == len(api) and all(isinstance(node_id, int) for node_id in node_ids)
+    by_type = {node["type"]: node for node in nodes}
+    assert set(by_type) == {"ResolutionSelector", "LoadImage", "TextEncodeQwenImage21", "SaveImageAdvanced"}
+    assert len(snapshot["links"]) == 2
+    assert {link[1] for link in snapshot["links"]}.issubset(node_ids)
+    assert {link[3] for link in snapshot["links"]}.issubset(node_ids)
+    type_by_id = {node["id"]: node["type"] for node in nodes}
+    assert {(type_by_id[link[1]], type_by_id[link[3]]) for link in snapshot["links"]} == {
+        ("LoadImage", "TextEncodeQwenImage21"),
+        ("TextEncodeQwenImage21", "SaveImageAdvanced"),
+    }
+    print("  api to ui retained composite subgraph nodes / links OK")
+
+
+def test_api_to_ui_qwen_combined_prompt_outputs() -> None:
+    api = {
+        "459:11": {"class_type": "LoadImage", "inputs": {"image": "source.png"}},
+        "459:19": {
+            "class_type": "TextEncodeQwenImage21",
+            "inputs": {
+                "prompt": "positive prompt",
+                "negative_prompt": "negative prompt",
+                "images.image_1": ["459:11", 0],
+            },
+        },
+        "6": {
+            "class_type": "XB_ROCmKSampler",
+            "inputs": {
+                "positive": ["459:19", 0],
+                "negative": ["459:19", 1],
+                "latent": ["459:19", 2],
+            },
+        },
+        "8": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0]}},
+        "18": {"class_type": "SaveImage", "inputs": {"images": ["8", 0]}},
+    }
+    object_info = {
+        "LoadImage": {
+            "input": {"required": {"image": [["source.png"]]}},
+            "output": ["IMAGE"],
+            "output_name": ["IMAGE"],
+        },
+        "TextEncodeQwenImage21": {
+            "input": {
+                "required": {
+                    "prompt": ["STRING", {}],
+                    "negative_prompt": ["STRING", {}],
+                    "images.image_1": ["IMAGE"],
+                }
+            },
+            "input_order": {"required": ["prompt", "negative_prompt", "images.image_1"]},
+            "output": ["CONDITIONING", "CONDITIONING", "LATENT"],
+            "output_name": ["positive", "negative", "latent"],
+        },
+        "XB_ROCmKSampler": {
+            "input": {"required": {
+                "positive": ["CONDITIONING"],
+                "negative": ["CONDITIONING"],
+                "latent": ["LATENT"],
+            }},
+            "input_order": {"required": ["positive", "negative", "latent"]},
+            "output": ["LATENT"],
+            "output_name": ["LATENT"],
+        },
+        "VAEDecode": {
+            "input": {"required": {"samples": ["LATENT"]}},
+            "output": ["IMAGE"],
+            "output_name": ["IMAGE"],
+        },
+        "SaveImage": {"input": {"required": {"images": ["IMAGE"]}}},
+    }
+    snapshot = api_to_ui(api, object_info)
+    by_type = {node["type"]: node for node in snapshot["nodes"]}
+    encoder = by_type["TextEncodeQwenImage21"]
+    assert encoder["widgets_values"] == ["positive prompt", "negative prompt"]
+    assert [output["name"] for output in encoder["outputs"]] == ["positive", "negative", "latent"]
+    assert sum(node["type"] == "TextEncodeQwenImage21" for node in snapshot["nodes"]) == 1
+
+    sampler = by_type["XB_ROCmKSampler"]
+    links_by_id = {link[0]: link for link in snapshot["links"]}
+    for field, output_index in (("positive", 0), ("negative", 1)):
+        sampler_input = next(item for item in sampler["inputs"] if item["name"] == field)
+        link = links_by_id[sampler_input["link"]]
+        assert link[1] == encoder["id"] and link[2] == output_index
+    print("  api to ui retained combined Qwen prompt fields / outputs OK")
+
+
+def test_xb_sampler_seed_control_snapshot() -> None:
+    """XB legacy aliases need a seed-control widget absent from /object_info."""
+    normal_inputs = {
+        "model": ["MODEL"],
+        "seed": ["INT", {"default": 0}],
+        "steps": ["INT", {"default": 20}],
+        "cfg": ["FLOAT", {"default": 8.0}],
+        "sampler": [["euler", "er_sde"]],
+        "scheduler": [["simple", "karras"]],
+        "positive": ["CONDITIONING"],
+        "negative": ["CONDITIONING"],
+        "latent": ["LATENT"],
+        "denoise": ["FLOAT", {"default": 1.0}],
+        "cleanup": [["不做任何清理"]],
+    }
+    advanced_inputs = {
+        "model": ["MODEL"],
+        "add_noise": [["enable", "disable"]],
+        "noise_seed": ["INT", {"default": 0}],
+        "steps": ["INT", {"default": 20}],
+        "cfg": ["FLOAT", {"default": 8.0}],
+        "sampler": [["euler", "er_sde"]],
+        "scheduler": [["simple", "karras"]],
+        "positive": ["CONDITIONING"],
+        "negative": ["CONDITIONING"],
+        "latent": ["LATENT"],
+        "start_at_step": ["INT", {"default": 0}],
+        "end_at_step": ["INT", {"default": 10000}],
+        "return_with_leftover_noise": [["disable", "enable"]],
+        "cleanup": [["不做任何清理"]],
+    }
+    object_info = {
+        "XB_ROCmKSampler": {"input": {"required": normal_inputs}},
+        "XB_ROCmKSamplerAdvanced": {"input": {"required": advanced_inputs}},
+        "OtherSampler": {"input": {"required": {"seed": ["INT", {"default": 0}]}}},
+    }
+    api = {
+        "18": {
+            "class_type": "XB_ROCmKSampler",
+            "inputs": {
+                "seed": 1077777992415812,
+                "steps": 25,
+                "cfg": 1.0,
+                "sampler": "euler",
+                "scheduler": "simple",
+                "denoise": 1.0,
+                "cleanup": "不做任何清理",
+                "model": ["1", 0],
+            },
+        },
+        "19": {
+            "class_type": "XB_ROCmKSamplerAdvanced",
+            "inputs": {
+                "add_noise": "enable",
+                "noise_seed": ["30", 0],
+                "steps": 8,
+                "cfg": 1.0,
+                "sampler": "euler",
+                "scheduler": "simple",
+                "start_at_step": 0,
+                "end_at_step": 10000,
+                "return_with_leftover_noise": "disable",
+                "cleanup": "不做任何清理",
+            },
+        },
+        "20": {"class_type": "OtherSampler", "inputs": {"seed": 7}},
+    }
+    snapshot = build_extra_pnginfo(api, object_info)["workflow"]
+    by_id = {node["id"]: node for node in snapshot["nodes"]}
+    assert by_id[18]["widgets_values"] == [
+        1077777992415812, "fixed", 25, 1.0, "euler", "simple", 1.0, "不做任何清理"
+    ]
+    assert by_id[19]["widgets_values"] == [
+        "enable", None, "fixed", 8, 1.0, "euler", "simple", 0, 10000,
+        "disable", "不做任何清理",
+    ]
+    assert by_id[20]["widgets_values"] == [7]
+    print("  XB sampler seed-control PNG snapshot OK")
 
 
 def test_workflow_build() -> None:
@@ -1282,19 +1561,120 @@ def test_template_management() -> None:
     with tempfile.TemporaryDirectory() as td:
         b2 = WorkflowBuilder(plugin_dir=PLUGIN, custom_dir=Path(td))
         wf = _load_fixture("mini_workflow.json")
-        wf.update({
-            "445": {"class_type": "StandardNode445", "inputs": {}},
-            "446": {"class_type": "StandardNode446", "inputs": {}},
-            "447": {"class_type": "StandardNode447", "inputs": {}},
-        })
         b2.save_template("mini", wf)
-        assert all(node_id in b2.load_template("mini") for node_id in ("445", "446", "447"))
-        b2.drop_ui_nodes(wf, ("445",))
-        assert "445" not in wf and "446" in wf and "447" in wf
         names = [t["name"] for t in b2.list_templates()]
         assert "mini" in names
         b2.delete_template("mini")
     print("  template management OK")
+
+
+def test_graph_workflow_validation() -> None:
+    wf = {
+        "445": {"class_type": "LoadImage", "inputs": {"image": "reference.png"}},
+        "446": {"class_type": "SaveImage", "inputs": {"images": ["445", 0]}},
+        "447": {"class_type": "CLIPTextEncode", "inputs": {"text": "original prompt"}},
+    }
+    ui = {
+        "nodes": [
+            {"id": 445, "type": "LoadImage", "outputs": [{"name": "IMAGE"}]},
+            {"id": 446, "type": "SaveImage"},
+            {"id": 447, "type": "CLIPTextEncode"},
+        ],
+        "links": [[1, 445, 0, 446, 0, "IMAGE"]],
+    }
+    assert set(validate_api_workflow(wf)) == {"445", "446", "447"}
+    assert validate_ui_snapshot(ui, wf) is ui
+    with tempfile.TemporaryDirectory() as td:
+        builder = WorkflowBuilder(plugin_dir=PLUGIN, custom_dir=Path(td))
+        builder.save_template("standard", wf)
+        builder.save_ui_template("standard", ui)
+        loaded = builder.load_template("standard")
+        assert set(loaded) == {"445", "446", "447"}
+        profiles = WorkflowProfileStore(Path(td) / "profiles")
+        assert profiles.effective("standard", loaded)["drop_nodes"] == []
+        apply_slots(loaded, {"prompt": {"node": "447", "field": "text"}}, {"prompt": "new prompt"}, drop_nodes=[])
+        assert loaded["447"]["inputs"]["text"] == "new prompt"
+        assert set(loaded) == {"445", "446", "447"}
+        assert builder.load_ui_template("standard") == ui
+        builder.delete_template("standard")
+        assert builder.load_ui_template("standard") is None
+    invalid = json.loads(json.dumps(wf))
+    invalid["446"]["inputs"]["images"] = ["445", 1]
+    try:
+        validate_ui_snapshot(ui, invalid)
+    except ValueError as e:
+        assert "输出端口" in str(e)
+    else:
+        raise AssertionError("missing output port was accepted")
+    print("  graph API/UI validation and standard node IDs OK")
+
+
+def test_graph_webapi_submission() -> None:
+    import webapi as webapi_module
+
+    wf = {
+        "445": {"class_type": "LoadImage", "inputs": {"image": "reference.png"}},
+        "446": {"class_type": "SaveImage", "inputs": {"images": ["445", 0]}},
+    }
+    ui = {
+        "nodes": [
+            {"id": 445, "type": "LoadImage", "outputs": [{"name": "IMAGE"}]},
+            {"id": 446, "type": "SaveImage"},
+        ],
+        "links": [[1, 445, 0, 446, 0, "IMAGE"]],
+    }
+
+    class FakeClient:
+        def __init__(self):
+            self.submitted = []
+
+        async def submit_prompt_detail(self, workflow, ui_workflow=None):
+            self.submitted.append((workflow, ui_workflow))
+            return "graph-pid", None
+
+        async def get_history_entry(self, prompt_id):
+            assert prompt_id == "graph-pid"
+            return {"status": {"status_str": "success"}, "outputs": {
+                "446": {"images": [{"filename": "graph.png", "type": "output"}]}
+            }}
+
+        async def download_image(self, filename, subfolder="", image_type="output"):
+            assert filename == "graph.png" and image_type == "output"
+            return b"\x89PNG\r\n\x1a\nimage-data"
+
+    async def run():
+        body = {"name": "standard", "workflow": wf, "ui_workflow": ui}
+
+        async def fake_body():
+            return body
+
+        old_body, old_json, old_query = webapi_module._body, webapi_module._json, webapi_module._query
+        webapi_module._body = fake_body
+        webapi_module._json = lambda data, status=200: {**data, "_status": status}
+        webapi_module._query = lambda key, default="": "graph-pid" if key == "pid" else default
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                builder = WorkflowBuilder(plugin_dir=PLUGIN, custom_dir=root / "workflows")
+                store = RecipeStore(root / "recipes")
+                client = FakeClient()
+                shared = {}
+                api = webapi_module.StudioApi(client, builder, store, root / "output", shared)
+                saved = await api.save_graph()
+                assert saved["ok"] and builder.load_ui_template("standard") == ui
+                submitted = await api.run_graph()
+                assert submitted["prompt_id"] == "graph-pid"
+                assert client.submitted == [(wf, ui)]
+                assert shared["web_pending_runs"]["graph-pid"]["entry"] == "graph"
+                result = await api.generate_poll()
+                assert result["done"] and result["data_url"].startswith("data:image/png;base64,")
+                history = store.list_history(1)[0]
+                assert history["entry"] == "graph" and history["workflow"] == "standard"
+        finally:
+            webapi_module._body, webapi_module._json, webapi_module._query = old_body, old_json, old_query
+
+    asyncio.run(run())
+    print("  graph WebUI save / remote submission / history OK")
 
 
 def test_submit_error_parse() -> None:
@@ -1523,98 +1903,157 @@ def test_webapi_original_output_and_interrupt_guard() -> None:
     print("  webapi original output / interrupt guard OK")
 
 
-def test_graph_save_and_remote_submission() -> None:
+def test_studio_recipe_workflow_independence() -> None:
     import webapi as webapi_module
-    from workflow_graph import validate_api_workflow, validate_ui_snapshot
+    from unittest.mock import patch
 
-    class FakeClient:
+    class FakeConfig(dict):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.saved = 0
+            self.fail = False
+            self.schema = json.loads((_PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8"))
+
+        def save_config(self):
+            if self.fail:
+                raise OSError("disk unavailable")
+            self.saved += 1
+
+    class FakeTool:
+        active = True
+
         def __init__(self):
-            self.submitted = None
+            self.refreshes = 0
 
-        async def submit_prompt_detail(self, workflow, ui_workflow=None):
-            self.submitted = (workflow, ui_workflow)
-            return "graph-pid", None
+        def refresh_schema(self):
+            self.refreshes += 1
 
-    workflow = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "base.safetensors"}}}
-    ui = {"nodes": [{"id": 1, "type": "UNETLoader", "pos": [40, 80]}], "links": [], "groups": []}
-    invalid_output = {
-        **workflow,
-        "2": {"class_type": "KSampler", "inputs": {"model": ["1", 2]}},
-    }
-    invalid_canvas = {"nodes": [
-        {"id": 1, "type": "UNETLoader", "outputs": [{"name": "MODEL"}]},
-        {"id": 2, "type": "KSampler"},
-    ], "links": []}
-    try:
-        validate_ui_snapshot(invalid_canvas, validate_api_workflow(invalid_output))
-        raise AssertionError("不存在的输出端口应被拒绝")
-    except ValueError as exc:
-        assert "输出端口" in str(exc)
-    nested_workflow = {
-        "1:2": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat"}},
-        "3": {"class_type": "KSampler", "inputs": {"positive": ["1:2", 0]}},
-    }
-    nested_canvas = {"nodes": [
-        {"id": 1, "type": "workflow-subgraph", "outputs": [{"name": "CONDITIONING"}]},
-        {"id": 3, "type": "KSampler"},
-    ], "links": []}
-    assert validate_ui_snapshot(nested_canvas, validate_api_workflow(nested_workflow)) == nested_canvas
-    body = {"name": "edited", "workflow": workflow, "ui_workflow": ui}
-    old_body, old_json = webapi_module._body, webapi_module._json
+    async def run():
+        body = {}
+        old_body, old_json, old_query = (
+            webapi_module._body, webapi_module._json, webapi_module._query,
+        )
 
-    async def fake_body():
-        return dict(body)
+        async def fake_body():
+            return dict(body)
 
-    webapi_module._body = fake_body
-    webapi_module._json = lambda data, status=200: {**data, "_status": status}
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            builder = WorkflowBuilder(plugin_dir=PLUGIN, custom_dir=root / "workflows")
-            client = FakeClient()
-            shared = {}
-            api = webapi_module.StudioApi(client, builder, RecipeStore(root), root, shared)
+        def fake_json(data, status=200):
+            return {**data, "_status": status}
 
-            async def run():
-                saved = await api.save_graph()
-                assert saved["ok"] and saved["ui_workflow"] == ui
-                assert builder.load_template_raw("edited") == workflow
-                assert builder.load_ui_template("edited") == ui
-                assert [item["name"] for item in builder.list_templates()] == ["edited"]
+        webapi_module._body, webapi_module._json = fake_body, fake_json
+        webapi_module._query = lambda key, default="": default
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                builder = WorkflowBuilder(plugin_dir=PLUGIN, custom_dir=root / "workflows")
+                for name in ("gen-a", "gen-b", "edit-a", "edit-b"):
+                    builder.save_template(name, _load_fixture("mini_workflow.json"))
+                store = RecipeStore(root)
+                profiles = WorkflowProfileStore(root)
+                profiles.save("gen-a", {"prompt": {"node": "2"}}, [])
+                config = FakeConfig({
+                    "model_families": [{"__template_key": "family", "name": "qwen", "workflow": "gen-a"}],
+                    "edit_families": [{"__template_key": "edit_family", "model_family": "qwen", "workflow": "edit-a"}],
+                    "workflow_node_mappings": [],
+                })
+                families = ModelFamilyRegistry(config["model_families"], edit_raw=config["edit_families"])
+                draw_tool, recipe_tool, edit_tool = FakeTool(), FakeTool(), FakeTool()
+                api = webapi_module.StudioApi(
+                    None, builder, store, root / "output", {},
+                    draw_tool, recipe_tool, edit_tool, families, profiles,
+                    plugin_config=config,
+                )
+                routes = []
 
-                started = await api.run_graph()
-                assert started["prompt_id"] == "graph-pid"
-                assert client.submitted == (workflow, ui)
-                assert shared["web_pending_runs"]["graph-pid"]["entry"] == "graph"
+                class FakeContext:
+                    def register_web_api(self, path, handler, methods, description):
+                        routes.append(path)
 
-                body["workflow"] = {"1": {"class_type": "UNETLoader", "inputs": {"model": ["99", 0]}}}
-                invalid = await api.run_graph()
-                assert invalid["_status"] == 400 and "连接无效" in invalid["error"]
+                webapi_module.register_web_apis(
+                    FakeContext(), None, builder, store, root / "output", {},
+                    draw_tool, recipe_tool, edit_tool, families, profiles,
+                    plugin_config=config,
+                )
+                assert "/astrbot_plugin_comfyui_direct/workflow/bind" in routes
 
-            asyncio.run(run())
-            builder.delete_template("edited")
-            assert builder.load_ui_template("edited") is None
-    finally:
-        webapi_module._body, webapi_module._json = old_body, old_json
+                body.update({
+                    "name": "静态配方", "family": "qwen", "defaults": {"steps": 18},
+                    "profile_slots": {"prompt": {"node": "999"}},
+                    "drop_nodes": ["2"],
+                })
+                saved = await api.save_recipe()
+                assert saved["ok"] is True
+                assert store.get("静态配方")["defaults"]["steps"] == 18
+                recipe_path = store.path_for(saved["recipe"]["id"])
+                assert "slots" not in json.loads(recipe_path.read_text(encoding="utf-8"))
+                assert profiles.get("gen-a")["slots"]["prompt"]["node"] == "2"
+                original_recipe = store.get("静态配方")
+                with patch.object(builder, "load_template", side_effect=AssertionError("recipe read touched workflow")):
+                    loaded = await api.get_recipe()
+                assert loaded["ok"] is True and loaded["recipe"]["name"] == "静态配方"
 
-    captured = {}
+                body.clear()
+                updated_workflow = _load_fixture("mini_workflow.json")
+                updated_workflow["2"]["inputs"]["text"] = "updated workflow prompt"
+                body.update({"name": "gen-a", "workflow": updated_workflow})
+                imported = await api.import_workflow()
+                assert imported["ok"] is True
+                assert builder.load_template("gen-a")["2"]["inputs"]["text"] == "updated workflow prompt"
+                assert store.get("静态配方") == original_recipe
+                assert profiles.get("gen-a")["slots"]["prompt"]["node"] == "2"
 
-    def handler(request):
-        captured.update(json.loads(request.content))
-        return httpx.Response(200, json={"prompt_id": "graph-pid", "number": 0})
+                body.clear()
+                body.update({
+                    "workflow": "gen-a",
+                    "slots": {"prompt": {"node": "2"}, "sampler": {"node": "5"}},
+                    "drop_nodes": [],
+                })
+                mapped = await api.save_workflow_profile()
+                assert mapped["ok"] is True
+                assert profiles.get("gen-a")["slots"]["sampler"]["node"] == "5"
+                assert store.get("静态配方") == original_recipe
 
-    client = ComfyUIClient(host="t", port=1, cache_file=None)
-    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://t:1")
+                body.clear()
+                body.update({"mode": "generate", "family": "qwen", "workflow": "gen-b"})
+                bound = await api.save_workflow_binding()
+                assert bound["ok"] is True
+                assert families.get("qwen").workflow == "gen-b"
+                assert builder.default_workflow == "gen-b"
+                assert store.get("静态配方") == original_recipe
+                assert profiles.get("gen-a")["slots"]["prompt"]["node"] == "2"
 
-    async def submit():
-        pid, err = await client.submit_prompt_detail(workflow, ui_workflow=ui)
-        assert pid == "graph-pid" and err is None
-        await client.close()
+                body["mode"], body["workflow"] = "edit", "edit-b"
+                bound_edit = await api.save_workflow_binding()
+                assert bound_edit["ok"] is True
+                assert any("LoadImage" in warning for warning in bound_edit["warnings"])
+                assert families.get("qwen").edit_workflow == "edit-b"
+                assert edit_tool.active is True
+                assert config.saved == 2
+                assert store.get("静态配方") == original_recipe
 
-    asyncio.run(submit())
-    assert captured["prompt"] == workflow
-    assert captured["extra_data"]["extra_pnginfo"]["workflow"] == ui
-    print("  graph save / remote submission payload OK")
+                body["workflow"] = ""
+                unbound = await api.save_workflow_binding()
+                assert unbound["ok"] is True
+                assert families.get("qwen").edit_workflow == ""
+                assert edit_tool.active is False
+                assert store.get("静态配方") == original_recipe
+
+                body["workflow"] = "missing"
+                rejected = await api.save_workflow_binding()
+                assert rejected["ok"] is False and config.saved == 3
+
+                config.fail = True
+                body["workflow"] = "edit-a"
+                failed_save = await api.save_workflow_binding()
+                assert failed_save["ok"] is False and config.saved == 3
+                assert families.get("qwen").edit_workflow == ""
+                assert config["edit_families"][0]["workflow"] == ""
+        finally:
+            webapi_module._body, webapi_module._json = old_body, old_json
+            webapi_module._query = old_query
+
+    asyncio.run(run())
+    print("  studio recipe/workflow independence and routing OK")
 
 
 def test_cache_atomic() -> None:
@@ -1708,10 +2147,11 @@ def test_resource_family_queries() -> None:
         resource_family_rules = []
         def __init__(self):
             pass
+        async def generation_resources(self):
+            return (await self.list_resources())[0]
+
         async def list_resources(self, **kwargs):
             return resources, False
-        async def generation_resources(self):
-            return resources
         async def list_models_folder(self, folder):
             return resources["lora_name" if folder == "loras" else "unet_name"]
 
@@ -1739,6 +2179,8 @@ def test_resource_family_queries() -> None:
         first = await lookup.call(None, type="lora", model_family="anima", query="style", limit=100)
         assert first.count(".safetensors") == 10 and "next_offset=10" in first
         assert "Krea2/" not in first and "unknown.safetensors" not in first and "wrong" not in first
+        named = await lookup.call(None, type="lora", model_family="anima", query="SDXL/style.safetensors")
+        assert "SDXL/style.safetensors" in named and "兼容性待核对" in named
         second = await lookup.call(None, type="lora", model_family="anima", query="style", offset=10)
         assert "style10" in second and "style00" not in second
         models = await lookup.call(None, type="model", model_family="sdxl")
@@ -1754,9 +2196,6 @@ def test_resource_family_queries() -> None:
         exact_unknown = await lookup.call(None, type="model", query="mystery")
         assert "mystery.safetensors" in exact_unknown and "未确认兼容性" in exact_unknown
         assert "mystery.safetensors" not in await lookup.call(None, type="model", query="mysteri")
-        assert "mystery.safetensors" in await lookup.call(
-            None, type="model", query="mystery", include_unknown=True
-        )
         unknown = await lookup.call(None, type="lora", model_family="unknown")
         assert "unknown.safetensors" in unknown and "未确认兼容性" in unknown
         listing = await ComfyuiListModelsTool(client=client).call(None, kind="lora", model_family="krea2")
@@ -1841,7 +2280,12 @@ def main() -> None:
     test_qwen_edit_graph_scoped_detection()
     test_split_family_config_dropdowns()
     test_ui_to_api()
+    test_ui_to_api_retained_widgets_and_power_lora()
+    test_ui_import_prunes_unavailable_orphans()
     test_api_to_ui_linked_widget_positions()
+    test_api_to_ui_composite_node_ids()
+    test_api_to_ui_qwen_combined_prompt_outputs()
+    test_xb_sampler_seed_control_snapshot()
     test_workflow_build()
     test_defaults_precedence()
     test_generation_entry_resolution()
@@ -1850,10 +2294,12 @@ def main() -> None:
     test_collect_trigger_words()
     test_lora_list_input()
     test_template_management()
+    test_graph_workflow_validation()
+    test_graph_webapi_submission()
     test_submit_error_parse()
     test_execution_status_and_image_media_type()
     test_webapi_original_output_and_interrupt_guard()
-    test_graph_save_and_remote_submission()
+    test_studio_recipe_workflow_independence()
     test_cache_atomic()
     test_image_cache_lifecycle()
     test_manual_profile_skips_detection()

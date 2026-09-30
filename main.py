@@ -36,30 +36,28 @@ from astrbot.core.star.star_tools import StarTools  # noqa: E402
 # 导致改代码后热重载仍在跑旧逻辑。这里在导入前主动踢掉它们。
 import sys as _sys  # noqa: E402
 
-for _m in (
-    "external_search",
-    "animadex",
-    "api_to_ui",
-    "tools",
-    "comfy_client",
-    "workflow_builder",
-    "webapi",
-    "slot_mapping",
-    "recipe_store",
-    "model_families",
-    "image_cache",
-    "resource_catalog",
-    "config_options",
-    "character_tags",
-    "generation_support",
-    "execution_events",
-):
-    _sys.modules.pop(_m, None)
+for _pkg_prefix in ("", "astrbot_plugin_comfyui_direct."):
+    for _m in (
+        "external_search",
+        "tools",
+        "comfy_client",
+        "workflow_builder",
+        "webapi",
+        "slot_mapping",
+        "recipe_store",
+        "model_families",
+        "image_cache",
+        "resource_catalog",
+        "config_options",
+        "character_tags",
+        "generation_support",
+        "execution_events",
+        "animadex",
+        "api_to_ui",
+    ):
+        _sys.modules.pop(_pkg_prefix + _m, None)
 
 from character_tags import CharacterTagLookup  # noqa: E402
-
-# Sibling modules use the plugin directory on sys.path consistently; mixed package
-# imports create duplicate class identities and fail SDK tool validation.
 from animadex import AnimaDexClient  # noqa: E402
 from comfy_client import ComfyUIClient  # noqa: E402
 from config_options import refresh_config_options  # noqa: E402
@@ -89,7 +87,7 @@ from tools import (  # noqa: E402
     ComfyuiLookupTool,
 )
 from workflow_builder import WorkflowBuilder  # noqa: E402
-from model_families import ModelFamilyRegistry, WorkflowProfileStore  # noqa: E402
+from model_families import EditWorkflowRegistry, ModelFamilyRegistry, WorkflowProfileStore  # noqa: E402
 from recipe_store import RecipeStore  # noqa: E402
 
 
@@ -103,8 +101,8 @@ DEFAULT_CACHE_TTL = 600
 DEFAULT_WORKFLOW = "anima-v3"
 
 BASIC_LLM_TOOLS = {"comfyui_draw", "comfyui_edit", "comfyui_recipe_draw", "comfyui_lookup"}
-# 这些工具可能选择任意模板、读取/上传本地文件、执行未映射节点或影响其他任务；
-# 默认不交给模型，需要管理员显式打开配置。
+# 这些工具可能读取任意本地文件、执行未经映射的自定义节点或影响其他任务，
+# 默认不交给模型；需要时由管理员显式打开配置。
 LLM_UNSAFE_TOOLS = {
     "comfyui_generate",
     "comfyui_run_workflow",
@@ -232,6 +230,11 @@ class ComfyUIDirectPlugin(Star):
             default_workflow,
             edit_raw=cfg.get("edit_families") or [],
         )
+        self._edit_workflows = EditWorkflowRegistry(
+            raw=cfg.get("edit_workflows") or [],
+            legacy_edit_raw=cfg.get("edit_families") or [],
+            legacy_families_raw=self._model_families_cfg,
+        )
 
         self._client = ComfyUIClient(
             host=host,
@@ -270,6 +273,7 @@ class ComfyUIDirectPlugin(Star):
             mcp_url=str(cfg.get("animadex_mcp_url") or "http://127.0.0.1:11451/mcp"),
             timeout=float(cfg.get("animadex_timeout") or 8.0),
         )
+
         self._character_lookup = CharacterTagLookup(
             data_dir, danbooru=self._danbooru,
             enabled=bool(cfg.get("character_names_enabled", True)),
@@ -298,10 +302,11 @@ class ComfyUIDirectPlugin(Star):
             output_dir=self._output_dir,
             shared=shared,
             families=self._families,
+            edit_workflows=self._edit_workflows,
             profiles=self._profiles,
         )
         self._edit_tool.refresh_schema()
-        if not self._families.editable_names():
+        if not self._edit_workflows.names():
             self._edit_tool.active = False
         self._recipe_draw_tool = ComfyuiRecipeDrawTool(
             draw_tool=self._draw_tool,
@@ -314,8 +319,8 @@ class ComfyUIDirectPlugin(Star):
             danbooru=self._danbooru,
             gelbooru=self._gelbooru,
             animadex=self._animadex,
-            character_lookup=self._character_lookup,
             client=self._client,
+            character_lookup=self._character_lookup,
         )
 
         recipe_tool = ComfyuiRecipeTool(
@@ -384,11 +389,13 @@ class ComfyUIDirectPlugin(Star):
                 shared,
                 self._draw_tool,
                 self._recipe_draw_tool,
+                self._edit_tool,
                 self._families,
                 self._profiles,
                 config_defaults=defaults,
                 plugin_config=config,
                 auto_trigger_words=bool(cfg.get("auto_lora_trigger_words", False)),
+                edit_workflows=self._edit_workflows,
             )
         except Exception as e:
             logger.error(f"[ComfyUIDirect] WebUI 接口注册失败: {e}")
@@ -448,7 +455,14 @@ class ComfyUIDirectPlugin(Star):
 
         first_family = self._families.first()
         wf = loaded.get(first_family.workflow)
-        if wf is not None:
+        has_legacy_slots = any(str(value or "").strip() for value in node_slots_cfg.values())
+        has_legacy_defaults = has_legacy_slots or any(
+            value not in (None, "", 0, 0.0, [], {})
+            for value in recipe_defaults.values()
+        )
+        if wf is not None and has_legacy_defaults:
+            # One-time migration for explicit old settings. Importing a workflow
+            # alone must not create or alter a static recipe.
             self._store.bootstrap(
                 workflow_name=first_family.workflow,
                 wf=wf,

@@ -30,13 +30,18 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
-from animadex import AnimaDexClient
 from character_tags import CharacterTagLookup, format_character_result
 from generation_support import fill_trigger_words
-from comfy_client import ComfyUIClient, execution_error_message, image_media_type
+from animadex import AnimaDexClient
+from comfy_client import ComfyUIClient, execution_error_message, image_dimensions, image_media_type
 from image_cache import save_image
 from external_search import CivitaiClient, DanbooruClient, GelbooruClient
-from model_families import ModelFamily, ModelFamilyRegistry, WorkflowProfileStore
+from model_families import (
+    EditWorkflowRegistry,
+    ModelFamily,
+    ModelFamilyRegistry,
+    WorkflowProfileStore,
+)
 from recipe_store import (
     RecipeStore,
     materialize_values,
@@ -52,6 +57,7 @@ from slot_mapping import (
     parse_lora,
     read_current_values,
     resolve_size,
+    source_image_slots,
 )
 from resource_catalog import (
     canonical_family, exact_matches, explicitly_named, family_summary,
@@ -62,34 +68,6 @@ from workflow_builder import WorkflowBuilder
 
 MAX_LLM_LIST_ITEMS = 30
 MAX_LLM_DETAIL_ITEMS = 8
-
-
-def _lora_input(kwargs: dict[str, Any]) -> Any:
-    """Read canonical `lora` input and retain the older `loras` alias."""
-    value = kwargs.get("lora")
-    if value is not None and value != "":
-        return value
-    return kwargs.get("loras")
-
-
-def _has_lora_input(kwargs: dict[str, Any]) -> bool:
-    value = _lora_input(kwargs)
-    return value is not None and value != ""
-
-
-def _lora_array_schema(description: str) -> dict[str, Any]:
-    return {
-        "type": "array",
-        "description": description,
-        "items": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "已安装 LoRA 的文件名或查询结果名称"},
-                "strength": {"type": "number", "description": "可选权重；省略时使用工作流/配方权重"},
-            },
-            "required": ["name"],
-        },
-    }
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -143,6 +121,7 @@ def _validate_generation_values(values: dict[str, Any]) -> dict[str, Any]:
         "denoise": (False, 0, 1),
         "width": (True, 64, 8192),
         "height": (True, 64, 8192),
+        "megapixels": (False, 0.1, 64),
     }
     for key, (integer, minimum, maximum) in limits.items():
         value = result.get(key)
@@ -156,6 +135,38 @@ def _validate_generation_values(values: dict[str, Any]) -> dict[str, Any]:
             maximum=maximum,
         )
     return result
+
+
+def _edit_canvas_dimensions(width: int, height: int, resolution: int) -> tuple[int, int]:
+    """Fit the reference image into a square resolution bound, preserving its ratio."""
+    if resolution == 0:
+        return width, height
+    scale = resolution / max(width, height)
+    scaled_width = max(8, int(round(width * scale / 8) * 8))
+    scaled_height = max(8, int(round(height * scale / 8) * 8))
+    return scaled_width, scaled_height
+
+
+def _custom_edit_canvas_dimensions(
+    source_dimensions: tuple[int, int] | None,
+    width: int | None,
+    height: int | None,
+) -> tuple[int, int]:
+    """Apply an explicit canvas size; infer one missing side from the reference ratio."""
+    if width is None and height is None:
+        raise ValueError("请至少指定 width 或 height")
+    if width is None or height is None:
+        if source_dimensions is None:
+            raise ValueError("无法读取来源图片宽高，不能按参考图比例补齐画布尺寸")
+        source_width, source_height = source_dimensions
+        if width is None:
+            width = int(round(height * source_width / source_height / 8) * 8)
+        if height is None:
+            height = int(round(width * source_height / source_width / 8) * 8)
+    width, height = max(8, int(round(width / 8) * 8)), max(8, int(round(height / 8) * 8))
+    if not (64 <= width <= 8192 and 64 <= height <= 8192):
+        raise ValueError("推算后的画布宽高需在 64 到 8192 之间，请同时指定 width 和 height")
+    return width, height
 
 
 def _event_scope(context: ContextWrapper[AstrAgentContext]) -> str:
@@ -306,7 +317,8 @@ _RESOURCE_QUERY_PROPERTIES = {
 
 def _resource_page(client, resources, kind, query="", family="", limit=5, offset=0,
                    include_unknown=False) -> str:
-    names = resources.get("lora_name" if kind == "lora" else "unet_name") or []
+    all_names = resources.get("lora_name" if kind == "lora" else "unet_name") or []
+    names = all_names
     meta = metadata_for(resources, kind)
     rules = getattr(client, "resource_family_rules", [])
     title = "LoRA" if kind == "lora" else "底模"
@@ -320,8 +332,15 @@ def _resource_page(client, resources, kind, query="", family="", limit=5, offset
     lines = [f"【{title} {scope}】共 {len(matches)} 项，显示 {offset + 1 if shown else 0}-{offset + len(shown)}"]
     for name, mode, _ in shown:
         found, source = resource_family(name, meta.get(name), rules, kind)
+        compatibility = selection_error(
+            resources,
+            {"loras": [{"name": name}]} if kind == "lora" else {"model": name},
+            family,
+            rules,
+        ) if family else ""
+        warning = f"；兼容性待核对: {compatibility}" if compatibility else ""
         near_note = "；近似名称，请核对" if mode == "near" else ""
-        lines.append(f"{name} [家族={found or 'unknown'}；{source}{near_note}]")
+        lines.append(f"{name} [家族={found or 'unknown'}；{source}{warning}{near_note}]")
         if kind == "lora":
             lines.extend("  " + line[:240] for line in _lora_info_summary(meta.get(name) or {}, detailed=True))
     if offset + limit < len(matches):
@@ -341,6 +360,9 @@ def _resource_matches(client, resources, kind, query, family="", include_unknown
     names = resources.get("lora_name" if kind == "lora" else "unet_name") or []
     meta = metadata_for(resources, kind)
     rules = getattr(client, "resource_family_rules", [])
+    exact = exact_matches(names, query) if query else []
+    if exact:
+        return [(name, "exact", 1.0) for name in exact]
     if family:
         names = filter_family(names, meta, family, rules, kind, include_unknown)
     else:
@@ -350,9 +372,6 @@ def _resource_matches(client, resources, kind, query, family="", include_unknown
                      or (query and explicitly_named(name, query))]
     if not query:
         return [(name, "list", 1.0) for name in names]
-    exact = exact_matches(names, query)
-    if exact:
-        return [(name, "exact", 1.0) for name in exact]
     if kind == "lora" and family:
         semantic = _match_lora_resources(names, meta, query, limit=len(names))
         if semantic:
@@ -409,7 +428,7 @@ class ComfyuiListModelsTool(FunctionTool[AstrAgentContext]):
         "查询本机上ComfyUI可用的UNET底模、LoRA、CLIP、VAE、Embedding列表。"
         "给出 query 可按模型名称跨家族搜索；缺少 kind 时同时搜索各类资源，结果标注家族。"
         "LoRA 会附带触发词，以及 LoRA Manager/Civitai 的 style、character 等类别、标签和使用建议。"
-        "清单会自动同步并本地缓存，ComfyUI离线时返回最近一次同步结果。"
+        "清单会自动同步并本地缓存，ComfyUI离线时返回最近一次同步结果。完整已知文件名可跨家族查询；类别/标签筛选需指定 model_family。"
         "用户询问可用资源，或绘图时需要按画风、角色、服饰、效果挑选已安装 LoRA 时使用。"
     )
     parameters: dict = Field(
@@ -487,12 +506,11 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
         "日常自由生图使用 comfyui_draw，快捷配方生图使用 comfyui_recipe_draw。"
         "prompt 必填；未覆盖的参数沿用配方、插件配置或模板默认值，width/height 可按构图需求填写。"
         "当 LoRA 有助于实现用户要求的画风、角色、服饰或效果时，可主动查询并选用，用户无需点名 LoRA 或提供文件名。"
-        "先用 comfyui_lookup(type=\"lora\", query=需求关键词) 或 comfyui_list_models(kind=\"lora\")，"
-        "按用途搜索时带上 model_family；已知文件名可以跨家族查询。依据返回的用途说明和推荐权重，"
-        "把实际文件名写进 lora 对象数组的 name，并可设置 strength。"
+        "按用途查询 LoRA 时使用 comfyui_lookup(type=\"lora\", model_family=所选家族, query=需求关键词)，"
+        "依据用途说明、兼容性和推荐权重选择，再把实际文件名写入 lora 对象数组。"
         "使用已记录的触发词时同步填写 trigger_words，保留原词格式；查询未提供触发词时可省略该字段并继续使用 LoRA。"
         "省略 lora 会沿用默认设置，传入列表会覆盖映射的可选 LoRA；已有独立加速节点的模板始终沿用其加速设置。"
-        "用户明确要求关闭可选 LoRA 时可传 \"[]\" 或 \"none\"，该操作只关闭映射槽位。"
+        "用户明确要求关闭可选 LoRA 时传空数组，该操作只关闭映射槽位。"
         "角色/画师名称不确定时用 comfyui_lookup 查询；底模、采样参数等按用户要求调整，其余沿用默认值。"
         "recipe 与 workflow 是两个独立入口：传 recipe 时按其模型家族解析当前工作流并写入保存参数；"
         "传 workflow 时按该模板生成、不套配方；两者都省略时优先默认配方，没有默认配方才用配置的默认工作流模板。"
@@ -504,7 +522,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "主提示词：danbooru 风格 tag 串，描述人物/动作/场景/服饰/构图，不含质量词与画师（必填）",
+                    "description": "主提示词，按所选工作流或家族的 prompt_style 编写；人物、动作、场景与构图依用户要求填写（必填）",
                 },
                 "artist": {
                     "type": "string",
@@ -526,12 +544,11 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                     "type": "string",
                     "description": "底模文件名。必须用 comfyui_list_models 返回的完整名字（可能带子目录前缀，如 Anima\\miaomiaoHarem_anima16.safetensors）；传短名会自动匹配，匹配到多份会要求重填。用户指定底模时填，不知道文件名先查 comfyui_list_models",
                 },
-                "lora": _lora_array_schema(
-                    "可按画面需求主动查询并选用 LoRA。传对象数组，如 "
-                    '[{"name":"查询得到的文件名","strength":0.55}]；可省略 strength 使用推荐/默认权重。'
-                    "覆盖映射的可选 LoRA 槽位；固定加速 LoRA 保持不变。"
-                    "省略沿用工作流/配方；明确关闭可选 LoRA 时传空数组。旧版字符串参数仍兼容。"
-                ),
+                "lora": {
+                    **_lora_array_schema(
+                        "按查询结果提供 LoRA 对象数组，可附推荐 strength。按已映射槽位覆盖可选 LoRA；独立加速 LoRA 保留。省略沿用默认，传空数组关闭可选 LoRA"
+                    ),
+                },
                 "steps": {
                     "type": "number",
                     "description": "采样步数。不传用插件配置默认",
@@ -580,8 +597,8 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
     builder: WorkflowBuilder | None = None
     output_dir: Path | None = None
     shared: dict = Field(default_factory=dict)  # 跨工具共享状态（如 last_prompt_id）
-    defaults: dict = Field(default_factory=dict)  # 插件配置里的生成默认值（LLM 不传时使用）
     auto_trigger_words: bool = False
+    defaults: dict = Field(default_factory=dict)  # 插件配置里的生成默认值（LLM 不传时使用）
     store: RecipeStore | None = None  # 配方存储（统一用 RecipeStore）
     families: ModelFamilyRegistry | None = None
     profiles: WorkflowProfileStore | None = None
@@ -615,7 +632,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
         if "negative" in flat and "negative_prompt" not in flat:
             flat["negative_prompt"] = flat.pop("negative")
         if loras is not None:
-            flat["lora"] = loras
+            flat["lora"] = json.dumps(loras, ensure_ascii=False)
         return flat
 
     def _load_recipe_data(self, name: str) -> dict | None:
@@ -627,9 +644,9 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
     async def _wait_outputs(self, prompt_id: str) -> tuple[dict | None, str | None]:
         return await _wait_outputs(self.client, prompt_id)
 
+
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         prepared_resources = None
-
         async def resources_for_request():
             nonlocal prepared_resources
             if prepared_resources is None:
@@ -663,7 +680,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 display = str(recipe_data.get("name") or entry_name or "默认")
                 return (
                     f"生成失败：配方「{display}」还没指定主提示词节点，"
-                    "请主人在配方工作台或配置下拉框里选一下。"
+                    "请在 Workflow Studio 工作流页或配置下拉框中确认节点映射。"
                 )
             merged = dict(self._load_recipe(entry_name) or {})
             merged.pop("name", None)
@@ -695,11 +712,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                         f"生成失败：底模「{model_val}」匹配到多份：{preview}。"
                         "请让用户选一个或填完整文件名。"
                     )
-            lora_val = _lora_input(kwargs)
-            if not _has_lora_input(kwargs):
-                lora_val = pick("lora")
-                if lora_val is None:
-                    lora_val = pick("loras")
+            lora_val = pick("lora")
             trigger_val = pick("trigger_words")
             generation_values = _validate_generation_values(
                 {
@@ -712,12 +725,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 }
             )
             seed = generation_values["seed"]
-            if self.auto_trigger_words and entry != "recipe" and trigger_val is None:
-                trigger_resources = await resources_for_request()
-                selected = [str(item.get("name")) for item in parse_lora(lora_val) if item.get("name")]
-                if selected:
-                    trigger_resources = await self.client.selected_lora_metadata(trigger_resources, selected, require_trusted=True)
-                trigger_val = fill_trigger_words({"loras": parse_lora(lora_val)}, trigger_resources, True).get("trigger_words")
+            # 自动填 lora 触发词已禁用（33号要求，lora_meta 触发词乱提示），需要时显式传 trigger_words
             prefix = f"astrbot_{uuid.uuid4().hex[:8]}"
             if recipe_data is not None:
                 # 配方生成必须走保存的 workflow + slots。此前这里把配方压平成
@@ -735,9 +743,24 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                         # model_val 已完成资源名解析；配方里保存的短名也要沿用
                         # 解析后的完整路径，避免 ComfyUI 校验时再次丢失。
                         "model": kwargs.get("model") if model_val is not None else None,
-                        "loras": parse_lora(_lora_input(explicit_kwargs))
-                        if _has_lora_input(explicit_kwargs)
-                        else None,
+                        "loras": (
+                            parse_lora(
+                                explicit_kwargs.get(
+                                    "lora",
+                                    explicit_kwargs.get("loras"),
+                                )
+                            )
+                            if (
+                                "lora" in explicit_kwargs
+                                or "loras" in explicit_kwargs
+                            )
+                            and explicit_kwargs.get(
+                                "lora",
+                                explicit_kwargs.get("loras"),
+                            )
+                            not in (None, "")
+                            else None
+                        ),
                         "width": explicit_kwargs.get("width"),
                         "height": explicit_kwargs.get("height"),
                         "steps": explicit_kwargs.get("steps"),
@@ -1001,7 +1024,7 @@ class ComfyuiBooruTool(FunctionTool[AstrAgentContext]):
         "从 danbooru（默认）或 gelbooru 查询画师或角色的触发词、别名和常用 tag。"
         "danbooru 查询失败或无结果时自动回退 gelbooru（结果里会标注真实来源）。"
         "用户指定画师风格/角色时，先调用本工具查到真实触发词，"
-        "再把 @画师 串填进 comfyui_draw 的 artist 或 prompt，不要凭记忆编 tag。"
+        "再把 @画师 串填进 comfyui_draw 的 artist/trigger_words 参数，不要凭记忆编 tag。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -1109,7 +1132,7 @@ class ComfyuiCivitaiSearchTool(FunctionTool[AstrAgentContext]):
     name: str = "comfyui_civitai_search"
     description: str = (
         "在 civitai 搜索参考图并返回其完整生成配方（模型、正向/负向提示词、采样器、"
-        "步数、cfg、seed），可将结果整理后传给 comfyui_draw 的对应参数。"
+        "步数、cfg、seed），可在确认家族和兼容性后填进 comfyui_draw 的参数。"
         "用户想参考某风格/某模型的作品或找现成提示词时使用。"
     )
     parameters: dict = Field(
@@ -1965,8 +1988,8 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
     description: str = (
         "把实验好的底模、LoRA、画幅和采样参数保存为命名配方。配方引用 model_family，"
         "工作流和节点映射由家族配置统一管理。"
-        "明确传 action=save（保存，需 name + model_family）/ action=list（列出）/"
-        "action=load（读取参数）；delete 仅在管理员开放危险工具时提供。"
+        "action=save（保存，需 name + model_family）/ action=list（列出）/"
+        "action=load（读取一个配方，返回全部参数）/ action=delete（删除）。"
         "实际快捷生图使用 comfyui_recipe_draw，只需传配方名和本次 prompt。"
     )
     parameters: dict = Field(
@@ -1976,13 +1999,13 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
                 "action": {
                     "type": "string",
                     "enum": ["save", "list", "load", "delete"],
-                    "description": "必填；save=保存，list=列出，load=读取；delete 仅在管理员开放危险工具后出现",
+                    "description": "save=保存（默认），list=列出，load=读取，delete=删除",
                 },
                 "name": {
                     "type": "string",
                     "description": "配方名（save/load/delete 必填）",
                 },
-                "description": {"type": "string", "description": "可选用途说明，不会作为配方的固定生图提示词"},
+                "description": {"type": "string", "description": "配方用途说明，帮助模型判断何时复用此配方"},
                 "model_family": {
                     "type": "string",
                     "description": "配方适用的模型家族（save 时必填）",
@@ -1992,7 +2015,7 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
                 "trigger_words": {"type": "string", "description": "lora触发词"},
                 "negative_prompt": {"type": "string", "description": "负向提示词"},
                 "model": {"type": "string", "description": "底模文件名"},
-                "lora": _lora_array_schema("可选 LoRA 对象数组；每项含 name，可带 strength。旧版字符串仍兼容。"),
+                "lora": _lora_array_schema("LoRA 对象数组，省略沿用已有设置；旧版 JSON 字符串仍可解析"),
                 "steps": {"type": "number", "description": "采样步数"},
                 "cfg": {"type": "number", "description": "CFG"},
                 "sampler_name": {"type": "string", "description": "采样器"},
@@ -2002,7 +2025,6 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
                 "height": {"type": "number", "description": "高度"},
                 "seed": {"type": "number", "description": "种子"},
             },
-            "required": ["action"],
         }
     )
     store: RecipeStore | None = None
@@ -2012,25 +2034,26 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
     families: ModelFamilyRegistry | None = None
 
     def refresh_schema(self) -> None:
-        action = self.parameters.setdefault("properties", {}).setdefault("action", {"type": "string"})
-        actions = ["save", "list", "load"]
-        if self.allow_delete:
-            actions.append("delete")
+        actions = ["save", "list", "load"] + (["delete"] if self.allow_delete else [])
+        action = self.parameters["properties"]["action"]
         action["enum"] = actions
-        family = self.parameters.setdefault("properties", {}).setdefault("model_family", {"type": "string"})
+        action["description"] = "选择保存、列出或读取配方" + ("；仅用户明确要求时删除" if self.allow_delete else "")
+        self.parameters["required"] = ["action"]
+        self.description = (
+            "保存、列出和读取静态配方。保存时提供 name、model_family 和可选生成参数；"
+            "description 描述配方用途，不会固定后续生图提示词。生图调用 comfyui_recipe_draw。"
+            + ("用户明确要求删除时可使用 action=delete。" if self.allow_delete else "")
+        )
+        family = self.parameters["properties"]["model_family"]
         names = self.families.names() if self.families is not None else []
         if names:
             family["enum"] = names
-            family["description"] = "保存配方时必填；从可用模型家族中选择"
         else:
             family.pop("enum", None)
-            family["description"] = "保存配方时必填；先配置模型家族"
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
-        action = str(kwargs.get("action") or "").strip().lower()
+        action = str(kwargs.get("action") or "save").strip().lower()
         name = str(kwargs.get("name") or "").strip()
-        if not action:
-            return "操作失败：action 必填，请选择 save、list 或 load。"
         if action not in ("save", "list", "load", "delete"):
             return "操作失败：action 仅支持 save/list/load/delete。"
 
@@ -2062,6 +2085,7 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
             defaults = recipe.get("defaults") or {}
             info = {
                 "name": recipe.get("name") or name,
+                "description": recipe.get("description") or "",
                 "model_family": recipe.get("family") or recipe_family(recipe),
                 "model": defaults.get("model") or "",
                 "lora": defaults.get("loras") or [],
@@ -2087,8 +2111,8 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
         if family is None:
             available = "、".join(self.families.names()) if self.families else "无"
             return f"保存失败：模型家族「{family_name}」不存在。可用家族：{available}"
-        lora_val = _lora_input(kwargs)
-        if _has_lora_input(kwargs):
+        lora_val = kwargs.get("lora")
+        if lora_val:
             try:
                 parsed_loras = parse_lora(lora_val)
             except ValueError as e:
@@ -2102,7 +2126,7 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
                 defaults[key] = v
         if kwargs.get("negative_prompt"):
             defaults["negative"] = kwargs["negative_prompt"]
-        if _has_lora_input(kwargs):
+        if lora_val not in (None, ""):
             defaults["loras"] = parsed_loras
         for key in ("steps", "cfg", "denoise", "width", "height"):
             v = kwargs.get(key)
@@ -2113,7 +2137,7 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
             assert self.store is not None
             self.store.save({
                 "name": name,
-                "description": str(kwargs.get("description") or kwargs.get("prompt") or "")[:200],
+                "description": str(kwargs.get("description") or kwargs.get("prompt") or "")[:160],
                 "family": family.name,
                 "defaults": defaults,
             })
@@ -2125,8 +2149,8 @@ class ComfyuiRecipeTool(FunctionTool[AstrAgentContext]):
 _DRAW_DESC = (
     "从文字生成新图片并发送；需要修改现有图片时使用 comfyui_edit。model_family、prompt 必填，提示词遵循家族 prompt_style。"
     "省略可选参数沿用工作流。可按画风、角色、服饰或效果需求主动用 comfyui_lookup 查询并选用 LoRA；"
-    "按用途/类别搜索 LoRA 时把同一 model_family 传给 comfyui_lookup；已知文件名可跨家族查询。"
-    "实际使用前仍要匹配当前家族，使用查询返回的文件名和推荐权重；已知触发词填 trigger_words。"
+    "分辨率选择器工作流可用 aspect_ratio 和 megapixels 覆盖比例与目标百万像素数；"
+    "按用途、类别或标签查询资源时传 model_family；完整已知文件名可跨家族查找。使用前核对资源与当前家族兼容，并采用返回的文件名、推荐权重和已知触发词。"
     "复用配方用 comfyui_recipe_draw。成功回执包含图片本地保存路径；图片已直接发送，无需再次发送。"
 )
 
@@ -2138,6 +2162,23 @@ def _recipe_enum(store: RecipeStore | None) -> list[str]:
         return store.names()
     except Exception:
         return []
+
+
+def _lora_array_schema(description: str) -> dict[str, Any]:
+    """Expose structured LoRA arguments while the runtime keeps legacy parsing."""
+    return {
+        "type": "array",
+        "description": description,
+        "items": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "comfyui_lookup 返回的实际文件名"},
+                "strength": {"type": "number", "description": "查询结果给出的推荐权重；省略则使用工作流默认权重"},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+    }
 
 
 def _match_resource(names: list[str], query: str, limit: int = 8) -> list[str]:
@@ -2172,16 +2213,23 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                     "type": "string",
                     "description": "换底模。用户没点名就不要填。关键词或文件名",
                 },
-                "lora": _lora_array_schema(
-                    "可按画风、角色、服饰或效果需求主动查询并选用，无需用户提供名称。"
-                    '填写对象数组，如 [{"name":"查询得到的文件名","strength":0.8}]。'
-                    "覆盖映射的可选 LoRA 槽位；固定加速 LoRA 保持不变。"
-                    "省略沿用工作流，用户要求关闭可选 LoRA 时传空数组。旧版字符串参数仍兼容。"
-                ),
+                "lora": {
+                    **_lora_array_schema("按实际需求用 comfyui_lookup 查询并选用 LoRA，传对象数组，可附推荐 strength。按工作流映射顺序覆盖可选槽位，独立加速 LoRA 保留。省略沿用工作流，空数组关闭可选 LoRA；旧版字符串调用仍兼容"),
+                },
                 "size": {
                     "type": "string",
                     "enum": ["portrait", "landscape", "square", "same"],
                     "description": "portrait竖图 landscape横图 square方图。用户没提画幅就不要填",
+                },
+                "aspect_ratio": {
+                    "type": "string",
+                    "description": "分辨率选择器支持时设置画幅比例，例如 1:1、16:9；用户没指定时沿用工作流",
+                },
+                "megapixels": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 64,
+                    "description": "分辨率选择器支持时设置目标 MP，例如 1.0 MP；Qwen Image 2.1 原生 2K 方图约 4.0 MP。用户没指定时沿用工作流",
                 },
                 "artist": {
                     "type": "string",
@@ -2244,10 +2292,10 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
     store: RecipeStore | None = None
     output_dir: Path | None = None
     shared: dict = Field(default_factory=dict)
+    auto_trigger_words: bool = False
     families: ModelFamilyRegistry | None = None
     profiles: WorkflowProfileStore | None = None
     on_schema_change: Any = None
-    auto_trigger_words: bool = False
 
     def refresh_schema(self) -> None:
         names = self.families.names() if self.families is not None else []
@@ -2266,6 +2314,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         if self.client is None:
             return {"unet_name": [], "lora_name": []}
         return await self.client.generation_resources()
+
 
     def _family_candidates(self, resources, kind, query, family):
         names = resources.get("lora_name" if kind == "lora" else "unet_name") or []
@@ -2292,12 +2341,15 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             return None, f"家族 {family} 中未找到可用底模「{query}」。请用 comfyui_lookup(type=model, model_family=家族) 查询；未知资源需核实后填写完整文件名。"
         return None, f"底模名称有歧义：{'、'.join(hits[:6])}。请填写含目录的完整文件名。"
 
+
     async def _resolve_loras(self, raw: Any, family: str = "", resources: dict | None = None) -> tuple[list[dict] | None, str | None]:
         resources = resources if resources is not None else await self._resource_lists()
         metadata = resources.get("lora_meta") or {}
         try:
             parsed = parse_lora(raw)
-        except ValueError:
+        except ValueError as error:
+            if not isinstance(raw, str):
+                return None, f"LoRA 参数无效：{error}"
             parsed = [{"name": part.strip()} for part in str(raw).split(",") if part.strip()]
         if not parsed:
             return [], None
@@ -2374,7 +2426,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         if not slots.get("prompt"):
             return (
                 f"工作流「{workflow_name}」还没指定主提示词节点。"
-                "请主人在配方工作台确认这张工作流的槽位映射。"
+                "请在 Workflow Studio 工作流页确认这张工作流的槽位映射。"
             )
         if "model" in values and values.get("model") not in (None, "") and not slots.get("model"):
             return f"工作流「{workflow_name}」没有映射底模槽位，无法替换底模。"
@@ -2391,6 +2443,9 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             or values.get("height") not in (None, "")
         ) and not slots.get("size"):
             return f"工作流「{workflow_name}」没有映射画面大小槽位，无法修改画幅。"
+        for role in ("aspect_ratio", "megapixels"):
+            if values.get(role) not in (None, "") and not slots.get(role):
+                return f"工作流「{workflow_name}」没有映射 {role} 输入，无法修改分辨率选择器。"
 
         seed = values.get("seed")
         if seed is None:
@@ -2552,8 +2607,16 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             if err:
                 return err
             values["model"] = resolved_model
-        if _has_lora_input(kwargs):
-            raw_loras = _lora_input(kwargs)
+        lora_present = (
+            kwargs.get("lora") not in (None, "")
+            or kwargs.get("loras") not in (None, "")
+        )
+        if lora_present:
+            raw_loras = (
+                kwargs.get("lora")
+                if kwargs.get("lora") not in (None, "")
+                else kwargs.get("loras")
+            )
             resolved_loras, err = await self._resolve_loras(raw_loras, family.name, resources)
             if err:
                 return err
@@ -2567,6 +2630,8 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             ("negative_prompt", "negative"),
             ("width", "width"),
             ("height", "height"),
+            ("aspect_ratio", "aspect_ratio"),
+            ("megapixels", "megapixels"),
             ("steps", "steps"),
             ("cfg", "cfg"),
             ("sampler_name", "sampler_name"),
@@ -2575,9 +2640,9 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         ):
             if kwargs.get(source) not in (None, ""):
                 values[target] = kwargs[source]
+
         if "trigger_words" in kwargs and kwargs["trigger_words"] is not None:
             values["trigger_words"] = kwargs["trigger_words"]
-
         return await self._execute(
             context,
             prompt=prompt,
@@ -2590,15 +2655,16 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
 
 
 _EDIT_DESC = (
-    "修改已有图片并直接发送结果。优先使用当前消息或引用消息中的图片；"
-    "没有附图时可使用本插件上次生成的图片，或在 image_path 填本插件此前返回的本地路径。"
-    "只填写修改要求和已配置的模型家族，不要猜测图片路径；成功回执包含新图片的本地保存路径。"
+    "按独立编辑工作流路由修改已有图片并直接发送结果。会按工作流输入顺序使用当前消息或引用消息中的多张图片；附件超过输入口时用 image_indices 选择；"
+    "没有附图时可使用本插件上次生成的图片，或填写本插件此前回执的本地路径。"
+    "局部改动默认沿用参考图原始宽高。需要按参考图比例缩放时使用 resolution；需要新画布/抠出素材时使用 custom_size 和 width/height。"
+    "这些画布参数只写入当前工作流已映射的输入；成功回执包含新图片的本地保存路径。"
 )
 
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
 class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
-    """Upload an attached image and run a family's mapped edit workflow."""
+    """Upload an attached image and run a selected independent edit workflow."""
 
     name: str = "comfyui_edit"
     description: str = _EDIT_DESC
@@ -2606,24 +2672,56 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "model_family": {
+                "edit_workflow": {
                     "type": "string",
-                    "description": "配置了 edit_workflow 的模型家族，如 qwen",
+                    "description": "独立的编辑工作流路由名，与生图模型家族无关；只有一个路由时可省略",
                 },
                 "prompt": {
                     "type": "string",
                     "description": "对来源图片的修改要求，必填",
                 },
+                "resolution": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 8192,
+                    "description": "按来源图比例缩放的最长边像素数；局部修改默认行为等同于 0（原始宽高）。只有明确要缩放时填写；不能与 width/height 同时填写",
+                },
+                "custom_size": {
+                    "type": "boolean",
+                    "description": "新画布或抠出素材时开启；工作流已映射 custom_size 开关时会启用分辨率选择器画布。width/height 可以自动开启此模式",
+                },
+                "width": {
+                    "type": "integer",
+                    "minimum": 64,
+                    "maximum": 8192,
+                    "description": "自定义画布宽度；需有 size 槽位。只填写一边时按参考图比例计算另一边；与 resolution 互斥。",
+                },
+                "height": {
+                    "type": "integer",
+                    "minimum": 64,
+                    "maximum": 8192,
+                    "description": "自定义画布高度；需有 size 槽位。只填写一边时按参考图比例计算另一边；与 resolution 互斥。",
+                },
                 "image_path": {
                     "type": "string",
-                    "description": "可选；仅填本插件此前回执给出的本地保存路径。当前消息或引用消息附图时省略",
+                    "description": "可选单张本地图路径；支持本插件回执路径或 AstrBot data/temp 中的消息图片路径。附图时省略",
                 },
                 "image_index": {
                     "type": "integer",
-                    "description": "当前或引用消息有多张图时，选择第几张（从 1 开始）",
+                    "description": "单图工作流或只选一张图时，选择第几张（从 1 开始）；多图工作流可用 image_indices",
+                },
+                "image_indices": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1},
+                    "description": "多图工作流中按输入顺序选择多张消息图片的 1-based 序号，例如 [1,2]；省略时按消息顺序使用附件",
+                },
+                "image_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "多图工作流使用本插件回执路径或 AstrBot data/temp 消息图片路径数组，最多与工作流参考图输入数相同",
                 },
             },
-            "required": ["model_family", "prompt"],
+            "required": ["prompt"],
         }
     )
     client: ComfyUIClient | None = None
@@ -2632,100 +2730,316 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
     output_dir: Path | None = None
     shared: dict = Field(default_factory=dict)
     families: ModelFamilyRegistry | None = None
+    edit_workflows: EditWorkflowRegistry | None = None
     profiles: WorkflowProfileStore | None = None
 
     def refresh_schema(self) -> None:
-        names = self.families.editable_names() if self.families else []
-        prop = self.parameters["properties"]["model_family"]
+        names = (
+            self.edit_workflows.names()
+            if self.edit_workflows is not None
+            else (self.families.editable_names() if self.families else [])
+        )
+        prop = self.parameters["properties"]["edit_workflow"]
         if names:
             prop["enum"] = names
-            self.description = _EDIT_DESC + " 可编辑家族：" + "、".join(names) + "。"
+            self.parameters["required"] = ["prompt"] + (
+                ["edit_workflow"] if len(names) > 1 else []
+            )
+            descriptions = []
+            if self.edit_workflows is not None:
+                descriptions = [
+                    f"{row['name']}：{row['description']}"
+                    for row in self.edit_workflows.list()
+                    if row.get("workflow") and row.get("description")
+                ]
+            suffix = " 路由说明：" + "；".join(descriptions) if descriptions else ""
+            self.description = _EDIT_DESC + " 可用编辑路由：" + "、".join(names) + "。" + suffix
         else:
             prop.pop("enum", None)
+            self.parameters["required"] = ["prompt"]
             self.description = _EDIT_DESC + " 当前尚未配置编辑工作流。"
 
-    async def _source_path(self, context: ContextWrapper[AstrAgentContext], kwargs: dict) -> tuple[Path | None, str | None]:
-        requested = str(kwargs.get("image_path") or "").strip()
-        if requested:
+    async def _source_paths(
+        self,
+        context: ContextWrapper[AstrAgentContext],
+        kwargs: dict,
+        *,
+        max_inputs: int,
+    ) -> tuple[list[Path] | None, str | None]:
+        """Resolve one or more attached images in workflow input order."""
+        requested_many = kwargs.get("image_paths")
+        requested_single = str(kwargs.get("image_path") or "").strip()
+        if requested_many not in (None, "") and requested_single:
+            return None, "image_path 与 image_paths 只能选一个。"
+        if (requested_many not in (None, "") or requested_single) and (
+            kwargs.get("image_indices") not in (None, "")
+            or kwargs.get("image_index") not in (None, "")
+        ):
+            return None, "image_path/image_paths 与 image_index/image_indices 只能选一类输入。"
+
+        raw_paths: list[str] = []
+        if requested_many not in (None, ""):
+            if not isinstance(requested_many, list) or not all(isinstance(x, str) for x in requested_many):
+                return None, "image_paths 必须是本插件此前回执的本地路径数组。"
+            raw_paths = [path.strip() for path in requested_many if path.strip()]
+        elif requested_single:
+            raw_paths = [requested_single]
+        if requested_many is not None and not raw_paths:
+            return None, "image_paths 不能为空，请提供明确图片路径。"
+
+        def resolve_allowed_paths(values: list[str]) -> tuple[list[Path] | None, str | None]:
+            resolved: list[Path] = []
+            roots = [self.output_dir.resolve()]
             try:
-                path = Path(requested).expanduser().resolve(strict=True)
-                path.relative_to(self.output_dir.resolve())
-            except (OSError, ValueError):
-                return None, "image_path 必须是本插件此前回执给出的有效本地保存路径。"
-            return (path, None) if path.is_file() else (None, "来源图片文件不存在。")
+                from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+
+                roots.append(Path(get_astrbot_temp_path()).resolve())
+            except (ImportError, OSError, RuntimeError):
+                pass
+            for value in values:
+                try:
+                    path = Path(value).expanduser().resolve(strict=True)
+                except (OSError, ValueError):
+                    return None, "image_path/image_paths 无法读取；请确认路径有效。"
+                allowed = False
+                for root in roots:
+                    try:
+                        path.relative_to(root)
+                        allowed = True
+                        break
+                    except ValueError:
+                        continue
+                if not allowed:
+                    return None, "image_path/image_paths 仅支持本插件输出目录或 AstrBot data/temp 中的文件。"
+                if not path.is_file():
+                    return None, "来源图片文件不存在。"
+                resolved.append(path)
+            if len(resolved) > max_inputs:
+                return None, f"工作流有 {max_inputs} 个参考图输入，image_paths 不能超过该数量。"
+            return (resolved or None), (None if resolved else "没有提供有效的来源图片路径。")
+
+        if raw_paths:
+            return resolve_allowed_paths(raw_paths)
 
         images = _message_images(context)
         if images:
+            raw_indices = kwargs.get("image_indices")
             raw_index = kwargs.get("image_index")
-            if raw_index in (None, "") and len(images) > 1:
-                return None, f"当前消息有 {len(images)} 张图片，请用 image_index 指定其中一张。"
-            try:
-                index = int(raw_index) if raw_index not in (None, "") else 1
-            except (TypeError, ValueError):
-                return None, "image_index 必须是从 1 开始的整数。"
-            if not 1 <= index <= len(images):
-                return None, f"image_index 超出范围；当前有 {len(images)} 张图片。"
-            try:
-                path = Path(await images[index - 1].convert_to_file_path()).resolve(strict=True)
-            except Exception as e:  # noqa: BLE001 - platform media resolver may raise adapter errors
-                return None, f"无法读取消息中的图片（{e}）。"
-            return path, None
+            if raw_indices not in (None, "") and raw_index not in (None, ""):
+                return None, "image_index 与 image_indices 只能选一个。"
+            indices: list[int]
+            if raw_indices not in (None, ""):
+                if not isinstance(raw_indices, list) or not raw_indices:
+                    return None, "image_indices 必须是非空的 1-based 图片序号数组。"
+                try:
+                    if any(isinstance(index, bool) for index in raw_indices):
+                        raise ValueError("boolean index")
+                    indices = [int(_number(index, "image_indices", integer=True, minimum=1)) for index in raw_indices]
+                except (TypeError, ValueError):
+                    return None, "image_indices 必须只包含整数。"
+            elif raw_index not in (None, ""):
+                try:
+                    if isinstance(raw_index, bool):
+                        raise ValueError("boolean index")
+                    indices = [int(_number(raw_index, "image_index", integer=True, minimum=1))]
+                except (TypeError, ValueError):
+                    return None, "image_index 必须是从 1 开始的整数。"
+            else:
+                if len(images) > max_inputs:
+                    return None, f"当前消息有 {len(images)} 张图片，但工作流只有 {max_inputs} 个参考图输入；请用 image_index 或 image_indices 选择。"
+                indices = list(range(1, len(images) + 1))
 
+            if len(indices) > max_inputs:
+                return None, f"image_indices 不能超过工作流的 {max_inputs} 个参考图输入。"
+            if any(index < 1 or index > len(images) for index in indices):
+                return None, f"image_indices 超出范围；当前消息有 {len(images)} 张图片。"
+
+            paths: list[Path] = []
+            for index in indices:
+                try:
+                    paths.append(Path(await images[index - 1].convert_to_file_path()).resolve(strict=True))
+                except Exception as e:  # noqa: BLE001 - media resolver may raise adapter errors
+                    return None, f"无法读取第 {index} 张消息图片（{e}）。"
+            return paths, None
+
+        if kwargs.get("image_index") is not None or kwargs.get("image_indices") is not None:
+            return None, "当前消息及引用消息没有可读取图片，image_index/image_indices 无法选择；请使用 image_path/image_paths。"
         last = str((self.shared.get("last_image_paths") or {}).get(_event_scope(context)) or "")
-        if last:
-            path = Path(last)
-            if path.is_file():
-                return path, None
+        if last and Path(last).is_file():
+            return [Path(last)], None
         return None, "当前消息没有图片，且本会话没有可用的上次生成图片；请附图后重试。"
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         prompt = str(kwargs.get("prompt") or "").strip()
         if not prompt:
             return "编辑失败：prompt 不能为空。"
-        if not all((self.client, self.builder, self.store, self.output_dir, self.families)):
+        if not all((self.client, self.builder, self.store, self.output_dir)):
             return "编辑失败：插件未初始化完成。"
-        family_name = str(kwargs.get("model_family") or "").strip()
-        family = self.families.get(family_name)
-        if family is None or not family.edit_workflow:
-            return f"编辑失败：家族「{family_name}」未配置 edit_workflow；请先在模型家族配置中选择编辑工作流。"
+        workflows = self.edit_workflows
+        if workflows is None:
+            legacy = [
+                {"name": row.get("name"), "workflow": row.get("edit_workflow")}
+                for row in (self.families.list() if self.families else [])
+                if row.get("edit_workflow")
+            ]
+            workflows = EditWorkflowRegistry(raw=legacy)
+        route_name = str(
+            kwargs.get("edit_workflow") or kwargs.get("model_family") or ""
+        ).strip()
+        if not route_name:
+            available = workflows.names()
+            if len(available) == 1:
+                route_name = available[0]
+            elif len(available) > 1:
+                return "编辑失败：请从可用 edit_workflow 中选择一个编辑路由：" + "、".join(available)
+        edit_route = workflows.get(route_name)
+        if edit_route is None or not edit_route.workflow:
+            return f"编辑失败：编辑路由「{route_name or '(未指定)'}」没有可用工作流；请在 Workflow Studio 中绑定编辑工作流。"
         try:
-            wf = self.builder.load_template(family.edit_workflow)
+            wf = self.builder.load_template(edit_route.workflow)
         except (FileNotFoundError, ValueError) as e:
             return f"编辑失败：{e}"
-        profile = self.profiles.effective(family.edit_workflow, wf) if self.profiles else {"slots": detect_slots(wf), "drop_nodes": []}
+        profile = self.profiles.effective(edit_route.workflow, wf) if self.profiles else {"slots": detect_slots(wf), "drop_nodes": []}
         slots = profile.get("slots") or {}
-        image_node = wf.get(str((slots.get("source_image") or {}).get("node") or ""))
-        if not isinstance(image_node, dict) or image_node.get("class_type") != "LoadImage":
-            return f"编辑失败：工作流「{family.edit_workflow}」缺少有效的来源图片 LoadImage 槽位映射。"
-        if not slots.get("prompt"):
-            return f"编辑失败：工作流「{family.edit_workflow}」缺少提示词槽位映射。"
-
-        source_path, source_error = await self._source_path(context, kwargs)
-        if source_error:
-            return f"编辑失败：{source_error}"
         try:
-            if source_path.stat().st_size > 25 * 1024 * 1024:
-                return "编辑失败：来源图片超过 25 MiB。"
-            content = await asyncio.to_thread(source_path.read_bytes)
-        except OSError as e:
-            return f"编辑失败：读取来源图片失败（{e}）。"
-        suffixes = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
-        suffix = suffixes.get(image_media_type(content))
-        if not suffix:
-            return "编辑失败：来源文件需为 PNG、JPEG、WebP 或 GIF 图片。"
-        upload_name, upload_error = await self.client.upload_image(f"astrbot_edit_{uuid.uuid4().hex}{suffix}", content)
-        if upload_error or not upload_name:
-            return f"编辑失败：上传来源图片失败（{upload_error or 'ComfyUI 未返回文件名'}）。"
+            source_specs = source_image_slots(wf, slots)
+        except ValueError as e:
+            return f"编辑失败：{e}。"
+        if not source_specs:
+            return f"编辑失败：工作流「{edit_route.workflow}」缺少有效的来源图片 LoadImage 槽位映射。"
+        if not slots.get("prompt"):
+            return f"编辑失败：工作流「{edit_route.workflow}」缺少提示词槽位映射。"
+        size_node = wf.get(str((slots.get("size") or {}).get("node") or ""))
+        size_inputs = (size_node or {}).get("inputs") or {}
+        size_has_dimensions = (
+            isinstance(size_node, dict)
+            and "width" in size_inputs
+            and "height" in size_inputs
+        )
 
+        resolution = kwargs.get("resolution")
+        resolution_provided = resolution not in (None, "")
+        if resolution_provided:
+            if isinstance(resolution, bool):
+                return "编辑失败：resolution 必须是 0 到 8192 之间的整数。"
+            try:
+                resolution = _number(
+                    resolution, "resolution", integer=True, minimum=0, maximum=8192,
+                )
+            except ValueError as e:
+                return f"编辑失败：{e}。"
+        width, height = kwargs.get("width"), kwargs.get("height")
+        width_provided = width not in (None, "")
+        height_provided = height not in (None, "")
+        width = width if width_provided else None
+        height = height if height_provided else None
+        if width_provided:
+            if isinstance(width, bool):
+                return "编辑失败：width 必须是 64 到 8192 之间的整数。"
+            try:
+                width = _number(width, "width", integer=True, minimum=64, maximum=8192)
+            except ValueError as e:
+                return f"编辑失败：{e}。"
+        if height_provided:
+            if isinstance(height, bool):
+                return "编辑失败：height 必须是 64 到 8192 之间的整数。"
+            try:
+                height = _number(height, "height", integer=True, minimum=64, maximum=8192)
+            except ValueError as e:
+                return f"编辑失败：{e}。"
+        dimensions_provided = width_provided or height_provided
+        if resolution_provided and dimensions_provided:
+            return "编辑失败：resolution 与 width/height 是两种画布设置方式，请只选一种。"
+        if resolution_provided and not slots.get("resolution") and not size_has_dimensions:
+            return "编辑失败：此工作流尚未映射 resolution 输入或画面大小节点；请映射 resolution 或 EmptyLatentImage.width/height。"
+        if dimensions_provided and not size_has_dimensions:
+            return "编辑失败：此工作流尚未映射画面大小节点，无法写入 width/height。"
+        custom_size = kwargs.get("custom_size")
+        if custom_size is not None:
+            if not isinstance(custom_size, bool):
+                return "编辑失败：custom_size 必须是布尔值。"
+            if custom_size and not slots.get("custom_size"):
+                return "编辑失败：此工作流尚未映射 custom_size 开关；若只需指定 EmptyLatentImage 画布，请传 width/height。"
+        if dimensions_provided and custom_size is False:
+            return "编辑失败：填写 width/height 时请开启 custom_size 或省略该开关。"
+
+        source_paths, source_error = await self._source_paths(
+            context, kwargs, max_inputs=len(source_specs),
+        )
+        if source_error or not source_paths:
+            return f"编辑失败：{source_error or '没有可用的来源图片。'}"
+        contents: list[bytes] = []
+        for source_path in source_paths:
+            try:
+                if source_path.stat().st_size > 25 * 1024 * 1024:
+                    return "编辑失败：单张来源图片不能超过 25 MiB。"
+                contents.append(await asyncio.to_thread(source_path.read_bytes))
+            except OSError as e:
+                return f"编辑失败：读取来源图片失败（{e}）。"
+        suffixes = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
+        uploads: list[str] = []
+        for index, content in enumerate(contents, start=1):
+            suffix = suffixes.get(image_media_type(content))
+            if not suffix:
+                return "编辑失败：来源文件需为 PNG、JPEG、WebP 或 GIF 图片。"
+            uploads.append(f"astrbot_edit_{index}_{uuid.uuid4().hex}{suffix}")
+        if resolution_provided:
+            effective_resolution = resolution
+        elif dimensions_provided:
+            effective_resolution = 0
+        else:
+            effective_resolution = 0
+        canvas_dimensions = None
+        needs_canvas = dimensions_provided or (
+            resolution_provided and (custom_size is True or not slots.get("resolution"))
+        ) or not (slots.get("resolution") or slots.get("custom_size"))
+        if size_has_dimensions and needs_canvas:
+            source_dimensions = image_dimensions(contents[0])
+            if dimensions_provided:
+                try:
+                    canvas_dimensions = _custom_edit_canvas_dimensions(
+                        source_dimensions, width, height,
+                    )
+                except ValueError as e:
+                    return f"编辑失败：{e}。"
+            else:
+                if source_dimensions is None:
+                    return "编辑失败：无法读取来源图片宽高，不能按参考图比例设置画布。"
+                canvas_dimensions = _edit_canvas_dimensions(*source_dimensions, int(effective_resolution))
+        effective_custom_size = custom_size
+        if (
+            effective_custom_size is None and slots.get("custom_size")
+            and (dimensions_provided or (resolution_provided and not slots.get("resolution")))
+        ):
+            effective_custom_size = True
         seed = random.randint(0, 2**31 - 1) if slots.get("sampler") or slots.get("sampler_2") else None
+        apply_values = {"prompt": prompt, "seed": seed}
+        if slots.get("source_images"):
+            apply_values["source_images"] = uploads
+        else:
+            apply_values["source_image"] = uploads[0]
+        if slots.get("resolution"):
+            apply_values["resolution"] = effective_resolution
+        if canvas_dimensions is not None:
+            apply_values["width"], apply_values["height"] = canvas_dimensions
+        if slots.get("custom_size"):
+            apply_values["custom_size"] = (
+                effective_custom_size if effective_custom_size is not None else False
+            )
         try:
             apply_slots(
-                wf, slots, {"prompt": prompt, "source_image": upload_name, "seed": seed},
+                wf, slots, apply_values,
                 prefix=f"astrbot_edit_{uuid.uuid4().hex[:8]}",
                 drop_nodes=profile.get("drop_nodes") or [],
             )
         except (TypeError, ValueError) as e:
             return f"编辑失败：工作流节点映射无效（{e}）。"
+        for index, (filename, content) in enumerate(zip(uploads, contents)):
+            upload_name, upload_error = await self.client.upload_image(filename, content)
+            if upload_error or not upload_name:
+                return f"编辑失败：上传第 {index + 1} 张来源图片失败（{upload_error or 'ComfyUI 未返回文件名'}）。"
+            uploads[index] = upload_name
+        apply_slots(wf, slots, {"source_images": uploads})
         pid, submit_error = await self.client.submit_prompt_detail(wf)
         if submit_error or not pid:
             return f"编辑失败：{submit_error or '无法连接 ComfyUI'}"
@@ -2749,8 +3063,10 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
             return f"编辑完成，但保存图片失败（{e}）。"
         _remember_image_path(self.shared, context, local_path)
         self.store.save_history({
-            "prompt_id": pid, "entry": "edit", "family": family.name,
-            "workflow": family.edit_workflow, "prompt": prompt, "source_path": str(source_path),
+            "prompt_id": pid, "entry": "edit", "family": edit_route.name,
+            "edit_route": edit_route.name, "workflow": edit_route.workflow,
+            "prompt": prompt, "source_path": str(source_paths[0]),
+            "source_paths": [str(path) for path in source_paths],
             "filename": filename, "local_path": str(local_path),
         })
         try:
@@ -2759,7 +3075,13 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         except Exception as e:
             return f"图片已编辑但发送失败（{e}）。本地路径: {local_path}"
         seed_note = f"seed={seed} " if seed is not None else ""
-        return f"图片已编辑并发送。本地路径: {local_path}\n{seed_note}prompt_id={pid}"
+        image_note = ""
+        if len(source_specs) > 1:
+            image_note = (
+                f" 已填入 {len(uploads)}/{len(source_specs)} 个参考图输入；"
+                "其余输入沿用工作流默认值。"
+            )
+        return f"图片已编辑并发送。本地路径: {local_path}\n{seed_note}prompt_id={pid}.{image_note}"
 
 
 _RECIPE_DRAW_DESC = (
@@ -2816,7 +3138,7 @@ class ComfyuiRecipeDrawTool(FunctionTool[AstrAgentContext]):
             prop["description"] = "用户点名时从 enum 选择；省略用默认配方"
         else:
             prop.pop("enum", None)
-            prop["description"] = "当前没有配方，请先在配方工作台保存"
+            prop["description"] = "当前没有配方，请先在 Workflow Studio 静态配方页保存"
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         prompt = str(kwargs.get("prompt") or "").strip()
@@ -2830,7 +3152,7 @@ class ComfyuiRecipeDrawTool(FunctionTool[AstrAgentContext]):
         if recipe is None:
             if recipe_name:
                 return f"生成失败：配方「{recipe_name}」不存在。"
-            return "生成失败：还没有可用配方，请先在配方工作台保存一套。"
+            return "生成失败：还没有可用配方，请先在 Workflow Studio 静态配方页保存一套。"
 
         family = self.families.resolve_recipe(recipe)
         explicit_family = str(recipe.get("family") or "").strip()
@@ -2853,7 +3175,7 @@ class ComfyuiRecipeDrawTool(FunctionTool[AstrAgentContext]):
             if not legacy_workflow:
                 return (
                     f"生成失败：配方「{recipe.get('name')}」没有模型家族。"
-                    "请在配方工作台为它选择家族后重新保存。"
+                    "请在 Workflow Studio 静态配方页为它选择家族后重新保存。"
                 )
 
         seed = kwargs.get("seed")
@@ -2888,10 +3210,8 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
         "查询角色/画师规范词和已安装底模/LoRA。model/lora 指定 query 可跨家族按名称搜索；"
         "浏览清单时传与生图一致的 model_family，两个参数都省略时返回家族数量。"
         "绘图需要某种画风、角色、服饰或效果时，可主动查询匹配的 LoRA，用户无需点名 LoRA 或提供文件名。"
-        "character：支持中文角色名，先查本地名字索引和缓存，再返回规范角色 tag 与有来源的外观参考标签；"
-        "同名或部分匹配会给候选，请结合作品核对，不要默认采用第一项。外观标签可能含默认服饰；分列的眼色/发色候选按角色版本选用，可按用户需求调整。"
-        "artist：把触发词写进 prompt 或 artist。"
-        "model/lora：选择符合需求的结果，把实际文件名填进 comfyui_draw 的 model/lora。已知文件名可跨家族查询；LoRA 的用途/类别 query 支持 LoRA Manager/Civitai "
+        "character 支持中文名并返回有来源的外观参考；同名和颜色候选须核对版本。artist 触发词写进 artist。"
+        "model/lora：选择符合需求的结果，把实际文件名填进 comfyui_draw 的 model/lora。LoRA 的 query 支持 LoRA Manager/Civitai "
         "分类或标签，例如 style/character/concept/风格/角色；结果会带用途说明、推荐权重和触发词。"
         "选用 LoRA 时可同步传入已记录的触发词；查询未提供触发词时可省略该字段并继续使用 LoRA。"
         "查无结果时可换类别或用途关键词搜索，也可继续使用配方默认值。文件名和规范词以查询结果为准。"
@@ -2911,7 +3231,7 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
                 },
                 "limit": {
                     "type": "number",
-                    "description": "角色候选或 LoRA 最多返回几项（1-8，默认 5）",
+                    "description": "type=lora 时最多返回几项（1-8，默认 5）",
                 },
                 **_RESOURCE_QUERY_PROPERTIES,
             },
@@ -2993,3 +3313,16 @@ async def _wait_outputs(client: ComfyUIClient, prompt_id: str) -> tuple[dict | N
     if status.get("status_str") == "error":
         return None, execution_error_message(status, "执行出错（详见 ComfyUI 日志）")
     return entry.get("outputs", {}), None
+
+
+def _has_lora_input(kwargs: dict[str, Any]) -> bool:
+    value = _lora_input(kwargs)
+    return value is not None and value != ""
+
+
+def _lora_input(kwargs: dict[str, Any]) -> Any:
+    """Read canonical `lora` input and retain the older `loras` alias."""
+    value = kwargs.get("lora")
+    if value is not None and value != "":
+        return value
+    return kwargs.get("loras")

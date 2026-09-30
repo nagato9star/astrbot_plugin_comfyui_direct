@@ -98,7 +98,7 @@ export class WorkflowGraphEditor {
       { content: "适配画布", callback: () => this.fit() },
     ];
     this.keyHandler = (event) => {
-      if (!document.body.classList.contains("graph-mode")
+      if (this.element.offsetParent === null
           || event.target.closest?.("input, textarea, select, [contenteditable=true]")) return;
       if ((event.ctrlKey || event.metaKey) && ["z", "y"].includes(event.key.toLowerCase())) {
         event.preventDefault();
@@ -332,7 +332,7 @@ export class WorkflowGraphEditor {
           this.domWidgets.set(widget, entry);
         }
         const { element } = entry;
-        const visible = !node.flags?.collapsed && !widget.hidden && scale >= 0.3;
+        const visible = !node.flags?.collapsed && !widget.hidden && scale >= 0.2;
         element.hidden = !visible;
         if (!visible) continue;
         const [x, y] = this.canvas.ds.convertOffsetToCanvas([node.pos[0] + 10, node.pos[1] + widget.y + 4]);

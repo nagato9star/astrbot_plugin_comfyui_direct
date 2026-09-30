@@ -6,7 +6,7 @@ import copy
 import hashlib
 from typing import Any
 
-from slot_mapping import SLOT_CLASS_HINTS, SLOT_ROLES, node_options_for_slot, parse_node_option
+from slot_mapping import SLOT_ROLES, node_matches_slot, node_options_for_slot, parse_node_option
 
 
 _WORKFLOW_TEMPLATE_PREFIX = "local_workflow_"
@@ -42,14 +42,22 @@ def refresh_config_options(config: Any, builder: Any, store: Any) -> None:
     workflows = sorted({str(row.get("name") or "") for row in templates if row.get("name")})
     generation = _rows(config.get("model_families"))
     editing = _rows(config.get("edit_families"))
+    edit_workflows = _rows(config.get("edit_workflows"))
     mappings = _rows(config.get("workflow_node_mappings"))
     family_names = sorted({str(row.get("name") or "").strip() for row in generation if row.get("name")})
 
     family_items = schema["model_families"]["templates"]["family"]["items"]
     edit_items = schema["edit_families"]["templates"]["edit_family"]["items"]
+    edit_workflow_items = schema["edit_workflows"]["templates"]["edit_workflow"]["items"]
     mapping_items = schema["workflow_node_mappings"]["templates"]["mapping"]["items"]
     _select_options(family_items["workflow"], workflows, [r.get("workflow") for r in generation])
-    _select_options(edit_items["workflow"], workflows, [r.get("workflow") for r in editing])
+    _select_options(edit_items["workflow"], workflows, [r.get("workflow") for r in editing], optional=True)
+    _select_options(
+        edit_workflow_items["workflow"],
+        workflows,
+        [r.get("workflow") for r in edit_workflows],
+        optional=True,
+    )
     _select_options(mapping_items["workflow"], workflows, [r.get("workflow") for r in mappings])
 
     mapping_templates = schema["workflow_node_mappings"]["templates"]
@@ -67,14 +75,17 @@ def refresh_config_options(config: Any, builder: Any, store: Any) -> None:
             if role not in mapping_items:
                 continue
             item = copy.deepcopy(mapping_items[role])
+            if role == "source_images":
+                item["hint"] = str(item.get("hint") or "") + "；多个节点 ID 用逗号分隔，通常优先在 Workflow Studio 多选"
+                items[role] = item
+                continue
             selected = {
                 parse_node_option(row.get(role)) for row in mappings
                 if str(row.get("workflow") or "").strip() == name
             }
-            hints = set(SLOT_CLASS_HINTS.get(role) or ())
             candidate_ids = {
                 str(nid) for nid, node in workflow.items()
-                if isinstance(node, dict) and node.get("class_type") in hints
+                if node_matches_slot(node, role)
             }
             options = [""] + [
                 label for label in node_options_for_slot(workflow, role)[1:]

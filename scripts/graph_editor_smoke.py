@@ -107,6 +107,7 @@ def exported(page):
 
 
 def check_editor_interactions(page):
+    page.locator("#graph-expand").click()
     page.locator("#graph-fit").click()
     # Edit inside the node and restore it through both undo shortcuts.
     prompt = page.locator('.graph-node-textarea[data-node-id="2"]')
@@ -164,7 +165,7 @@ def check_editor_interactions(page):
     )
     snapshot = exported(page)
     before = page.evaluate(
-        "window.__calls.filter(x=>x.endpoint==='workflow/save').length"
+        "window.__calls.filter(x=>x.endpoint==='workflow/import').length"
     )
     page.once("dialog", lambda dialog: dialog.accept())
     page.locator("#graph-import").set_input_files(
@@ -175,7 +176,7 @@ def check_editor_interactions(page):
         }
     )
     page.wait_for_function(
-        "n=>window.__calls.filter(x=>x.endpoint==='workflow/save').length>n", arg=before
+        "n=>window.__calls.filter(x=>x.endpoint==='workflow/import').length>n", arg=before
     )
     assert exported(page)["workflow"]["5"]["inputs"]["steps"] == [str(source_id), 0]
     assert (
@@ -256,6 +257,7 @@ def check_dpr(page):
 
 
 def check_coordinates(page):
+    page.locator("#graph-expand").click()
     page.locator("#graph-fit").click()
     check_dpr(page)
     box = page.locator("#workflow-canvas").bounding_box()
@@ -352,6 +354,12 @@ def main() -> None:
                   },
                   apiPost: async (endpoint, body) => {
                     window.__calls.push({endpoint, body});
+                    if (endpoint === 'workflow/import') {
+                      const editor=document.querySelector('#workflow-canvas').workflowGraphEditor;
+                      const snapshot=await editor.exportWorkflowSnapshot();
+                      window.__saved={name:body.name,...snapshot,ui_workflow:body.workflow};
+                      return {ok:true,name:body.name};
+                    }
                     if (endpoint === 'workflow/detect') return {ok:true, values:{}, slots:{}};
                     if (endpoint === 'workflow/save') { window.__saved = body; return {ok:true, name:body.name, workflow:body.workflow, ui_workflow:body.ui_workflow, profile_slots:{}, detected_slots:{}, slot_options:{}}; }
                     if (endpoint === 'workflow/run') return {ok:true, prompt_id:'test-prompt-id'};
@@ -439,9 +447,9 @@ def main() -> None:
                 node["pos"] for node in moved["ui_workflow"]["nodes"] if node["id"] == 2
             )
             assert moved_pos != original_pos, (original_pos, moved_pos)
-            page.locator("#btn-mode-recipe").click()
+            page.locator("#tab-recipe").click()
             page.locator("#wf-list li").first.click()
-            page.locator("#btn-mode-graph").click()
+            page.locator("#tab-workflow").click()
             page.locator("#graph-save").click()
             page.wait_for_function(
                 "window.__calls.filter(x => x.endpoint === 'workflow/save').length === 3"
@@ -506,11 +514,9 @@ def main() -> None:
                 }
             )
             page.wait_for_function(
-                "window.__calls.filter(x => x.endpoint === 'workflow/save').length === 5"
+                "window.__calls.some(x => x.endpoint === 'workflow/import')"
             )
-            imported = page.evaluate(
-                "window.__calls.filter(x => x.endpoint === 'workflow/save').at(-1).body"
-            )
+            imported = page.evaluate("window.__saved")
             assert imported["workflow"]["5"]["inputs"]["positive"] == ["3", 0]
             assert imported["workflow"]["7"]["inputs"]["lora_3"]["on"] is False
             check_editor_interactions(page)

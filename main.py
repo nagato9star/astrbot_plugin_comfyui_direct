@@ -49,83 +49,47 @@ for _pkg_prefix in ("", "astrbot_plugin_comfyui_direct."):
         "image_cache",
         "resource_catalog",
         "config_options",
+        "character_tags",
+        "generation_support",
+        "execution_events",
         "animadex",
         "api_to_ui",
     ):
         _sys.modules.pop(_pkg_prefix + _m, None)
 
-try:
-    from astrbot_plugin_comfyui_direct.animadex import AnimaDexClient
-    from astrbot_plugin_comfyui_direct.comfy_client import ComfyUIClient
-    from astrbot_plugin_comfyui_direct.config_options import refresh_config_options
-    from astrbot_plugin_comfyui_direct.external_search import (
-        CivitaiClient,
-        DanbooruClient,
-        GelbooruClient,
-    )
-    from astrbot_plugin_comfyui_direct.tools import (
-        ComfyuiAnimadexTool,
-        ComfyuiBooruTool,
-        ComfyuiCivitaiSearchTool,
-        ComfyuiFetchOutputsTool,
-        ComfyuiFreeMemoryTool,
-        ComfyuiGenerateTool,
-        ComfyuiInterruptTool,
-        ComfyuiJobTool,
-        ComfyuiListModelsTool,
-        ComfyuiModelInfoTool,
-        ComfyuiModelsSearchTool,
-        ComfyuiNodesTool,
-        ComfyuiQueueTool,
-        ComfyuiRecipeTool,
-        ComfyuiRecipeDrawTool,
-        ComfyuiRunWorkflowTool,
-        ComfyuiSystemStatsTool,
-        ComfyuiUploadFileTool,
-        ComfyuiValidateWorkflowTool,
-        ComfyuiDrawTool,
-        ComfyuiEditTool,
-        ComfyuiLookupTool,
-    )
-    from astrbot_plugin_comfyui_direct.workflow_builder import WorkflowBuilder
-    from astrbot_plugin_comfyui_direct.model_families import (
-        EditWorkflowRegistry,
-        ModelFamilyRegistry,
-        WorkflowProfileStore,
-    )
-    from astrbot_plugin_comfyui_direct.recipe_store import RecipeStore
-except ImportError:
-    from animadex import AnimaDexClient
-    from comfy_client import ComfyUIClient
-    from config_options import refresh_config_options
-    from external_search import CivitaiClient, DanbooruClient, GelbooruClient
-    from tools import (
-        ComfyuiAnimadexTool,
-        ComfyuiBooruTool,
-        ComfyuiCivitaiSearchTool,
-        ComfyuiFetchOutputsTool,
-        ComfyuiFreeMemoryTool,
-        ComfyuiGenerateTool,
-        ComfyuiInterruptTool,
-        ComfyuiJobTool,
-        ComfyuiListModelsTool,
-        ComfyuiModelInfoTool,
-        ComfyuiModelsSearchTool,
-        ComfyuiNodesTool,
-        ComfyuiQueueTool,
-        ComfyuiRecipeTool,
-        ComfyuiRecipeDrawTool,
-        ComfyuiRunWorkflowTool,
-        ComfyuiSystemStatsTool,
-        ComfyuiUploadFileTool,
-        ComfyuiValidateWorkflowTool,
-        ComfyuiDrawTool,
-        ComfyuiEditTool,
-        ComfyuiLookupTool,
-    )
-    from workflow_builder import WorkflowBuilder
-    from model_families import EditWorkflowRegistry, ModelFamilyRegistry, WorkflowProfileStore
-    from recipe_store import RecipeStore
+from character_tags import CharacterTagLookup  # noqa: E402
+from animadex import AnimaDexClient  # noqa: E402
+from comfy_client import ComfyUIClient  # noqa: E402
+from config_options import refresh_config_options  # noqa: E402
+from external_search import CivitaiClient, DanbooruClient, GelbooruClient  # noqa: E402
+from tools import (  # noqa: E402
+    ComfyuiAnimadexTool,
+    ComfyuiBooruTool,
+    ComfyuiCivitaiSearchTool,
+    ComfyuiFetchOutputsTool,
+    ComfyuiFreeMemoryTool,
+    ComfyuiGenerateTool,
+    ComfyuiInterruptTool,
+    ComfyuiJobTool,
+    ComfyuiListModelsTool,
+    ComfyuiModelInfoTool,
+    ComfyuiModelsSearchTool,
+    ComfyuiNodesTool,
+    ComfyuiQueueTool,
+    ComfyuiRecipeTool,
+    ComfyuiRecipeDrawTool,
+    ComfyuiRunWorkflowTool,
+    ComfyuiSystemStatsTool,
+    ComfyuiUploadFileTool,
+    ComfyuiValidateWorkflowTool,
+    ComfyuiDrawTool,
+    ComfyuiEditTool,
+    ComfyuiLookupTool,
+)
+from workflow_builder import WorkflowBuilder  # noqa: E402
+from model_families import EditWorkflowRegistry, ModelFamilyRegistry, WorkflowProfileStore  # noqa: E402
+from recipe_store import RecipeStore  # noqa: E402
+
 
 from image_cache import manage_cache  # noqa: E402
 
@@ -279,6 +243,8 @@ class ComfyUIDirectPlugin(Star):
             cache_file=data_dir / "comfyui_models.json",
             cache_ttl=ttl,
             lora_manager_enabled=lora_manager_enabled,
+            request_timeout=float(cfg.get("comfyui_request_timeout") or 15),
+            events_enabled=bool(cfg.get("comfyui_events_enabled", True)),
         )
         self._client.resource_family_rules = cfg.get("resource_family_rules") or []
         self._civitai = CivitaiClient(api_key=civitai_key)
@@ -308,6 +274,16 @@ class ComfyUIDirectPlugin(Star):
             timeout=float(cfg.get("animadex_timeout") or 8.0),
         )
 
+        self._character_lookup = CharacterTagLookup(
+            data_dir, danbooru=self._danbooru,
+            enabled=bool(cfg.get("character_names_enabled", True)),
+            names_file=str(cfg.get("character_names_file") or ""),
+            aliases=cfg.get("character_aliases") or [],
+            reference_url=str(cfg.get("character_reference_url", "https://animadex.net")),
+            timeout=float(cfg.get("character_lookup_timeout") or 6.0),
+            cache_hours=float(cfg.get("character_cache_hours") or 168.0),
+        )
+
         self._draw_tool = ComfyuiDrawTool(
             client=self._client,
             builder=self._builder,
@@ -316,6 +292,7 @@ class ComfyUIDirectPlugin(Star):
             shared=shared,
             families=self._families,
             profiles=self._profiles,
+            auto_trigger_words=bool(cfg.get("auto_lora_trigger_words", False)),
         )
         self._draw_tool.refresh_schema()
         self._edit_tool = ComfyuiEditTool(
@@ -343,6 +320,7 @@ class ComfyUIDirectPlugin(Star):
             gelbooru=self._gelbooru,
             animadex=self._animadex,
             client=self._client,
+            character_lookup=self._character_lookup,
         )
 
         recipe_tool = ComfyuiRecipeTool(
@@ -369,6 +347,7 @@ class ComfyUIDirectPlugin(Star):
                 store=self._store,
                 families=self._families,
                 profiles=self._profiles,
+                auto_trigger_words=bool(cfg.get("auto_lora_trigger_words", False)),
             ),
             ComfyuiInterruptTool(client=self._client, shared=shared),
             ComfyuiQueueTool(client=self._client),
@@ -415,13 +394,15 @@ class ComfyUIDirectPlugin(Star):
                 self._profiles,
                 config_defaults=defaults,
                 plugin_config=config,
+                auto_trigger_words=bool(cfg.get("auto_lora_trigger_words", False)),
                 edit_workflows=self._edit_workflows,
             )
         except Exception as e:
             logger.error(f"[ComfyUIDirect] WebUI 接口注册失败: {e}")
 
         try:
-            asyncio.create_task(self._client.warm_up_cache())
+            self._client.start_events()
+            self._client.start_warmup()
         except Exception as e:
             logger.warning(f"[ComfyUIDirect] 启动预热失败: {e}")
 
@@ -544,6 +525,7 @@ class ComfyUIDirectPlugin(Star):
             with suppress(asyncio.CancelledError):
                 await self._cache_task
         await self._client.close()
+        await self._character_lookup.close()
         await self._danbooru.close()
         await self._gelbooru.close()
         await self._civitai.close()

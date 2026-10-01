@@ -229,3 +229,37 @@ AstrBot Dashboard → 插件页 → **Workflow Studio**，分为工作流与静�
 ## 📄 License
 
 [MIT](LICENSE) © 2026 长门九曜
+
+
+### 中文角色名 → 角色 tag 与外观参考
+
+```python
+comfyui_lookup(type="character", query="初音未来")
+comfyui_lookup(type="character", query="伊蕾娜")
+comfyui_lookup(type="character", query="elysia_(honkai_impact)")
+```
+
+角色查询先使用本地名字索引和配置别名定位规范 tag，再对唯一精确匹配查询 [AnimaDex](https://github.com/zetaneko/AnimaDex) 的结构化角色样例标签。不需要额外 MCP 服务，不拉取图片或帖子样本，不调用 LLM 翻译名字。同名、不同版本或部分匹配返回候选；眼色和发色有多个参考值时分列候选，按版本选用。
+
+首次查询下载约 1 MB 的名字 JSON，来自 [Jannchie/danbooru-tag-index](https://github.com/Jannchie/danbooru-tag-index) 的 Wiki 别名选取、人工校订与错误译名排除列表。名字选取包含 LLM 辅助，覆盖有限，不能当作完整官方角色名库。网络兜底使用 Danbooru 角色 tag / Wiki 别名元数据；外观参考来自 AnimaDex 样例，可能含默认服饰。所有结果标明来源。
+
+- `character_aliases`：可编辑别名到规范 tag 的映射，支持填写自定义外观 tag；同名可配置多行，配置优先于社区索引。
+- `character_names_file`：可指定本地 JSON 替代下载。支持 `{"hatsune_miku":{"zh_hans":"初音未来","ja":"初音ミク"}}`，或 `[{"tag":"hatsune_miku","names":["初音未来"],"appearance_tags":["aqua_hair","twintails"]}]`。
+- `character_reference_url`：默认 `https://animadex.net`，可换成本地 AnimaDex Web 服务；留空关闭外观联网查询。
+- `character_cache_hours`：默认 168 小时，名字与外观缓存保存在插件数据目录的 `character_tags.json`；重启后可复用。
+- `character_lookup_timeout`：默认每阶段 6 秒；缓存命中不等待网络。缺少名字时仍可查询英文 tag，缺少外观来源时保留角色 tag。
+
+离线回归：`python scripts/character_lookup_test.py`，覆盖同名候选、错误译名排除、外观角色一致性、配置覆盖、并发请求复用、重启缓存和免帖子取样。
+
+
+### 生图任务等待与资源准备
+
+- `comfyui_timeout` 是任务等待上限；`comfyui_request_timeout` 单独控制 HTTP 请求超时，默认 15 秒。连接建立失败可重试提交，提交响应超时会保留“可能已提交”的提示，避免重复排队。
+- `comfyui_events_enabled` 默认开启，通过一个可重连的 WebSocket 接收完成、错误和进度事件；HTTP 历史是结果依据，事件连接失效时继续轮询。等待超时会返回任务 ID，WebUI 可点「继续等待」，复用原任务。
+- 生图准备使用单次资源快照，共用节点定义缓存。全量 LoRA Manager 分类目录在后台同步；选中的 LoRA 按需读取元数据，查询完整资源信息时才等待全量补全。
+- 同一个 WebUI 结果的重复／并发查询复用本地原图，生成历史只写一次；结果缓存保存文件路径，不长期保留 base64 图片。
+- `auto_lora_trigger_words` 默认关闭，Bot 和 WebUI 规则一致。启用后只补全未显式设置且已映射的触发词槽位；显式留空保留，训练词频与数据集标签推测不会自动注入。
+
+回归验证：`python scripts/generation_pipeline_test.py`，覆盖提交重试、请求与等待期限、执行事件及断线回退、并发结果查询、资源准备、各生图入口的触发词优先级。
+
+画布支持屏幕像素比例适配、节点内多行文本、Ctrl+Z / Ctrl+Y 编辑历史、完整节点搜索、可收起侧栏，以及保存重开时保留参数、布局和视角。

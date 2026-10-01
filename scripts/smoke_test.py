@@ -564,6 +564,9 @@ def test_family_and_recipe_generation_paths() -> None:
         def __init__(self):
             self.submitted = []
 
+        async def generation_resources(self):
+            return (await self.list_resources())[0]
+
         async def list_resources(self):
             return (
                 {
@@ -2144,6 +2147,9 @@ def test_resource_family_queries() -> None:
         resource_family_rules = []
         def __init__(self):
             pass
+        async def generation_resources(self):
+            return (await self.list_resources())[0]
+
         async def list_resources(self, **kwargs):
             return resources, False
         async def list_models_folder(self, folder):

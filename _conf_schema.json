@@ -33,7 +33,7 @@
       "max": 3600,
       "step": 60
     },
-    "hint": "模型/LoRA 清单缓存刷新间隔（秒）。0 表示每次查询都强制同步（ComfyUI 端会多一次请求）；装了 LoRA Manager 时分类标签随缓存一并刷新。"
+    "hint": "资源清单刷新间隔（秒），0 表示每次刷新。生图复用单次请求快照；LoRA 元数据在后台补全，选中的文件按需查询。"
   },
   "lora_manager_enabled": {
     "type": "bool",
@@ -624,5 +624,81 @@
       }
     },
     "default": []
+  },
+  "comfyui_request_timeout": {
+    "type": "float",
+    "default": 15.0,
+    "description": "网络请求超时（秒）",
+    "hint": "与上方任务等待上限分开。历史、资源和图片请求会遵守此超时，等待超时后保留任务 ID，便于继续查询。"
+  },
+  "comfyui_events_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "使用 ComfyUI 执行事件",
+    "hint": "通过 WebSocket 接收进度、完成和错误事件；连接断开时自动重连，并保留 HTTP 历史轮询回退。"
+  },
+  "auto_lora_trigger_words": {
+    "type": "bool",
+    "default": false,
+    "description": "自动使用已记录的 LoRA 触发词",
+    "hint": "默认关闭，Bot 与 WebUI 一致。启用后仅补全未显式设置的触发词，写入已映射的触发词槽位；显式留空可关闭本次补全。训练词频和数据集标签猜测不会自动写入。"
+  },
+  "character_names_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "启用中文角色名字索引",
+    "hint": "首次角色查询下载约 1 MB 的名字 JSON，保存在插件数据目录。名称来自 Jannchie/danbooru-tag-index 的 Wiki 别名选取及人工校订；缓存有效期内离线查询。关闭后仍可用配置别名和已缓存数据。"
+  },
+  "character_names_file": {
+    "type": "string",
+    "default": "",
+    "description": "本地角色名字库 JSON（可选）",
+    "hint": "填写文件路径后优先使用该文件，跳过名字库下载。支持规范 tag 到语言名字对象的映射，或 [{tag,names,appearance_tags}] 列表；文件修改后下次查询自动重新读取。"
+  },
+  "character_aliases": {
+    "type": "template_list",
+    "default": [],
+    "description": "手动角色别名与外观标签",
+    "hint": "添加已核实的中文名到规范角色 tag 的映射。同名角色可添加多行，查询时会返回候选。配置优先，便于纠正社区数据。",
+    "templates": {
+      "character": {
+        "name": "角色别名",
+        "items": {
+          "name": {
+            "type": "string",
+            "description": "中文名或其他别名",
+            "default": ""
+          },
+          "tag": {
+            "type": "string",
+            "description": "规范角色 tag，如 hatsune_miku",
+            "default": ""
+          },
+          "appearance_tags": {
+            "type": "string",
+            "description": "外观 tag（可选，逗号分隔）",
+            "default": ""
+          }
+        }
+      }
+    }
+  },
+  "character_reference_url": {
+    "type": "string",
+    "default": "https://animadex.net",
+    "description": "AnimaDex 外观参考 HTTP 地址",
+    "hint": "规范 tag 定位后查询结构化外观标签。可改成本地 AnimaDex Web 服务地址；留空关闭外观在线查询。与 animadex_mcp_url 分开，不需要额外 MCP 服务。"
+  },
+  "character_lookup_timeout": {
+    "type": "float",
+    "default": 6.0,
+    "description": "角色查询每阶段超时（秒）",
+    "hint": "名字库下载、在线名称兜底、外观参考查询各自有总超时，防止多个镜像逐个长时间等待。缓存命中时不联网。"
+  },
+  "character_cache_hours": {
+    "type": "float",
+    "default": 168.0,
+    "description": "名字索引与角色参考缓存有效期（小时）",
+    "hint": "默认 7 天。过期下载失败时保留旧名字索引；外观只对唯一精确匹配查询并缓存，同名候选不自动合并。"
   }
 }

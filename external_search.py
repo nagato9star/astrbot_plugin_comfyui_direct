@@ -121,7 +121,7 @@ class DanbooruClient:
             return None
         posts = await self._get(
             "/posts.json", {"tags": f"artist:{artist['name']}", "limit": limit}
-        )
+        ) if limit > 0 else []
         return {
             "artist": artist["name"],
             "aliases": artist.get("other_names") or [],
@@ -136,13 +136,35 @@ class DanbooruClient:
             return None
         posts = await self._get(
             "/posts.json", {"tags": f"character:{tag['name']}", "limit": limit}
-        )
+        ) if limit > 0 else []
         return {
             "character": tag["name"],
             "aliases": tag.get("aliases") or [],
             "posts": posts or [],
             "url": f"{self.base_urls[0]}/tags/{tag.get('id', '')}",
         }
+
+    async def character_candidates(self, query: str, limit: int = 5) -> list[dict]:
+        """Lookup canonical character tags/real wiki aliases without post sampling."""
+        q = "_".join(query.strip().split()).replace("*", "")
+        data = await self._get("/tags.json", {
+            "search[name_matches]": f"*{q}*", "search[category]": 4,
+            "search[order]": "count", "limit": limit,
+        })
+        if isinstance(data, list):
+            candidates = [{"tag": row["name"], "names": [], "source": "Danbooru 角色 tag"}
+                          for row in data if isinstance(row, dict) and row.get("name") and str(row.get("category")) == "4"]
+            if candidates:
+                return candidates
+        # Danbooru puts Japanese/Chinese names on wiki pages, not on Tag.aliases.
+        data = await self._get("/wiki_pages.json", {
+            "search[other_names_match]": q, "search[tag][category]": 4,
+            "limit": limit, "only": "title,other_names",
+        })
+        if not isinstance(data, list):
+            return []
+        return [{"tag": row["title"], "names": row.get("other_names") or [], "source": "Danbooru Wiki 别名"}
+                for row in data if isinstance(row, dict) and row.get("title")]
 
     @staticmethod
     def aggregate_tags(posts: list[dict], top: int = 15) -> list[tuple[str, int]]:

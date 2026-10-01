@@ -450,7 +450,7 @@ def _clean_defaults(raw: dict) -> dict:
         if key not in raw:
             continue
         val = raw[key]
-        if val in (None, ""):
+        if val in (None, "") and not (key == "trigger_words" and val == ""):
             continue
         if val == [] and key != "loras":
             continue
@@ -467,7 +467,7 @@ def materialize_values(recipe: dict, overrides: dict[str, Any]) -> dict[str, Any
     values = dict(recipe.get("defaults") or {})
     values.pop("seed", None)
     for key, val in overrides.items():
-        if val is None or val == "":
+        if val is None or (val == "" and key != "trigger_words"):
             continue
         values[key] = val
     return values

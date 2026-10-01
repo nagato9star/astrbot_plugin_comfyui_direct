@@ -18,7 +18,6 @@ import asyncio
 import json
 import math
 import random
-import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -31,6 +30,8 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
+from character_tags import CharacterTagLookup, format_character_result
+from generation_support import fill_trigger_words
 from animadex import AnimaDexClient
 from comfy_client import ComfyUIClient, execution_error_message, image_dimensions, image_media_type
 from image_cache import save_image
@@ -51,7 +52,6 @@ from recipe_store import (
 from slot_mapping import (
     ANIMA_DROP_NODES,
     apply_slots,
-    collect_trigger_words,
     detect_slots,
     looks_like_anima,
     parse_lora,
@@ -597,6 +597,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
     builder: WorkflowBuilder | None = None
     output_dir: Path | None = None
     shared: dict = Field(default_factory=dict)  # 跨工具共享状态（如 last_prompt_id）
+    auto_trigger_words: bool = False
     defaults: dict = Field(default_factory=dict)  # 插件配置里的生成默认值（LLM 不传时使用）
     store: RecipeStore | None = None  # 配方存储（统一用 RecipeStore）
     families: ModelFamilyRegistry | None = None
@@ -630,7 +631,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
             flat[k] = v
         if "negative" in flat and "negative_prompt" not in flat:
             flat["negative_prompt"] = flat.pop("negative")
-        if loras:
+        if loras is not None:
             flat["lora"] = json.dumps(loras, ensure_ascii=False)
         return flat
 
@@ -641,34 +642,17 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
         return self.store.get(name) if name else self.store.default()
 
     async def _wait_outputs(self, prompt_id: str) -> tuple[dict | None, str | None]:
-        """轮询执行结果，返回 (outputs, 错误信息)。执行失败/超时返回错误信息。
+        return await _wait_outputs(self.client, prompt_id)
 
-        ZeroTier 抽风时单次 GET 可能失败（内部已自动重试），连续失败累计
-        超过阈值打警告提示链路不稳，但不中断轮询。
-        """
-        deadline = time.time() + self.client.timeout
-        miss = 0
-        while time.time() < deadline:
-            entry = await self.client.get_history_entry(prompt_id)
-            if entry is not None:
-                miss = 0
-                st = entry.get("status") or {}
-                if st.get("status_str") == "error":
-                    return None, execution_error_message(
-                        st, "执行出错（详见 ComfyUI 日志）"
-                    )
-                return entry.get("outputs", {}), None
-            miss += 1
-            if miss == 5:
-                logger.warning(
-                    f"[ComfyUIDirect] 轮询 {prompt_id} 连续 {miss} 次无响应"
-                    f"（ZeroTier 链路抖动?），继续等待不中断"
-                )
-            await asyncio.sleep(2)
-        logger.error(f"[ComfyUIDirect] 生成超时 ({int(self.client.timeout)}s)")
-        return None, f"生成超时（{int(self.client.timeout)}s）"
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        prepared_resources = None
+        async def resources_for_request():
+            nonlocal prepared_resources
+            if prepared_resources is None:
+                prepared_resources = await self.client.generation_resources()
+            return prepared_resources
+
         prompt = str(kwargs.get("prompt") or "").strip()
         if not prompt:
             return "生成失败：prompt（主提示词）不能为空。"
@@ -716,7 +700,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
             model_val = pick("model")
             if model_val and self.client is not None:
                 try:
-                    resources, _ = await self.client.list_resources()
+                    resources = await resources_for_request()
                     hits = _match_resource(resources.get("unet_name") or [], str(model_val))
                 except Exception:
                     hits = []
@@ -797,7 +781,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                     else None
                 )
                 if family_entry is not None and (values.get("model") or values.get("loras")):
-                    resources, _ = await self.client.list_resources()
+                    resources = await resources_for_request()
                     error = selection_error(resources, values, family_entry.name,
                                             getattr(self.client, "resource_family_rules", []))
                     if error:
@@ -813,6 +797,12 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                 else:
                     recipe_slots = recipe_data.get("slots") or {}
                     recipe_drop_nodes = list(recipe_data.get("drop_nodes") or [])
+                if self.auto_trigger_words and recipe_slots.get("trigger_words"):
+                    trigger_resources = await resources_for_request()
+                    names = [str(item.get("name")) for item in parse_lora(values.get("loras")) if item.get("name")]
+                    if names:
+                        trigger_resources = await self.client.selected_lora_metadata(trigger_resources, names, require_trusted=True)
+                    values = fill_trigger_words(values, trigger_resources, True)
                 apply_slots(
                     wf,
                     recipe_slots,
@@ -844,7 +834,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
                     kwargs.get("workflow") or self.builder.default_workflow
                 ) if self.families is not None else None
                 if family_entry is not None and (pick("model") or lora_val):
-                    resources, _ = await self.client.list_resources()
+                    resources = await resources_for_request()
                     error = selection_error(resources,
                                             {"model": pick("model"), "loras": parse_lora(lora_val)},
                                             family_entry.name, getattr(self.client, "resource_family_rules", []))
@@ -867,7 +857,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
 
         outputs, wait_err = await self._wait_outputs(pid)
         if wait_err:
-            return f"生成失败：{wait_err}"
+            return wait_err if wait_err.startswith(("等待超时", "等待中断")) else f"生成失败：{wait_err}"
         if outputs is None:
             return "生成失败：未获取到执行结果。"
 
@@ -1520,9 +1510,10 @@ class ComfyuiRunWorkflowTool(FunctionTool[AstrAgentContext]):
             return f"工作流已提交，prompt_id: {pid}（可稍后用 comfyui_job 查状态）"
 
         # 轮询
-        deadline = time.time() + self.client.timeout
-        while time.time() < deadline:
-            entry = await self.client.get_history_entry(pid)
+        while True:
+            entry, wait_error = await self.client.wait_for_history(pid)
+            if wait_error:
+                return wait_error
             if entry is not None:
                 st = entry.get("status") or {}
                 if st.get("status_str") == "error":
@@ -1609,9 +1600,10 @@ class ComfyuiJobTool(FunctionTool[AstrAgentContext]):
             return "已请求取消任务 " + pid + "。" if ok else "取消失败：无法连接 ComfyUI。"
 
         if action == "wait":
-            deadline = time.time() + self.client.timeout
-            while time.time() < deadline:
-                entry = await self.client.get_history_entry(pid)
+            while True:
+                entry, wait_error = await self.client.wait_for_history(pid)
+                if wait_error:
+                    return wait_error
                 if entry is not None:
                     st = entry.get("status") or {}
                     if st.get("status_str") == "error":
@@ -2300,6 +2292,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
     store: RecipeStore | None = None
     output_dir: Path | None = None
     shared: dict = Field(default_factory=dict)
+    auto_trigger_words: bool = False
     families: ModelFamilyRegistry | None = None
     profiles: WorkflowProfileStore | None = None
     on_schema_change: Any = None
@@ -2320,8 +2313,8 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
     async def _resource_lists(self) -> dict:
         if self.client is None:
             return {"unet_name": [], "lora_name": []}
-        resources, _ = await self.client.list_resources()
-        return resources
+        return await self.client.generation_resources()
+
 
     def _family_candidates(self, resources, kind, query, family):
         names = resources.get("lora_name" if kind == "lora" else "unet_name") or []
@@ -2338,8 +2331,8 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             )]
         return filter_family(names, meta, family, rules, kind)
 
-    async def _resolve_model(self, query: str, family: str = "") -> tuple[str | None, str | None]:
-        resources = await self._resource_lists()
+    async def _resolve_model(self, query: str, family: str = "", resources: dict | None = None) -> tuple[str | None, str | None]:
+        resources = resources if resources is not None else await self._resource_lists()
         names = self._family_candidates(resources, "model", query, family)
         hits = _match_resource(names, query)
         if len(hits) == 1:
@@ -2348,8 +2341,9 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             return None, f"家族 {family} 中未找到可用底模「{query}」。请用 comfyui_lookup(type=model, model_family=家族) 查询；未知资源需核实后填写完整文件名。"
         return None, f"底模名称有歧义：{'、'.join(hits[:6])}。请填写含目录的完整文件名。"
 
-    async def _resolve_loras(self, raw: Any, family: str = "") -> tuple[list[dict] | None, str | None]:
-        resources = await self._resource_lists()
+
+    async def _resolve_loras(self, raw: Any, family: str = "", resources: dict | None = None) -> tuple[list[dict] | None, str | None]:
+        resources = resources if resources is not None else await self._resource_lists()
         metadata = resources.get("lora_meta") or {}
         try:
             parsed = parse_lora(raw)
@@ -2387,6 +2381,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         legacy_workflow: str = "",
         legacy_slots: dict | None = None,
         legacy_drop_nodes: list[str] | None = None,
+        resources: dict | None = None,
     ) -> str:
         """执行一条已解析的家族或旧配方生成任务。"""
         if (
@@ -2397,8 +2392,14 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         ):
             return "生成失败：插件未初始化完成。"
 
+        if values.get("model") or values.get("loras"):
+            resources = resources if resources is not None else await self._resource_lists()
+            selected = [str(item.get("name")) for item in parse_lora(values.get("loras")) if item.get("name")]
+            if selected:
+                resources = await self.client.selected_lora_metadata(resources, selected, require_trusted=self.auto_trigger_words and values.get("trigger_words") is None)
+        resources = resources or {}
         if family is not None and (values.get("model") or values.get("loras")):
-            error = selection_error(await self._resource_lists(), values, family.name,
+            error = selection_error(resources, values, family.name,
                                     getattr(self.client, "resource_family_rules", []))
             if error:
                 return error
@@ -2450,6 +2451,9 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         if seed is None:
             seed = random.randint(0, 2**31 - 1)
         values = dict(values)
+        if "trigger_words" in (recipe or {}).get("defaults", {}):
+            values.setdefault("trigger_words", recipe["defaults"]["trigger_words"])
+        values = fill_trigger_words(values, resources, self.auto_trigger_words and bool(slots.get("trigger_words")))
         values["prompt"] = prompt
         values["seed"] = seed
         try:
@@ -2485,7 +2489,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
 
         outputs, wait_err = await _wait_outputs(self.client, pid)
         if wait_err:
-            return f"生成失败：{wait_err}"
+            return wait_err if wait_err.startswith(("等待超时", "等待中断")) else f"生成失败：{wait_err}"
         if outputs is None:
             return "生成失败：未获取到执行结果。"
 
@@ -2513,7 +2517,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
 
         actual = read_current_values(wf, slots)
         used = dict(actual)
-        used.update({k: v for k, v in values.items() if v is not None and v != ""})
+        used.update({k: v for k, v in values.items() if v is not None and (v != "" or k == "trigger_words")})
         used["prompt"] = prompt
         used["seed"] = seed
         family_name = family.name if family is not None else str((recipe or {}).get("family") or "")
@@ -2532,7 +2536,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                     k: v
                     for k, v in used.items()
                     if k != "prompt"
-                    and v not in (None, "")
+                    and v is not None and (v != "" or k == "trigger_words")
                     and (v != [] or k == "loras")
                 },
                 "filename": filename,
@@ -2549,7 +2553,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                     k: v
                     for k, v in used.items()
                     if k not in {"prompt", "seed"}
-                    and v not in (None, "")
+                    and v is not None and (v != "" or k == "trigger_words")
                     and (v != [] or k == "loras")
                 }
                 try:
@@ -2597,8 +2601,9 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             "seed": kwargs.get("seed"),
         }
         model_raw = str(kwargs.get("model") or "").strip()
+        resources = await self._resource_lists() if model_raw or _has_lora_input(kwargs) else None
         if model_raw:
-            resolved_model, err = await self._resolve_model(model_raw, family.name)
+            resolved_model, err = await self._resolve_model(model_raw, family.name, resources)
             if err:
                 return err
             values["model"] = resolved_model
@@ -2612,7 +2617,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
                 if kwargs.get("lora") not in (None, "")
                 else kwargs.get("loras")
             )
-            resolved_loras, err = await self._resolve_loras(raw_loras, family.name)
+            resolved_loras, err = await self._resolve_loras(raw_loras, family.name, resources)
             if err:
                 return err
             values["loras"] = resolved_loras
@@ -2636,6 +2641,8 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             if kwargs.get(source) not in (None, ""):
                 values[target] = kwargs[source]
 
+        if "trigger_words" in kwargs and kwargs["trigger_words"] is not None:
+            values["trigger_words"] = kwargs["trigger_words"]
         return await self._execute(
             context,
             prompt=prompt,
@@ -2643,6 +2650,7 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
             family=family,
             size_token=str(kwargs.get("size") or "").strip(),
             save_as=str(kwargs.get("save_as") or "").strip(),
+            resources=resources,
         )
 
 
@@ -3038,7 +3046,7 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
         _remember_prompt_id(self.shared, context, pid)
         outputs, wait_error = await _wait_outputs(self.client, pid)
         if wait_error:
-            return f"编辑失败：{wait_error}"
+            return wait_error if wait_error.startswith(("等待超时", "等待中断")) else f"编辑失败：{wait_error}"
         images = [img for output in (outputs or {}).values() for img in output.get("images", [])]
         if not images:
             return "编辑完成，但没有图片输出。"
@@ -3202,7 +3210,7 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
         "查询角色/画师规范词和已安装底模/LoRA。model/lora 指定 query 可跨家族按名称搜索；"
         "浏览清单时传与生图一致的 model_family，两个参数都省略时返回家族数量。"
         "绘图需要某种画风、角色、服饰或效果时，可主动查询匹配的 LoRA，用户无需点名 LoRA 或提供文件名。"
-        "character/artist：把触发词写进 prompt 或 artist。"
+        "character 支持中文名并返回有来源的外观参考；同名和颜色候选须核对版本。artist 触发词写进 artist。"
         "model/lora：选择符合需求的结果，把实际文件名填进 comfyui_draw 的 model/lora。LoRA 的 query 支持 LoRA Manager/Civitai "
         "分类或标签，例如 style/character/concept/风格/角色；结果会带用途说明、推荐权重和触发词。"
         "选用 LoRA 时可同步传入已记录的触发词；查询未提供触发词时可省略该字段并继续使用 LoRA。"
@@ -3233,6 +3241,7 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
     danbooru: DanbooruClient | None = None
     gelbooru: GelbooruClient | None = None
     animadex: AnimaDexClient | None = None
+    character_lookup: CharacterTagLookup | None = None
     client: ComfyUIClient | None = None
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
@@ -3250,6 +3259,13 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
         if not query:
             return "查询角色/画师时 query 必填。"
 
+        if kind == "character" and self.character_lookup is not None:
+            try:
+                limit = max(1, min(int(kwargs.get("limit") or 5), 8))
+            except (TypeError, ValueError):
+                limit = 5
+            return format_character_result(await self.character_lookup.lookup(query, limit))
+
         if kind == "character" and self.animadex is not None:
             text = await self.animadex.search_characters(query, page=1)
             if text:
@@ -3262,7 +3278,7 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
             data = None
             source = "danbooru"
             if self.danbooru is not None:
-                data = await self.danbooru.search_artist(query, 20)
+                data = await self.danbooru.search_artist(query, 0)
             if data is None and self.gelbooru is not None:
                 data = await self.gelbooru.search_artist(query, 20)
                 source = "gelbooru"
@@ -3276,7 +3292,7 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
         data = None
         source = "danbooru"
         if self.danbooru is not None:
-            data = await self.danbooru.search_character(query, 20)
+            data = await self.danbooru.search_character(query, 0)
         if data is None and self.gelbooru is not None:
             data = await self.gelbooru.search_character(query, 20)
             source = "gelbooru"
@@ -3289,34 +3305,24 @@ class ComfyuiLookupTool(FunctionTool[AstrAgentContext]):
 
 
 
-async def _auto_fill_trigger_words(client: ComfyUIClient, lora_input: Any) -> str | None:
-    """从 lora_meta 缓存中按 LoRA 文件名查触发词，拼成逗号分隔串返回。"""
-    if client is None or lora_input in (None, "", []):
-        return None
-    try:
-        resources, _ = await client.list_resources()
-    except Exception:
-        return None
-    text = collect_trigger_words(resources.get("lora_meta") or {}, lora_input)
-    return text or None
-
-
 async def _wait_outputs(client: ComfyUIClient, prompt_id: str) -> tuple[dict | None, str | None]:
-    deadline = time.time() + client.timeout
-    miss = 0
-    while time.time() < deadline:
-        entry = await client.get_history_entry(prompt_id)
-        if entry is not None:
-            st = entry.get("status") or {}
-            if st.get("status_str") == "error":
-                return None, execution_error_message(
-                    st, "执行出错（详见 ComfyUI 日志）"
-                )
-            return entry.get("outputs", {}), None
-        miss += 1
-        if miss == 5:
-            logger.warning(
-                f"[ComfyUIDirect] 轮询 {prompt_id} 连续 {miss} 次无响应，继续等待"
-            )
-        await asyncio.sleep(2)
-    return None, f"生成超时（{int(client.timeout)}s）"
+    entry, error = await client.wait_for_history(prompt_id)
+    if error or entry is None:
+        return None, error
+    status = entry.get("status") or {}
+    if status.get("status_str") == "error":
+        return None, execution_error_message(status, "执行出错（详见 ComfyUI 日志）")
+    return entry.get("outputs", {}), None
+
+
+def _has_lora_input(kwargs: dict[str, Any]) -> bool:
+    value = _lora_input(kwargs)
+    return value is not None and value != ""
+
+
+def _lora_input(kwargs: dict[str, Any]) -> Any:
+    """Read canonical `lora` input and retain the older `loras` alias."""
+    value = kwargs.get("lora")
+    if value is not None and value != "":
+        return value
+    return kwargs.get("loras")

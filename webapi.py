@@ -23,12 +23,13 @@ from resource_catalog import selection_error
 from model_families import EditWorkflowRegistry, ModelFamilyRegistry, WorkflowProfileStore
 from config_options import refresh_config_options
 from recipe_store import RecipeStore, materialize_values, recipe_template
+from generation_support import fill_trigger_words
 from slot_mapping import (
     SLOT_BASIC,
     SLOT_HELP,
     SLOT_ROLES,
     apply_slots,
-    collect_trigger_words,
+    parse_lora,
     detect_slots,
     is_ui_workflow,
     list_nodes,
@@ -121,6 +122,7 @@ class StudioApi:
         profiles: WorkflowProfileStore | None = None,
         config_defaults: dict | None = None,
         plugin_config: Any = None,
+        auto_trigger_words: bool = False,
         edit_workflows: EditWorkflowRegistry | None = None,
     ) -> None:
         self.client = client
@@ -135,6 +137,7 @@ class StudioApi:
         self.edit_workflows = edit_workflows
         self.profiles = profiles
         self.config_defaults = config_defaults or {}
+        self.auto_trigger_words = auto_trigger_words
         # AstrBotConfig（或测试用的 dict）：供「设为默认配方」直接写配置
         self.plugin_config = plugin_config if isinstance(plugin_config, dict) else {}
 
@@ -697,19 +700,6 @@ class StudioApi:
         defaults = recipe.get("defaults") or {}
         loras = body.get("loras") if "loras" in body else body.get("lora")
         trigger = body.get("trigger_words")
-        if not trigger:
-            if loras:
-                try:
-                    resources, _ = await self.client.list_resources()
-                    trigger = collect_trigger_words(resources.get("lora_meta") or {}, loras) or None
-                except Exception:
-                    trigger = None
-            elif not defaults.get("trigger_words"):
-                try:
-                    resources, _ = await self.client.list_resources()
-                    trigger = collect_trigger_words(resources.get("lora_meta") or {}, defaults.get("loras")) or None
-                except Exception:
-                    trigger = None
         overrides = {
             "prompt": prompt,
             "seed": seed,
@@ -726,13 +716,21 @@ class StudioApi:
             "trigger_words": trigger,
         }
         values = materialize_values(recipe, overrides)
+        if trigger is not None:
+            values["trigger_words"] = trigger
+        elif "trigger_words" in defaults:
+            values["trigger_words"] = defaults["trigger_words"]
         values["seed"] = seed
         # 与机器人 comfyui_generate 保持一致：配方没配的项补插件配置默认值（画师/画质/负向等）
         for key, val in self.config_defaults.items():
             if key not in values and val not in (None, "", 0, 0.0, []):
                 values["negative" if key == "negative_prompt" else key] = val
         if family is not None and (values.get("model") or values.get("loras")):
-            resources, _ = await self.client.list_resources()
+            resources = await self.client.generation_resources()
+            names = [str(item.get("name")) for item in parse_lora(values.get("loras")) if item.get("name")]
+            if names:
+                resources = await self.client.selected_lora_metadata(resources, names, require_trusted=self.auto_trigger_words and values.get("trigger_words") is None)
+            values = fill_trigger_words(values, resources, self.auto_trigger_words and bool(slots.get("trigger_words")))
             error = selection_error(resources, values, family.name,
                                     getattr(self.client, "resource_family_rules", []))
             if error:
@@ -774,73 +772,47 @@ class StudioApi:
         if len(pending_runs) > 64:
             for old_pid in list(pending_runs)[:-64]:
                 pending_runs.pop(old_pid, None)
-        return _json({"ok": True, "prompt_id": pid})
+        return _json({"ok": True, "prompt_id": pid, "wait_timeout": getattr(self.client, "timeout", 300)})
 
     async def generate_poll(self) -> Any:
         pid = _query("pid").strip()
         if not pid:
             return _json({"ok": False, "error": "缺少 pid"})
-        entry = await self.client.get_history_entry(pid)
-        if entry is None:
-            return _json({"ok": True, "done": False})
-        st = entry.get("status") or {}
-        if st.get("status_str") == "error":
-            pending_runs = self.shared.get("web_pending_runs") or {}
-            pending_runs.pop(pid, None)
-            return _json(
-                {"ok": True, "done": True, "error": execution_error_message(st)}
-            )
-        images = []
-        for node_out in (entry.get("outputs") or {}).values():
-            images.extend(node_out.get("images") or [])
-        if not images:
-            return _json({"ok": True, "done": True, "error": "执行完成但无输出图片"})
-        img = next((item for item in images if item.get("type", "output") == "output"), images[-1])
-        content = await self.client.download_image(
-            img["filename"], img.get("subfolder", ""), image_type=img.get("type", "output")
-        )
-        if not content:
-            return _json({"ok": True, "done": True, "error": f"图片下载失败: {img['filename']}"})
+        cache = self.shared.setdefault("web_result_cache", {})
+        locks = self.shared.setdefault("web_result_locks", {})
+        holder = locks.setdefault(pid, {"lock": asyncio.Lock(), "users": 0})
+        holder["users"] += 1
         try:
-            local_path = await asyncio.to_thread(save_image, self.output_dir, img["filename"], content)
-        except (ValueError, OSError) as e:
-            return _json({"ok": True, "done": True, "error": f"图片本地保存失败: {e}"})
-        pending_runs = self.shared.get("web_pending_runs") or {}
-        pending = pending_runs.get(pid) or {}
-        recipe = pending.get("recipe") or {}
-        values = pending.get("values") or {}
-        self.store.save_history(
-            {
-                "prompt_id": pid,
-                "entry": pending.get("entry") or "recipe",
-                "family": pending.get("family") or recipe.get("family") or "",
-                "recipe": recipe.get("name"),
-                "recipe_id": recipe.get("id"),
-                "workflow": pending.get("workflow") or recipe_template(recipe),
-                "slots": pending.get("slots") or recipe.get("slots") or {},
-                "drop_nodes": pending.get("drop_nodes") or recipe.get("drop_nodes") or [],
-                "prompt": pending.get("prompt") or "",
-                "values": {
-                    k: v
-                    for k, v in values.items()
-                    if v not in (None, "") and (v != [] or k == "loras")
-                },
-                "filename": img["filename"],
-                "local_path": str(local_path),
-            }
-        )
-        pending_runs.pop(pid, None)
-        return _json(
-            {
-                "ok": True,
-                "done": True,
-                "filename": img["filename"],
-                "data_url": (
-                    f"data:{image_media_type(content, img['filename'])};base64,"
-                    + base64.b64encode(content).decode("ascii")
-                ),
-            }
-        )
+            async with holder["lock"]:
+                saved = cache.get(pid)
+                if not saved:
+                    history = await asyncio.to_thread(self.store.history_get, pid) or {}
+                    if history.get("local_path") and history.get("filename"):
+                        local = Path(history["local_path"]).resolve()
+                        if local.is_relative_to(self.output_dir.resolve()):
+                            saved = {"path": str(local), "filename": history["filename"]}
+                if saved:
+                    try:
+                        content = await asyncio.to_thread(Path(saved["path"]).read_bytes)
+                        cache[pid] = saved
+                        return _json(self._image_result(saved["filename"], content))
+                    except OSError:
+                        cache.pop(pid, None)
+                result = await self._generate_result(pid)
+                path = result.pop("_local_path", None)
+                if path:
+                    cache[pid] = {"path": path, "filename": result["filename"]}
+                return _json(result)
+        finally:
+            holder["users"] -= 1
+            for old_pid in list(cache)[:-64]:
+                cache.pop(old_pid, None)
+            for old_pid in list(locks):
+                if len(locks) <= 128:
+                    break
+                if not locks[old_pid]["users"]:
+                    locks.pop(old_pid, None)
+
 
     async def interrupt(self) -> Any:
         body = await _body()
@@ -872,6 +844,75 @@ class StudioApi:
         self._refresh_draw_schema()
         return _json({"ok": True, "recipe": saved})
 
+    async def _generate_result(self, pid: str) -> dict:
+        if hasattr(self.client, "wait_for_history"):
+            entry, _ = await self.client.wait_for_history(pid, timeout=min(5.0, self.client.timeout))
+        else:
+            entry = await self.client.get_history_entry(pid)
+        if entry is None:
+            progress = self.client.execution_progress(pid) if hasattr(self.client, "execution_progress") else {}
+            return {"ok": True, "done": False, "progress": progress}
+        st = entry.get("status") or {}
+        if st.get("status_str") == "error":
+            pending_runs = self.shared.get("web_pending_runs") or {}
+            pending_runs.pop(pid, None)
+            return {"ok": True, "done": True, "error": execution_error_message(st)}
+        if st.get("completed") is False:
+            return {"ok": True, "done": False}
+        images = []
+        for node_out in (entry.get("outputs") or {}).values():
+            images.extend(node_out.get("images") or [])
+        if not images:
+            pending_runs = self.shared.get("web_pending_runs") or {}
+            pending = pending_runs.pop(pid, {})
+            if pending.get("entry") == "graph" and st.get("completed"):
+                return {"ok": True, "done": True, "message": "执行完成，无图片输出"}
+            return {"ok": True, "done": True, "error": "执行完成但无输出图片"}
+        img = next((item for item in images if item.get("type", "output") == "output"), images[-1])
+        content = await self.client.download_image(
+            img["filename"], img.get("subfolder", ""), image_type=img.get("type", "output")
+        )
+        if not content:
+            return {"ok": True, "done": True, "error": f"图片下载失败: {img['filename']}"}
+        try:
+            local_path = await asyncio.to_thread(save_image, self.output_dir, img["filename"], content)
+        except (ValueError, OSError) as e:
+            return {"ok": True, "done": True, "error": f"图片本地保存失败: {e}"}
+        pending_runs = self.shared.get("web_pending_runs") or {}
+        pending = pending_runs.get(pid) or {}
+        recipe = pending.get("recipe") or {}
+        values = pending.get("values") or {}
+        if pending or self.store.history_get(pid) is None:
+            self.store.save_history(
+                {
+                    "prompt_id": pid,
+                    "entry": pending.get("entry") or "recipe",
+                    "family": pending.get("family") or recipe.get("family") or "",
+                    "recipe": recipe.get("name"),
+                    "recipe_id": recipe.get("id"),
+                    "workflow": pending.get("workflow") or recipe_template(recipe),
+                    "slots": pending.get("slots") or recipe.get("slots") or {},
+                    "drop_nodes": pending.get("drop_nodes") or recipe.get("drop_nodes") or [],
+                    "prompt": pending.get("prompt") or "",
+                    "values": {
+                        k: v
+                        for k, v in values.items()
+                        if v is not None and (v != "" or k == "trigger_words") and (v != [] or k == "loras")
+                    },
+                    "filename": img["filename"],
+                    "local_path": str(local_path),
+                }
+            )
+        pending_runs.pop(pid, None)
+        return {**self._image_result(img["filename"], content), "_local_path": str(local_path)}
+
+    @staticmethod
+    def _image_result(filename: str, content: bytes) -> dict:
+        return {"ok": True, "done": True, "filename": filename,
+                "data_url": f"data:{image_media_type(content, filename)};base64," + base64.b64encode(content).decode("ascii")}
+
+
+
 
 def register_web_apis(
     context,
@@ -887,6 +928,7 @@ def register_web_apis(
     profiles: WorkflowProfileStore | None = None,
     config_defaults: dict | None = None,
     plugin_config: Any = None,
+    auto_trigger_words: bool = False,
     edit_workflows: EditWorkflowRegistry | None = None,
 ) -> None:
     if store is None or output_dir is None:
@@ -905,6 +947,7 @@ def register_web_apis(
         profiles,
         config_defaults=config_defaults,
         plugin_config=plugin_config,
+        auto_trigger_words=auto_trigger_words,
         edit_workflows=edit_workflows,
     )
     routes = [

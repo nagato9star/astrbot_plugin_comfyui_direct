@@ -761,13 +761,22 @@ async function runGenerate() {
     return;
   }
   state.runningPid = res.prompt_id;
-  pollResult(res.prompt_id);
+  pollResult(res.prompt_id, "#preview", res.wait_timeout).catch((error) => toast(String(error), true));
 }
 
-async function pollResult(pid, previewSelector = "#preview") {
+async function pollResult(pid, previewSelector = "#preview", waitTimeout = 300) {
   const preview = $(previewSelector);
-  for (let i = 0; i < 150; i++) {
-    const poll = await apiGet("generate", { pid });
+  const resume = $(previewSelector === "#graph-preview" ? "#graph-resume" : "#btn-resume");
+  resume.hidden = true;
+  const deadline = performance.now() + Math.max(1, Number(waitTimeout) || 300) * 1000;
+  while (performance.now() < deadline) {
+    let poll;
+    try { poll = await apiGet("generate", { pid }); }
+    catch (_) {
+      preview.textContent = "连接暂时中断，正在重新查询任务…";
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      continue;
+    }
     if (poll && poll.done) {
       state.runningPid = "";
       if (poll.error) {
@@ -784,10 +793,14 @@ async function pollResult(pid, previewSelector = "#preview") {
       await loadLists();
       return;
     }
-    await new Promise((r) => setTimeout(r, 2000));
+    const progress = poll?.progress;
+    if (progress?.event === "progress") preview.textContent = `正在生成 · ${progress.value}/${progress.max}`;
+    await new Promise((r) => setTimeout(r, 200));
   }
   state.runningPid = "";
-  preview.textContent = "等待超时";
+  preview.textContent = `等待超时，任务仍可能在排队或执行。任务 ID：${pid}`;
+  resume.dataset.promptId = pid;
+  resume.hidden = false;
 }
 
 async function saveHistoryAsRecipe(item) {
@@ -869,6 +882,13 @@ function updateGraphStatus() {
   const count = editor.graph._nodes.length;
   const name = editor.activeName || "未命名工作流";
   $("#graph-status").textContent = `${name} · ${count} 个节点${editor.dirty ? " · 未保存" : ""}`;
+  $("#graph-undo").disabled = !editor.canUndo;
+  $("#graph-redo").disabled = !editor.canRedo;
+}
+
+function setGraphPanel(panel, hidden) {
+  document.body.classList.toggle(`graph-${panel}-hidden`, hidden);
+  $(`#graph-toggle-${panel}`).setAttribute("aria-expanded", String(!hidden));
 }
 
 function loadGraphPayload(payload) {
@@ -933,11 +953,13 @@ function renderGraphInspector(node) {
   id.className = "graph-node-id";
   id.textContent = `#${node.id} · ${node.type}`;
   holder.append(title, id);
-  const definition = state.nodeDefinitions[node.type]?.input || {};
-  const fields = { ...(definition.required || {}), ...(definition.optional || {}) };
-  const names = new Set([...Object.keys(fields), ...Object.keys(node._apiInputs || {})]);
+  const definitions = state.nodeDefinitions[node.type]?.input || {};
+  const fields = { ...(definitions.required || {}), ...(definitions.optional || {}) };
+  const names = new Set([...Object.keys(fields), ...Object.keys(node._apiInputs || {}),
+    ...(node.widgets || []).filter((widget) => widget._seedWidget).map((widget) => widget.name)]);
   for (const name of names) {
-    const spec = fields[name] || [];
+    const widget = node.widgets?.find((item) => item.name === name);
+    const spec = fields[name] || (widget?._seedWidget ? [widget.options.values, {}] : []);
     const link = node.inputs?.find((input) => input.name === name && input.link != null);
     const label = document.createElement("label");
     label.className = "field";
@@ -953,8 +975,7 @@ function renderGraphInspector(node) {
       holder.append(label);
       continue;
     }
-    const widget = node.widgets?.find((item) => item.name === name);
-    const value = node._apiInputs?.[name] ?? widget?.value ?? spec?.[1]?.default ?? "";
+    const value = widget?.value ?? node._apiInputs?.[name] ?? spec?.[1]?.default ?? "";
     const choices = Array.isArray(spec[0]) ? spec[0]
       : spec[0] === "COMBO" ? (spec[1]?.options || spec[1]?.values || []) : null;
     let control;
@@ -972,6 +993,8 @@ function renderGraphInspector(node) {
       control = document.createElement("input");
       control.type = "number";
       control.step = spec[0] === "INT" ? "1" : String(spec[1]?.step || "any");
+      if (spec[1]?.min !== undefined) control.min = spec[1].min;
+      if (spec[1]?.max !== undefined) control.max = spec[1].max;
       control.value = String(value);
     } else {
       control = document.createElement("textarea");
@@ -992,12 +1015,12 @@ function renderGraphInspector(node) {
         catch (_) { toast(`${name} 的 JSON 无效`, true); return; }
       } else next = control.value;
       node._apiInputs = node._apiInputs || {};
-      node._apiInputs[name] = next;
+      if (widget?.options?.serialize !== false) node._apiInputs[name] = next;
       if (widget) widget.value = next;
       state.graphEditor.changed();
     });
     label.append(control);
-    if (!Object.hasOwn(fields, name)) {
+    if (!Object.hasOwn(fields, name) && !widget) {
       const remove = document.createElement("button");
       remove.type = "button";
       remove.textContent = "移除此输入";
@@ -1033,7 +1056,7 @@ function renderGraphInspector(node) {
 
 async function ensureGraphEditor() {
   if (state.graphEditor) return state.graphEditor;
-  const { WorkflowGraphEditor } = await import("./graph-editor.bundle.js");
+  const { WorkflowGraphEditor } = await import("./graph-editor.bundle.js?v=canvas-3");
   const editor = new WorkflowGraphEditor($("#workflow-canvas"), {
     onChange: updateGraphStatus,
     onSelect: renderGraphInspector,
@@ -1087,7 +1110,7 @@ async function saveGraph() {
 async function runGraph() {
   if (state.runningPid) return toast("上一张仍在运行，请先等待或中断", true);
   const editor = await ensureGraphEditor();
-  const graph = await editor.exportWorkflowSnapshot();
+  const graph = await editor.exportWorkflow();
   const preview = $("#graph-preview");
   preview.textContent = "正在提交到远端 ComfyUI…";
   const res = await apiPost("workflow/run", { name: $("#graph-name").value.trim(), ...graph });
@@ -1096,8 +1119,10 @@ async function runGraph() {
     return toast(res?.error || "提交失败", true);
   }
   state.runningPid = res.prompt_id;
+  editor.afterQueued();
+  setGraphPanel("inspector", false);
   $("#graph-run-status").textContent = `#${res.prompt_id.slice(0, 8)}`;
-  await pollResult(res.prompt_id, "#graph-preview");
+  await pollResult(res.prompt_id, "#graph-preview", res.wait_timeout);
   $("#graph-run-status").textContent = "";
 }
 
@@ -1112,6 +1137,13 @@ function bindGraphUi() {
     $("#graph-expand").textContent = expanded ? "收起画布" : "放大画布";
     requestAnimationFrame(() => { state.graphEditor?.resize(); state.graphEditor?.fit(); });
   });
+  $("#graph-undo").addEventListener("click", () => state.graphEditor?.undo());
+  $("#graph-redo").addEventListener("click", () => state.graphEditor?.redo());
+  for (const panel of ["palette", "inspector"]) {
+    $(`#graph-toggle-${panel}`).addEventListener("click", () => {
+      setGraphPanel(panel, !document.body.classList.contains(`graph-${panel}-hidden`));
+    });
+  }
   $("#graph-stop").addEventListener("click", async () => {
     if (!state.runningPid) return;
     const res = await apiPost("generate/interrupt", { prompt_id: state.runningPid });
@@ -1130,16 +1162,30 @@ function bindGraphUi() {
     const type = event.dataTransfer.getData("text/x-comfy-node");
     if (!type || !state.graphEditor) return;
     event.preventDefault();
-    const rect = canvas.getBoundingClientRect();
-    const ds = state.graphEditor.canvas.ds;
-    const position = [(event.clientX - rect.left - ds.offset[0]) / ds.scale,
-      (event.clientY - rect.top - ds.offset[1]) / ds.scale];
+    const position = state.graphEditor.eventToGraph(event);
     try { state.graphEditor.addNode(type, position); }
     catch (error) { toast(String(error), true); }
   });
 }
 
 function bindUi() {
+  for (const [button, selector] of [["#btn-resume", "#preview"], ["#graph-resume", "#graph-preview"]]) {
+    $(button).addEventListener("click", () => {
+      const pid = $(button).dataset.promptId;
+      if (!pid || state.runningPid) return;
+      state.runningPid = pid;
+      pollResult(pid, selector).catch((error) => { state.runningPid = ""; toast(String(error), true); });
+    });
+  }
+  document.addEventListener("keydown", (event) => {
+    if (state.activeMode !== "workflow" || !(event.ctrlKey || event.metaKey)) return;
+    const key = event.key.toLowerCase();
+    if (key !== "s" && key !== "enter") return;
+    event.preventDefault();
+    const action = key === "s" ? saveGraph : runGraph;
+    action().catch((error) => toast(String(error), true));
+  });
+
   bindGraphUi();
   $("#btn-refresh").addEventListener("click", () => refreshStatus().catch((e) => toast(String(e), true)));
   $("#tab-workflow").addEventListener("click", () => selectMode("workflow"));

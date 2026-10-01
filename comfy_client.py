@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import html
 import json
 import mimetypes
@@ -220,11 +221,15 @@ class ComfyUIClient:
         cache_file: Path | None = None,
         cache_ttl: int = 600,
         lora_manager_enabled: bool = True,
+        request_timeout: float = 15.0,
+        events_enabled: bool = False,
     ) -> None:
         self.host = host
         self.port = port
         self.base_url = f"http://{host}:{port}"
         self.timeout = timeout
+        self.request_timeout = max(0.1, float(request_timeout))
+        self.events_enabled = events_enabled
         self.cache_file = cache_file
         self.cache_ttl = cache_ttl
         self.lora_manager_enabled = bool(lora_manager_enabled)
@@ -237,22 +242,42 @@ class ComfyUIClient:
         self._resource_lock = asyncio.Lock()
         # /object_info 缓存（构造 UI 快照用），进程内一次
         self._object_info: dict | None = None
+        self._object_info_at = 0.0
+        self._object_info_lock = asyncio.Lock()
+        self._memory_cache: dict | None = None
+        self._cache_stamp = None
+        self._metadata_task: asyncio.Task | None = None
+        self._full_metadata_task: asyncio.Task | None = None
+        self._warmup_task: asyncio.Task | None = None
+        self._events = None
+        self._closed = False
         # 可选：civitai 客户端，用于本地 metadata 无触发词时在线回退
         self.civitai_client = None
+
 
     @property
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
-                base_url=self.base_url, timeout=httpx.Timeout(self.timeout)
+                base_url=self.base_url,
+                timeout=httpx.Timeout(self.request_timeout, connect=min(5.0, self.request_timeout)),
             )
         return self._client
 
+
     async def close(self) -> None:
         """关闭底层连接，插件卸载（terminate）时调用。"""
+        self._closed = True
+        tasks = [task for task in (getattr(self, "_metadata_task", None), getattr(self, "_full_metadata_task", None), getattr(self, "_warmup_task", None)) if task and not task.done()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if getattr(self, "_events", None) is not None:
+            await self._events.close()
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
 
     async def _request_with_retry(
         self,
@@ -274,9 +299,12 @@ class ComfyUIClient:
         """
         last_exc: Exception | None = None
         for i in range(attempts):
+            if self._closed:
+                return None
             try:
                 resp = await self.client.request(
-                    method, path, params=params, json=json_body, timeout=timeout
+                    method, path, params=params, json=json_body,
+                    timeout=self.request_timeout if timeout is None else timeout,
                 )
                 resp.raise_for_status()
                 return resp
@@ -296,6 +324,7 @@ class ComfyUIClient:
             )
         return None
 
+
     async def _get(self, path: str, params: dict | None = None) -> Any:
         """GET（幂等，自动重试），失败返回 None。"""
         resp = await self._request_with_retry("GET", path, params=params)
@@ -308,8 +337,18 @@ class ComfyUIClient:
             logger.warning(f"[ComfyUIDirect] GET {self.base_url}{path} 响应非 JSON: {e}")
             return None
 
-    async def get_object_info(self) -> dict | None:
-        return await self._get("/object_info")
+    async def get_object_info(self, force_refresh: bool = False) -> dict | None:
+        async with self._object_info_lock:
+            if (not force_refresh and self._object_info is not None
+                    and time.monotonic() - self._object_info_at < max(self.cache_ttl, 60)):
+                return self._object_info
+            data = await self._get("/object_info")
+            if isinstance(data, dict) and data:
+                self._object_info = data
+                self._object_info_at = time.monotonic()
+                return self._object_info
+            return None if force_refresh else self._object_info
+
 
     async def ping(self, timeout: float = 5.0) -> bool:
         """轻量连通性探测（用于 WebUI 状态灯），ZeroTier 抽风时重试 2 次。"""
@@ -329,17 +368,8 @@ class ComfyUIClient:
 
     async def _get_object_info_cached(self) -> dict | None:
         """拉取 /object_info（进程内缓存），失败返回 None。"""
-        if self._object_info is not None:
-            return self._object_info
-        try:
-            resp = await self.client.get("/object_info")
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict) and data:
-                    self._object_info = data
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"[ComfyUIDirect] /object_info 拉取失败（UI 快照将跳过）: {e}")
-        return self._object_info
+        return await self.get_object_info()
+
 
     def _meta_debug(self, msg: str) -> None:
         """独立文件级日志：不依赖 astrbot logger，用于判定新代码是否真的在跑。"""
@@ -366,7 +396,12 @@ class ComfyUIClient:
         （ConnectError/ConnectTimeout = 请求肯定没发出去，安全）；ReadTimeout
         不重试——服务端可能已收下任务，重试会重复出图，改为提示"可能已提交"。
         """
+        if self._closed:
+            return None, "插件连接已关闭，请重新加载后确认任务状态。"
         body: dict = {"prompt": workflow}
+        events = self.start_events()
+        if events is not None:
+            body["client_id"] = events.client_id
         self._meta_debug("submit_called")
         try:
             try:
@@ -395,6 +430,7 @@ class ComfyUIClient:
         for i in range(2):
             try:
                 resp = await self.client.post("/prompt", json=body)
+                last_err = None
             except SUBMIT_RETRYABLE_EXC as e:
                 last_err = e
                 if i == 0:
@@ -469,6 +505,7 @@ class ComfyUIClient:
             logger.error("[ComfyUIDirect] 未获取到 prompt_id")
             return None, "ComfyUI 未返回 prompt_id"
         return pid, None
+
 
     async def poll_history(self, prompt_id: str) -> dict | None:
         """查询执行历史（outputs 部分）；未完成/不存在返回 None。"""
@@ -1020,9 +1057,11 @@ class ComfyUIClient:
                         logger.warning(f"[ComfyUIDirect] 读取 {name} LoRA Manager 信息失败: {e}")
 
                 manager_info = self.normalize_lora_metadata(manager_meta)
+                trusted_words = list(manager_info.get("trigger_words") or [])
                 # LoRA Manager 通常已经带有 Civitai trainedWords；有触发词时
                 # 不再为同一个文件额外读取 safetensors 头部。
                 if manager_info.get("trigger_words"):
+                    manager_info["trusted_trigger_words"] = trusted_words
                     out[name] = manager_info
                     return
 
@@ -1031,6 +1070,8 @@ class ComfyUIClient:
                 try:
                     meta = await self.get_model_metadata(name, folders=["loras"])
                     words, source = self._extract_trigger_words(meta)
+                    if source not in {"tag_frequency", "dataset"}:
+                        trusted_words = list(dict.fromkeys([*trusted_words, *words]))
                     if words:
                         local_info = {"trigger_words": words, "source": source}
                     base_model = self.normalize_lora_metadata(meta).get("base_model")
@@ -1041,6 +1082,7 @@ class ComfyUIClient:
 
                 info = self.normalize_lora_metadata(manager_meta, fallback=local_info)
                 if info:
+                    info["trusted_trigger_words"] = trusted_words
                     out[name] = info
                     if info.get("trigger_words"):
                         return
@@ -1061,6 +1103,8 @@ class ComfyUIClient:
                                 out[name] = self.normalize_lora_metadata(
                                     cached[1], fallback=info
                                 )
+                                declared = self.normalize_lora_metadata(cached[1]).get("trigger_words", [])
+                                out[name]["trusted_trigger_words"] = list(dict.fromkeys([*trusted_words, *declared]))
                             return
                         async with online_sem:
                             items = await self.civitai_client.search_models(
@@ -1091,6 +1135,8 @@ class ComfyUIClient:
                                 out[name] = self.normalize_lora_metadata(
                                     selected, fallback=info
                                 )
+                                declared = self.normalize_lora_metadata(selected).get("trigger_words", [])
+                                out[name]["trusted_trigger_words"] = list(dict.fromkeys([*trusted_words, *declared]))
                                 break
                         self._civitai_lora_cache[cache_key] = (
                             time.monotonic(), selected
@@ -1100,6 +1146,7 @@ class ComfyUIClient:
 
         await asyncio.gather(*(one(n) for n in lora_names))
         return out
+
 
     async def get_embeddings(self) -> list[str] | None:
         """GET /embeddings → 嵌入模型名列表（去扩展名）。
@@ -1284,15 +1331,27 @@ class ComfyUIClient:
         return out
 
     def _load_cache(self) -> dict | None:
-        if not self.cache_file or not self.cache_file.exists():
+        if not self.cache_file:
+            return self._memory_cache
+        if not self.cache_file.exists():
             return None
         try:
-            return json.loads(self.cache_file.read_text(encoding="utf-8"))
+            stat = self.cache_file.stat()
+            stamp = (stat.st_mtime_ns, stat.st_size)
+            if stamp == self._cache_stamp and self._memory_cache is not None:
+                return self._memory_cache
+            data = json.loads(self.cache_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("resources"), dict):
+                self._memory_cache, self._cache_stamp = data, stamp
+                return data
+            return None
         except (OSError, json.JSONDecodeError) as e:
             logger.warning(f"[ComfyUIDirect] 读取模型缓存失败: {e}")
             return None
 
+
     def _save_cache(self, data: dict) -> None:
+        self._memory_cache = data
         if not self.cache_file:
             return
         try:
@@ -1303,8 +1362,11 @@ class ComfyUIClient:
                 json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             tmp.replace(self.cache_file)
+            stat = self.cache_file.stat()
+            self._cache_stamp = (stat.st_mtime_ns, stat.st_size)
         except OSError as e:
             logger.warning(f"[ComfyUIDirect] 写入模型缓存失败: {e}")
+
 
     async def _fetch_resources(self) -> dict | None:
         """从 ComfyUI 拉取最新资源清单；任何失败（含空响应/超时）返回 None。
@@ -1346,62 +1408,171 @@ class ComfyUIClient:
         未过期且非强制刷新时直接用缓存；过期则重新从 ComfyUI 同步；
         ComfyUI 离线时回退本地缓存，保证清单不因本机关机而丢失。
         """
-        async with self._resource_lock:
-            if not force_refresh and self.cache_file and self.cache_file.exists():
-                cached = self._load_cache()
-                if cached and (
-                    self.cache_ttl <= 0
-                    or time.time() - cached.get("fetched_at", 0) < self.cache_ttl
-                ) and (
-                    not self.lora_manager_enabled
-                    or cached.get("lora_metadata_v3") is True
-                ):
-                    return cached["resources"], True
+        previous = self._load_cache()
+        resources = await self.generation_resources(force_refresh)
+        task = self._metadata_task
+        if task is not None and not task.done():
+            await asyncio.shield(task)
+        cached = self._load_cache()
+        if cached and not cached.get("lora_metadata_v4"):
+            if self._full_metadata_task is None or self._full_metadata_task.done():
+                self._full_metadata_task = asyncio.create_task(self._enrich_catalog(full=True))
+            await asyncio.shield(self._full_metadata_task)
+        cached = self._load_cache()
+        return copy.deepcopy(cached["resources"]) if cached else resources, bool(previous and not force_refresh)
 
-            resources = await self._fetch_resources()
-            if resources is not None:
-                data = {
-                    "fetched_at": time.time(),
-                    "lora_metadata_v3": True,
-                    "resources": resources,
-                }
-                self._save_cache(data)
-                return data["resources"], False
-
-            cached = self._load_cache()
-            if cached:
-                logger.warning("[ComfyUIDirect] ComfyUI 离线，回退本地缓存模型清单")
-                return cached["resources"], True
-            return {
-                "unet_name": [],
-                "lora_name": [],
-                "clip_name": [],
-                "vae_name": [],
-                "embeddings": [],
-            }, False
 
     async def warm_up_cache(self) -> None:
         """插件加载时后台预热资源清单（自动同步）。
 
         ComfyUI 刚启动时 /object_info 可能尚未就绪（空响应），最多重试 3 次。
         """
-        async with self._resource_lock:
-            for attempt in range(1, 4):
-                try:
-                    resources = await self._fetch_resources()
-                    if resources is not None:
-                        self._save_cache(
-                            {
-                                "fetched_at": time.time(),
-                                "lora_metadata_v3": True,
-                                "resources": resources,
-                            }
-                        )
-                        return
-                except Exception as e:
-                    logger.warning(
-                        f"[ComfyUIDirect] 预热资源清单失败（第 {attempt}/3 次）: {e}"
-                    )
-                if attempt < 3:
-                    await asyncio.sleep(8)
+        for attempt in range(1, 4):
+            resources = await self.generation_resources()
+            if resources.get("unet_name") or resources.get("lora_name"):
+                return
+            if attempt < 3:
+                await asyncio.sleep(8)
         logger.warning("[ComfyUIDirect] 预热资源清单失败（3 次尝试后放弃，将按需同步）")
+
+
+    def start_events(self):
+        if not getattr(self, "events_enabled", False) or getattr(self, "_closed", False):
+            return None
+        if self._events is None:
+            from execution_events import ExecutionEvents
+            self._events = ExecutionEvents(self.base_url, self.request_timeout)
+        return self._events
+
+    def execution_progress(self, prompt_id: str) -> dict:
+        events = getattr(self, "_events", None)
+        return dict(events.states.get(prompt_id, {})) if events is not None else {}
+
+    async def wait_for_history(self, prompt_id: str, timeout: float | None = None) -> tuple[dict | None, str | None]:
+        budget = self.timeout if timeout is None else max(0.0, timeout)
+        deadline = time.monotonic() + budget
+        events = self.start_events()
+        try:
+            while (remaining := deadline - time.monotonic()) > 0:
+                if getattr(self, "_closed", False):
+                    return None, f"等待中断，插件连接已关闭。任务可能仍在执行。prompt_id: {prompt_id}，可继续查询该任务。"
+                state = self.execution_progress(prompt_id)
+                if state.get("event") in {"execution_error", "execution_interrupted"}:
+                    return {"status": {"status_str": "error", "messages": [[state["event"], state]]}, "outputs": {}}, None
+                try:
+                    if events is None:
+                        entry = await asyncio.wait_for(self.get_history_entry(prompt_id), remaining)
+                    else:
+                        request = asyncio.create_task(self.get_history_entry(prompt_id))
+                        signal = asyncio.create_task(events.wait(prompt_id, remaining))
+                        try:
+                            done, _ = await asyncio.wait({request, signal}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+                            state = self.execution_progress(prompt_id)
+                            if state.get("event") in {"execution_error", "execution_interrupted"}:
+                                return {"status": {"status_str": "error", "messages": [[state["event"], state]]}, "outputs": {}}, None
+                            if not done:
+                                break
+                            entry = await asyncio.wait_for(request, max(0.001, deadline - time.monotonic()))
+                        finally:
+                            for task in (request, signal):
+                                if not task.done():
+                                    task.cancel()
+                            await asyncio.gather(request, signal, return_exceptions=True)
+                except TimeoutError:
+                    break
+                if entry is not None:
+                    return entry, None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                interval = min(0.2 if state.get("event") == "execution_success" else 2.0, remaining)
+                if events is not None:
+                    await events.wait(prompt_id, interval)
+                else:
+                    await asyncio.sleep(interval)
+        finally:
+            if events is not None:
+                events.forget(prompt_id)
+        return None, f"等待超时（{budget:g}s），任务可能仍在排队或执行。prompt_id: {prompt_id}，可继续查询该任务。"
+
+    async def generation_resources(self, force_refresh: bool = False) -> dict:
+        """Fast catalog for generation; full LoRA enrichment never holds this lock."""
+        async with self._resource_lock:
+            cached = self._load_cache()
+            fresh = not force_refresh and cached and (self.cache_ttl > 0 and time.time() - cached.get("fetched_at", 0) < self.cache_ttl)
+            if not fresh:
+                obj = await self.get_object_info(force_refresh=True)
+                if obj:
+                    resources = self._extract_resources(obj)
+                    previous = (cached or {}).get("resources", {})
+                    resources["embeddings"] = previous.get("embeddings", [])
+                    resources["model_meta"] = {name: info for name, info in previous.get("model_meta", {}).items()
+                                               if name in resources.get("unet_name", [])}
+                    resources["lora_meta"] = {name: info for name, info in previous.get("lora_meta", {}).items()
+                                              if name in resources.get("lora_name", [])}
+                    cached = {"fetched_at": time.time(), "resources": resources, "lora_metadata_v3": False}
+                    self._save_cache(cached)
+            resources = copy.deepcopy((cached or {}).get("resources", {
+                "unet_name": [], "lora_name": [], "clip_name": [], "vae_name": [], "lora_meta": {},
+            }))
+        self._start_metadata_refresh()
+        return resources
+
+    def _start_metadata_refresh(self) -> None:
+        cached = self._memory_cache
+        if self._closed or not cached or cached.get("lora_metadata_v3") is True or cached.get("lora_catalog_ready"):
+            return
+        if self._metadata_task is None or self._metadata_task.done():
+            self._metadata_task = asyncio.create_task(self._enrich_catalog())
+
+    async def _enrich_catalog(self, full: bool = False) -> None:
+        cached = self._load_cache()
+        if not cached:
+            return
+        names = list(cached["resources"].get("lora_name", []))
+        try:
+            catalog = await self.get_lora_manager_catalog()
+            if full:
+                metadata = await self._fetch_lora_trigger_words(names, lora_manager_catalog=catalog)
+            else:
+                metadata = {}
+                for name in names:
+                    raw = next((catalog[key] for key in self._lora_key_variants(name) if key in catalog), None)
+                    if raw:
+                        metadata[name] = self.normalize_lora_metadata(raw)
+                        metadata[name]["trusted_trigger_words"] = list(metadata[name].get("trigger_words") or [])
+            embeddings = await self.get_embeddings()
+            async with self._resource_lock:
+                current = self._load_cache()
+                if current and current.get("fetched_at") == cached.get("fetched_at"):
+                    updated = copy.deepcopy(current)
+                    merged = updated["resources"].setdefault("lora_meta", {})
+                    for name, info in metadata.items():
+                        merged[name] = {**merged.get(name, {}), **info}
+                    updated["resources"]["embeddings"] = embeddings or []
+                    updated["lora_metadata_v3"] = full
+                    updated["lora_metadata_v4"] = full
+                    updated["lora_catalog_ready"] = True
+                    self._save_cache(updated)
+        except Exception as e:
+            logger.warning(f"[ComfyUIDirect] 后台资源补全失败: {e}")
+
+    async def selected_lora_metadata(self, resources: dict, names: list[str], require_trusted: bool = False) -> dict:
+        """Enrich only selected files for compatibility checks/known triggers."""
+        missing = [name for name in names if not (resources.get("lora_meta") or {}).get(name)
+                   or (require_trusted and "trusted_trigger_words" not in resources["lora_meta"][name])]
+        if missing:
+            metadata = await self._fetch_lora_trigger_words(missing)
+            resources.setdefault("lora_meta", {}).update(metadata)
+            async with self._resource_lock:
+                cached = self._load_cache()
+                if cached:
+                    updated = copy.deepcopy(cached)
+                    known_names = updated["resources"].get("lora_name", [])
+                    updated["resources"].setdefault("lora_meta", {}).update({name: value for name, value in metadata.items() if name in known_names})
+                    self._save_cache(updated)
+        return resources
+
+    def start_warmup(self) -> None:
+        if not self._closed and (self._warmup_task is None or self._warmup_task.done()):
+            self._warmup_task = asyncio.create_task(self.warm_up_cache())

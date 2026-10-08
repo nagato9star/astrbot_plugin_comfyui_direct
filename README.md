@@ -30,6 +30,7 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 |:---|:---|
 | **按模型家族自由生图** | LLM 填写家族名，插件自动选择工作流；底模、LoRA、画幅和采样参数可自由调整 |
 | **配方快捷生图** | 输入配方名和本次提示词，复用实验好的模型、LoRA 和采样参数 |
+| **后台生成队列** | 工具返回任务编号，等待期间继续聊天；完成后自动发送图片并由 LLM 回复 |
 | **Workflow Studio** | 分别管理工作流 JSON、家族绑定与节点映射，以及静态配方和试画 |
 | **查一下再画** | 角色、画师、底模、LoRA 不确定时先查短列表；LoRA 支持 style / character 等分类 |
 
@@ -47,7 +48,21 @@ Bot 生图、原始工作流执行、输出下载和工作台试画统一将原�
 
 ## 生图上下文与工作流适配
 
-默认 `llm_tool_mode=basic` 启用自由生图、配方生图和查询；配置编辑工作流后也启用图片编辑。家族目录提供 `prompt_style`。生成与编辑成功回执包含发送状态、本地保存路径和任务 ID，完整参数继续保存到生成历史。配方生图只需提示词及可选配方名。
+默认 `llm_tool_mode=basic` 启用自由生图、配方生图、查询和任务管理；配置编辑工作流后也启用图片编辑。家族目录提供 `prompt_style`。生成与编辑工具先返回队列任务编号；完成事件包含发送状态、本地保存路径和任务 ID，完整参数继续保存到生成历史。配方生图只需提示词及可选配方名。
+
+## 后台生成队列
+
+自由生图、配方生图、图片编辑、高级兼容生成和原始工作流工具统一进入插件队列。校验并准备好工作流后，工具返回 `任务 C000001 已加入生成队列`，当前 LLM 可以继续回复。后台按队列顺序提交 ComfyUI，通过 WebSocket 和 history 跟踪完成，下载最终输出并发送到原会话，然后携带原对话历史及人格调用一次 LLM 告知结果。完成通知只生成回复文本，图片由插件交付。
+
+- `comfyui_job(action="status", task_id="C000001")` 查询状态、图片路径和通知状态；也兼容 `prompt_id`，省略编号查询本会话最近任务。
+- `comfyui_job(action="queue")` 查看本会话正在排队或执行的任务。
+- `comfyui_job(action="cancel", task_id="C000001")` 取消待提交任务或请求 ComfyUI 中断已提交任务。队列任务的 `wait` 操作立即返回状态，完成时自动通知。
+
+任务登记保存在插件数据目录的 `generation_jobs.json`。重载后继续处理待提交任务、跟踪已有 prompt_id、回收尚未下载的图片及发送待通知结果。等待超时会继续跟踪原任务。提交响应丢失或插件在提交期间退出时标记“提交结果待确认”，避免自动重复生成。发送期间退出时通知状态标记为 `unknown`，可查询结果并人工核实送达情况，避免自动重复发图。图片下载失败和通知失败分别保留状态及原 prompt_id。最近 200 个终态且通知已处理的任务保留在登记文件中。
+
+默认队列容量 `generation_queue_limit=32`，同时跟踪任务数 `generation_queue_concurrency=1`（最多 4）；GPU 调度继续由 ComfyUI 负责。`generation_notify_llm=true` 开启完成后的 LLM 回复，`generation_notify_timeout=60` 设置通知超时。LLM 失败时直接发送任务结果。原对话已切换或删除时直接通知原会话，并保留任务归属。完成通知通过 AstrBot 会话锁协调正常聊天；较旧 SDK 缺少该锁时仅保证插件通知之间串行。原平台须支持主动消息，平台送达失败会记录到通知状态。
+
+Workflow Studio 的提交和浏览器轮询流程继续使用现有接口。
 
 已配置或保存的工作流映射直接使用，自动检测仅作为无映射时的回退。主提示词节点失效时会提示重新确认映射，避免消耗一次无效生成。图片返回优先选择最终 output；仅有 PreviewImage 等预览输出时使用其真实 type 与 subfolder 下载。
 
@@ -104,14 +119,16 @@ Qwen Image 2.1 可分别配置 T2I 与编辑工作流：生图家族 `qwen` 绑�
 |:---|:---|:---|
 | `comfyui_host` | `127.0.0.1` | ComfyUI 主机 IP（自填） |
 | `comfyui_port` | `8188` | ComfyUI 端口 |
-| `comfyui_timeout` | `300` | 生成等待超时（秒） |
+| `comfyui_timeout` | `300` | 单次结果等待窗口（秒），后台超时后继续跟踪原任务 |
+| `generation_queue_limit` / `generation_queue_concurrency` | `32` / `1` | 含待通知任务的队列容量 / 同时跟踪的任务数（最多 4） |
+| `generation_notify_llm` / `generation_notify_timeout` | `true` / `60` | 完成后调用 LLM 回复 / 通知 LLM 超时（秒） |
 | `model_cache_ttl` | `600` | 模型清单缓存刷新间隔（秒），0 表示每次强制同步 |
 | `lora_manager_enabled` | `true` | 复用 ComfyUI LoRA Manager 的分类、标签、用途说明、推荐权重和触发词；未安装时自动跳过 |
 | `model_families` | `anima → anima-v3` | 生图家族配置；工作流可从本地已导入模板下拉选择 |
 | `edit_workflows` | 空 | 独立编辑路由；每条记录提供路由名并选择本地编辑工作流，配置后启用 `comfyui_edit` |
 | `workflow_node_mappings` | 空 | 可重复添加的工作流节点映射；填写各槽位的节点 ID，优先于 Workflow Studio 档案和自动检测 |
 | `default_recipe` | `默认` | 用户只说「画一张」时用的配方；在工作台配方列表点「设为默认」自动写入，也可直接填配方名 |
-| `llm_tool_mode` | `basic` | `basic` 暴露自由生图、图片编辑（已配置时）、配方生图和查询；`full` 打开诊断工具 |
+| `llm_tool_mode` | `basic` | `basic` 暴露自由生图、图片编辑（已配置时）、配方生图、查询和任务管理；`full` 打开诊断工具 |
 | `allow_llm_unsafe_tools` | `false` | 是否允许 LLM 使用旧版高级生成、执行任意工作流、读取本地图片上传、释放显存和删除配方；默认关闭 |
 | `default_workflow` / `node_slots` | 旧版兼容 | `model_families` 为空时使用；新版槽位在 Workflow Studio 工作流页按工作流保存 |
 | `danbooru_base_url` | `https://danbooru.donmai.us` | danbooru 接口地址（国内可换镜像） |
@@ -138,6 +155,7 @@ Qwen Image 2.1 可分别配置 T2I 与编辑工作流：生图家族 `qwen` 绑�
 - `workflow_profiles.json`：按工作流保存的共享节点槽位
 - `recipes/`：只保存模型家族与生成参数的快捷配方
 - `output/`：生成的图片文件
+- `generation_jobs.json`：持久化任务编号、归属、生成与通知状态
 
 ## 🤖 LLM 工具
 
@@ -151,6 +169,7 @@ Qwen Image 2.1 可分别配置 T2I 与编辑工作流：生图家族 `qwen` 绑�
 | `comfyui_edit` | 用独立 `edit_workflow` 路由修改当前或引用消息中的一张或多张图片；可选分辨率与自定义画布参数 |
 | `comfyui_recipe_draw` | 快捷配方生图；填写本次 `prompt`，可选 `recipe`、`size` 和 `seed`，其余参数来自配方 |
 | `comfyui_lookup` | 查询角色 / 画师规范词，以及底模 / LoRA 文件名；支持按 LoRA 分类、标签、用途挑选，并返回用途说明、推荐权重和触发词 |
+| `comfyui_job` | 按任务编号查询状态、取消任务或查看本会话队列；完成后自动通知 |
 
 `llm_tool_mode=full` 额外启用以下工具，其中标注为需额外开关的工具还要求 `allow_llm_unsafe_tools=true`：
 
@@ -164,7 +183,6 @@ Qwen Image 2.1 可分别配置 T2I 与编辑工作流：生图家族 `qwen` 绑�
 | `comfyui_model_info` | 查模型/LoRA 元数据与触发词（`source`=local / civitai） |
 | `comfyui_animadex` | 从 AnimaDex 查询角色、画师、作品系列及角色详情 |
 | `comfyui_queue` | 查询队列与 GPU 显存状态 |
-| `comfyui_job` | 按任务 ID 查状态、等待完成、取消任务或查询队列 |
 | `comfyui_fetch_outputs` | 按任务 ID 下载生成结果并返回本地路径 |
 | `comfyui_system_stats` | 查询设备、显存和系统内存状态 |
 | `comfyui_nodes` | 搜索节点类或查询节点输入输出结构 |

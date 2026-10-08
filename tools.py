@@ -211,6 +211,17 @@ def _remember_image_path(shared: dict, context: ContextWrapper[AstrAgentContext]
     shared.setdefault("last_image_paths", {})[_event_scope(context)] = str(path)
 
 
+async def _enqueue_generation(shared: dict, context, workflow: dict, history: dict,
+                              saved_recipe: dict | None = None) -> str | None:
+    queue = shared.get("generation_queue")
+    if queue is None:
+        return None
+    try:
+        return await queue.enqueue(workflow, context.context.event, history=history, saved_recipe=saved_recipe)
+    except (OSError, ValueError) as error:
+        return f"加入队列失败：{error}"
+
+
 def _message_images(context: ContextWrapper[AstrAgentContext]) -> list[Image]:
     event = getattr(getattr(context, "context", None), "event", None)
     message = getattr(getattr(event, "message_obj", None), "message", None) or []
@@ -503,6 +514,7 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
     name: str = "comfyui_generate"
     description: str = (
         "高级兼容生成入口，按默认配方或指定工作流生成图片并发送到当前会话。"
+        "提交后返回生成队列任务编号；后台完成后自动发送图片并通知，无需等待或重复查询。"
         "日常自由生图使用 comfyui_draw，快捷配方生图使用 comfyui_recipe_draw。"
         "prompt 必填；未覆盖的参数沿用配方、插件配置或模板默认值，width/height 可按构图需求填写。"
         "当 LoRA 有助于实现用户要求的画风、角色、服饰或效果时，可主动查询并选用，用户无需点名 LoRA 或提供文件名。"
@@ -845,6 +857,13 @@ class ComfyuiGenerateTool(FunctionTool[AstrAgentContext]):
         except (ValueError, json.JSONDecodeError) as e:
             return f"生成失败：参数错误（{e}）"
 
+        queued = await _enqueue_generation(self.shared, context, wf, {
+            "entry": "legacy", "prompt": prompt,
+            "workflow": kwargs.get("workflow") or self.builder.default_workflow,
+            "values": generation_values,
+        })
+        if queued is not None:
+            return queued
         pid, submit_err = await self.client.submit_prompt_detail(wf)
         if submit_err:
             return f"生成失败：{submit_err}"
@@ -934,6 +953,10 @@ class ComfyuiInterruptTool(FunctionTool[AstrAgentContext]):
         pid = str(kwargs.get("prompt_id") or "").strip() or _last_prompt_id(
             self.shared, context
         )
+        queue = self.shared.get("generation_queue")
+        identifier = str(kwargs.get("prompt_id") or "").strip()
+        if queue is not None:
+            return await queue.action("cancel", identifier, _event_scope(context))
         remove = _as_bool(kwargs.get("remove_from_queue", False))
 
         if remove and pid:
@@ -1440,6 +1463,7 @@ class ComfyuiRunWorkflowTool(FunctionTool[AstrAgentContext]):
     name: str = "comfyui_run_workflow"
     description: str = (
         "直接运行一个工作流 JSON（ComfyUI API 格式）并返回结果。"
+        "提交后返回插件队列任务编号，完成后自动发送图片并通知。"
         "等价于原生 MCP 的 run_workflow，但不依赖在线模板库。"
         "workflow 参数可以是：JSON 文件路径（本地或本机上已存在的路径）、"
         "或直接传 JSON 字符串（dict 格式，节点 id -> {class_type, inputs}）。"
@@ -1456,7 +1480,7 @@ class ComfyuiRunWorkflowTool(FunctionTool[AstrAgentContext]):
                 },
                 "wait": {
                     "type": "boolean",
-                    "description": "是否等待执行完成（默认 true；false 只提交并返回 prompt_id）",
+                    "description": "兼容参数；插件运行时统一后台排队并返回任务编号",
                 },
             },
             "required": ["workflow"],
@@ -1498,6 +1522,9 @@ class ComfyuiRunWorkflowTool(FunctionTool[AstrAgentContext]):
         if wf is None:
             return "运行失败：workflow 解析失败。"
 
+        queued = await _enqueue_generation(self.shared, context, wf, {"entry": "raw_workflow"})
+        if queued is not None:
+            return queued
         pid, submit_err = await self.client.submit_prompt_detail(wf)
         if submit_err:
             return f"运行失败：{submit_err}"
@@ -1554,10 +1581,10 @@ class ComfyuiJobTool(FunctionTool[AstrAgentContext]):
 
     name: str = "comfyui_job"
     description: str = (
-        "按 prompt_id 查询 ComfyUI 任务状态、等待完成或取消任务。"
-        "action=status：查询状态与输出；action=wait：轮询直到完成；"
-        "action=cancel：中断任务；action=queue：查看当前队列。"
-        "不传 prompt_id 时对最近一次由本插件提交的任务操作。"
+        "按任务编号（如 C000001）或 prompt_id 查询生成任务状态或取消任务。"
+        "action=status：查询状态与输出；action=wait：返回队列任务当前状态；"
+        "action=cancel：中断任务；action=queue：查看本会话的生成队列。"
+        "不传编号时查询本会话最近的任务。插件队列任务自动通知完成，wait 也立即返回状态，无需反复查询。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -1570,7 +1597,11 @@ class ComfyuiJobTool(FunctionTool[AstrAgentContext]):
                 },
                 "prompt_id": {
                     "type": "string",
-                    "description": "任务 ID，可选；不传用最近一次生成的任务",
+                    "description": "插件任务编号或 ComfyUI prompt_id，可选；不传用本会话最近任务",
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "插件任务编号，例如 C000001；与 prompt_id 二选一",
                 },
             },
         }
@@ -1580,6 +1611,12 @@ class ComfyuiJobTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         action = str(kwargs.get("action") or "status").strip().lower()
+        queue = self.shared.get("generation_queue")
+        identifier = str(kwargs.get("task_id") or kwargs.get("prompt_id") or "").strip()
+        if queue is not None:
+            if action not in {"status", "wait", "cancel", "queue"}:
+                return "操作无效：支持 status / wait / cancel / queue。"
+            return await queue.action(action, identifier, _event_scope(context))
         pid = str(kwargs.get("prompt_id") or "").strip() or _last_prompt_id(
             self.shared, context
         )
@@ -2151,7 +2188,7 @@ _DRAW_DESC = (
     "省略可选参数沿用工作流。可按画风、角色、服饰或效果需求主动用 comfyui_lookup 查询并选用 LoRA；"
     "分辨率选择器工作流可用 aspect_ratio 和 megapixels 覆盖比例与目标百万像素数；"
     "按用途、类别或标签查询资源时传 model_family；完整已知文件名可跨家族查找。使用前核对资源与当前家族兼容，并采用返回的文件名、推荐权重和已知触发词。"
-    "复用配方用 comfyui_recipe_draw。成功回执包含图片本地保存路径；图片已直接发送，无需再次发送。"
+    "复用配方用 comfyui_recipe_draw。提交后返回队列任务编号，可以继续聊天；后台完成后自动发送图片并通知，无需轮询或重复提交。"
 )
 
 
@@ -2480,6 +2517,25 @@ class ComfyuiDrawTool(FunctionTool[AstrAgentContext]):
         except (TypeError, ValueError) as e:
             return f"生成失败：参数错误（{e}）"
 
+        if self.shared.get("generation_queue") is not None:
+            used = read_current_values(wf, slots)
+            used.update({k: v for k, v in values.items() if v is not None and (v != "" or k == "trigger_words")})
+            family_name = family.name if family is not None else str((recipe or {}).get("family") or "")
+            recipe_defaults = {
+                k: v for k, v in used.items()
+                if k not in {"prompt", "seed"} and v is not None
+                and (v != "" or k == "trigger_words") and (v != [] or k == "loras")
+            }
+            saved_recipe = {
+                "name": save_as, "description": f"从 {family_name} 家族自由生图保存",
+                "family": family_name, "defaults": recipe_defaults,
+            } if save_as and family is not None else None
+            return await _enqueue_generation(self.shared, context, wf, {
+                "entry": "recipe" if recipe else "family", "family": family_name,
+                "recipe": (recipe or {}).get("name"), "recipe_id": (recipe or {}).get("id"),
+                "workflow": workflow_name, "slots": slots, "drop_nodes": drop_nodes,
+                "prompt": prompt, "values": {**recipe_defaults, "seed": seed},
+            }, saved_recipe)
         pid, submit_err = await self.client.submit_prompt_detail(wf)
         if submit_err:
             return f"生成失败：{submit_err}"
@@ -2658,7 +2714,7 @@ _EDIT_DESC = (
     "按独立编辑工作流路由修改已有图片并直接发送结果。会按工作流输入顺序使用当前消息或引用消息中的多张图片；附件超过输入口时用 image_indices 选择；"
     "没有附图时可使用本插件上次生成的图片，或填写本插件此前回执的本地路径。"
     "局部改动默认沿用参考图原始宽高。需要按参考图比例缩放时使用 resolution；需要新画布/抠出素材时使用 custom_size 和 width/height。"
-    "这些画布参数只写入当前工作流已映射的输入；成功回执包含新图片的本地保存路径。"
+    "这些画布参数只写入当前工作流已映射的输入。提交后返回队列任务编号；后台完成后自动发送图片并通知，无需轮询或重复提交。"
 )
 
 
@@ -3040,6 +3096,14 @@ class ComfyuiEditTool(FunctionTool[AstrAgentContext]):
                 return f"编辑失败：上传第 {index + 1} 张来源图片失败（{upload_error or 'ComfyUI 未返回文件名'}）。"
             uploads[index] = upload_name
         apply_slots(wf, slots, {"source_images": uploads})
+        queued = await _enqueue_generation(self.shared, context, wf, {
+            "entry": "edit", "family": edit_route.name, "edit_route": edit_route.name,
+            "workflow": edit_route.workflow, "prompt": prompt,
+            "source_path": str(source_paths[0]), "source_paths": [str(path) for path in source_paths],
+            "values": apply_values,
+        })
+        if queued is not None:
+            return queued
         pid, submit_error = await self.client.submit_prompt_detail(wf)
         if submit_error or not pid:
             return f"编辑失败：{submit_error or '无法连接 ComfyUI'}"
@@ -3088,7 +3152,7 @@ _RECIPE_DRAW_DESC = (
     "使用已经实验并保存好的配方快捷生成新图片，完成后直接发送到当前会话；修改现有图片使用 comfyui_edit。"
     "prompt 必填，recipe 在用户点名配方时填写；省略 recipe 使用配置的默认配方。"
     "配方保存底模、LoRA、画幅和采样参数，并通过 model family 使用当前配置的工作流。"
-    "本工具用于复用固定方案；需要自由选择底模、LoRA 或采样参数时调用 comfyui_draw。成功回执包含本地保存路径。"
+    "本工具用于复用固定方案；需要自由选择底模、LoRA 或采样参数时调用 comfyui_draw。提交后返回队列任务编号；后台完成后自动发送图片并通知，无需轮询或重复提交。"
 )
 
 

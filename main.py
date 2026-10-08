@@ -51,6 +51,7 @@ for _pkg_prefix in ("", "astrbot_plugin_comfyui_direct."):
         "config_options",
         "character_tags",
         "generation_support",
+        "generation_queue",
         "execution_events",
         "animadex",
         "api_to_ui",
@@ -61,6 +62,7 @@ from character_tags import CharacterTagLookup  # noqa: E402
 from animadex import AnimaDexClient  # noqa: E402
 from comfy_client import ComfyUIClient  # noqa: E402
 from config_options import refresh_config_options  # noqa: E402
+from generation_queue import GenerationQueue  # noqa: E402
 from external_search import CivitaiClient, DanbooruClient, GelbooruClient  # noqa: E402
 from tools import (  # noqa: E402
     ComfyuiAnimadexTool,
@@ -100,7 +102,7 @@ DEFAULT_TIMEOUT = 300
 DEFAULT_CACHE_TTL = 600
 DEFAULT_WORKFLOW = "anima-v3"
 
-BASIC_LLM_TOOLS = {"comfyui_draw", "comfyui_edit", "comfyui_recipe_draw", "comfyui_lookup"}
+BASIC_LLM_TOOLS = {"comfyui_draw", "comfyui_edit", "comfyui_recipe_draw", "comfyui_lookup", "comfyui_job"}
 # 这些工具可能读取任意本地文件、执行未经映射的自定义节点或影响其他任务，
 # 默认不交给模型；需要时由管理员显式打开配置。
 LLM_UNSAFE_TOOLS = {
@@ -267,6 +269,14 @@ class ComfyUIDirectPlugin(Star):
         refresh_config_options(config, self._builder, self._store)
 
         shared: dict = {}
+        self._generation_queue = GenerationQueue(
+            self.context, self._client, self._store, self._output_dir, data_dir, shared,
+            max_pending=self._cache_limit(cfg.get("generation_queue_limit", 32), 32),
+            concurrency=self._cache_limit(cfg.get("generation_queue_concurrency", 1), 1),
+            notify_llm=_as_bool(cfg.get("generation_notify_llm", True)),
+            llm_timeout=self._cache_limit(cfg.get("generation_notify_timeout", 60), 60),
+        )
+        shared["generation_queue"] = self._generation_queue
         self._danbooru = DanbooruClient(base_urls=danbooru_urls)
         self._gelbooru = GelbooruClient(base_url=gelbooru_url)
         self._animadex = AnimaDexClient(
@@ -315,6 +325,7 @@ class ComfyUIDirectPlugin(Star):
         )
         self._recipe_draw_tool.refresh_schema()
         self._draw_tool.on_schema_change = self._recipe_draw_tool.refresh_schema
+        self._generation_queue.on_schema_change = self._recipe_draw_tool.refresh_schema
         self._lookup_tool = ComfyuiLookupTool(
             danbooru=self._danbooru,
             gelbooru=self._gelbooru,
@@ -479,8 +490,17 @@ class ComfyUIDirectPlugin(Star):
             return default
 
     async def initialize(self) -> None:
+        await self._generation_queue.start()
         if self._cache_auto_clean and self._cache_task is None:
             self._cache_task = asyncio.create_task(self._cache_cleanup_loop())
+
+    @filter.on_waiting_llm_request()
+    async def generation_turn_begin(self, event: AstrMessageEvent) -> None:
+        self._generation_queue.begin_turn(event)
+
+    @filter.after_message_sent()
+    async def generation_turn_end(self, event: AstrMessageEvent) -> None:
+        self._generation_queue.end_turn(event)
 
     async def _manage_image_cache(self, action: str) -> dict:
         return await asyncio.to_thread(
@@ -520,6 +540,7 @@ class ComfyUIDirectPlugin(Star):
 
     async def terminate(self) -> None:
         """插件重载/卸载时关闭异步连接。"""
+        await self._generation_queue.close()
         if self._cache_task is not None:
             self._cache_task.cancel()
             with suppress(asyncio.CancelledError):

@@ -23,7 +23,32 @@
       "max": 1800,
       "step": 30
     },
-    "hint": "单次生成等待上限（秒）。大分辨率/多 LoRA 建议不低于 300；链路经 ZeroTier 等中转时适当调大。超时后任务仍在 ComfyUI 队列里，可用 comfyui_job 查询。"
+    "hint": "单次结果等待窗口（秒）。后台队列在等待窗口超时后继续跟踪原任务；工作台可用原 prompt_id 继续查询。"
+  },
+  "generation_queue_limit": {
+    "type": "int",
+    "default": 32,
+    "description": "生成队列容量",
+    "hint": "插件最多接收多少个排队、生成、回收或待通知的任务；队列满时直接返回提示。"
+  },
+  "generation_queue_concurrency": {
+    "type": "int",
+    "default": 1,
+    "description": "同时跟踪的生成任务数",
+    "slider": {"min": 1, "max": 4, "step": 1},
+    "hint": "默认按顺序执行。提高数值会提前向 ComfyUI 提交更多任务；实际 GPU 并行能力由 ComfyUI 决定。"
+  },
+  "generation_notify_llm": {
+    "type": "bool",
+    "default": true,
+    "description": "完成后调用 LLM 回复",
+    "hint": "图片发送后，携带原对话历史和人格调用 LLM 告知任务结果。关闭时直接发送任务结果。对话已切换或删除时直接通知，避免写入新对话。"
+  },
+  "generation_notify_timeout": {
+    "type": "int",
+    "default": 60,
+    "description": "完成通知的 LLM 超时（秒）",
+    "hint": "LLM 超时或失败时直接发送任务结果，已生成图片仍会交付。"
   },
   "model_cache_ttl": {
     "type": "int",
@@ -299,7 +324,7 @@
       "基础（画图 + 查词）",
       "完整（开放诊断工具）"
     ],
-    "hint": "basic 暴露 comfyui_draw / comfyui_recipe_draw / comfyui_lookup；配置独立编辑工作流后还会暴露 comfyui_edit。full 额外开放队列、任务、模型信息等诊断工具，其中高风险工具仍需打开下方开关"
+    "hint": "basic 暴露 comfyui_draw / comfyui_recipe_draw / comfyui_lookup / comfyui_job；配置独立编辑工作流后还会暴露 comfyui_edit。full 额外开放服务端队列、模型信息等诊断工具，其中高风险工具仍需打开下方开关"
   },
   "allow_llm_unsafe_tools": {
     "type": "bool",

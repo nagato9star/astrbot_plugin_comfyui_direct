@@ -1,4 +1,4 @@
-# ✨ ComfyUI Direct
+# ✨ Kuyo ComfyFlow
 
 <div align="center">
 
@@ -8,7 +8,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![AstrBot](https://img.shields.io/badge/AstrBot-%E2%89%A54.16-green)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey)
-[![Last Commit](https://img.shields.io/github/last-commit/nagato9star/astrbot_plugin_comfyui_direct)](https://github.com/nagato9star/astrbot_plugin_comfyui_direct/commits/main)
+[![Last Commit](https://img.shields.io/github/last-commit/nagato9star/astrbot_plugin_kuyo_comfyflow)](https://github.com/nagato9star/astrbot_plugin_kuyo_comfyflow/commits/main)
 
 </div>
 
@@ -16,7 +16,7 @@
 
 ## 📢 简介
 
-ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的生图插件。
+Kuyo ComfyFlow 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的生图插件。
 
 先在 Workflow Studio 工作流页导入 ComfyUI 工作流，再为已有模型家族绑定生图或编辑图用途。LLM 调用 `comfyui_draw` 时填写模型家族，插件便会走对应工作流自由生图。
 
@@ -36,7 +36,7 @@ ComfyUI Direct 是一款基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
 
 ## 图片缓存与清理
 
-Bot 生图、原始工作流执行、输出下载和工作台试画统一将原图缓存到 AstrBot 的 `data/plugin_data/astrbot_plugin_comfyui_direct/output/`（由 `StarTools.get_data_dir` 定位）。缓存按图片内容哈希命名，保留原始字节，同内容复用并刷新保留时间，同名不同内容分别保存。旧版 output 图片也纳入清理。
+Bot 生图、原始工作流执行、输出下载和工作台试画统一将原图缓存到 AstrBot 的 `data/plugin_data/astrbot_plugin_kuyo_comfyflow/output/`（由 `StarTools.get_data_dir` 定位）。缓存按图片内容哈希命名，保留原始字节，同内容复用并刷新保留时间，同名不同内容分别保存。旧版 output 图片也纳入清理。
 
 管理员可发送：
 
@@ -141,13 +141,13 @@ Qwen Image 2.1 可分别配置 T2I 与编辑工作流：生图家族 `qwen` 绑�
 
 ## 🖼️ 工作流模板
 
-- 模板源：插件数据目录 `data/plugin_data/astrbot_plugin_comfyui_direct/workflows/`（首次部署需从原环境拷贝，插件包不含模板文件）。anima-v3 使用 rgthree（Power Lora Loader、Image Comparer）、Comfyroll（CR Prompt Text、JoinStringMulti）与 DanbooruText 自定义节点，需自行安装。
+- 模板源：插件数据目录 `data/plugin_data/astrbot_plugin_kuyo_comfyflow/workflows/`（首次部署需从原环境拷贝，插件包不含模板文件）。anima-v3 使用 rgthree（Power Lora Loader、Image Comparer）、Comfyroll（CR Prompt Text、JoinStringMulti）与 DanbooruText 自定义节点，需自行安装。
 - 兼容旧模板：`nagato-anima`、`anima-v2`，从 AstrBot `data/skills/anima-comfyui/references/` 目录加载（不存在时报错提示）。
 - 模板即事实来源：模型 / 步数 / cfg / 采样器默认值都在模板里，代码不写死。
 
 ## 📂 数据目录
 
-`data/plugin_data/astrbot_plugin_comfyui_direct/`
+`data/plugin_data/astrbot_plugin_kuyo_comfyflow/`
 
 - `comfyui_models.json`：模型清单缓存
 - `workflows/`：自定义工作流模板

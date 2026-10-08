@@ -407,7 +407,7 @@ class ComfyUIClient:
             try:
                 from api_to_ui import build_extra_pnginfo  # AstrBot: 插件目录已在 sys.path（main.py 自举）
             except ImportError:
-                from astrbot_plugin_comfyui_direct.api_to_ui import build_extra_pnginfo  # 沙箱/包环境兜底
+                from astrbot_plugin_kuyo_comfyflow.api_to_ui import build_extra_pnginfo  # 沙箱/包环境兜底
 
             if ui_workflow is not None:
                 body["extra_data"] = {"extra_pnginfo": {"workflow": ui_workflow}}

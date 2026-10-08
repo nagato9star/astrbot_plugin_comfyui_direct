@@ -44,7 +44,7 @@ from slot_mapping import (
 from workflow_builder import WorkflowBuilder
 from workflow_graph import validate_api_workflow, validate_ui_snapshot
 
-PLUGIN_NAME = "astrbot_plugin_comfyui_direct"
+PLUGIN_NAME = "astrbot_plugin_kuyo_comfyflow"
 
 SAMPLER_NAMES = [
     "er_sde",

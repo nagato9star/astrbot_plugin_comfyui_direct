@@ -16,7 +16,7 @@ import httpx
 
 from astrbot.api import logger
 
-USER_AGENT = "AstrBot-ComfyUIDirect/2.0 (+astrbot_plugin_comfyui_direct)"
+USER_AGENT = "AstrBot-KuyoComfyFlow/2.7 (+astrbot_plugin_kuyo_comfyflow)"
 
 # 聚合 tag 时排除的通用质量/评分词
 SKIP_TAGS = {

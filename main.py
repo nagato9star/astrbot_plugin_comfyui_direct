@@ -36,7 +36,7 @@ from astrbot.core.star.star_tools import StarTools  # noqa: E402
 # 导致改代码后热重载仍在跑旧逻辑。这里在导入前主动踢掉它们。
 import sys as _sys  # noqa: E402
 
-for _pkg_prefix in ("", "astrbot_plugin_comfyui_direct."):
+for _pkg_prefix in ("", "astrbot_plugin_comfyui_direct.", "astrbot_plugin_kuyo_comfyflow."):
     for _m in (
         "external_search",
         "tools",
@@ -159,10 +159,10 @@ def parse_default_lora(raw: Any) -> str:
 
 
 @register(
-    "astrbot_plugin_comfyui_direct",
+    "astrbot_plugin_kuyo_comfyflow",
     "长门九曜",
     "局域网直连ComfyUI API，按模型家族路由工作流并支持快捷配方",
-    "2.4.0",
+    "2.7.2",
 )
 class ComfyUIDirectPlugin(Star):
     """通过局域网直连ComfyUI API生成图片和查询模型。"""
@@ -213,7 +213,7 @@ class ComfyUIDirectPlugin(Star):
             civitai_key = ""
             defaults = {}
 
-        data_dir = StarTools.get_data_dir("astrbot_plugin_comfyui_direct")
+        data_dir = StarTools.get_data_dir("astrbot_plugin_kuyo_comfyflow")
         self._output_dir = data_dir / "output"
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._cache_auto_clean = _as_bool(cfg.get("image_cache_auto_clean", True))
